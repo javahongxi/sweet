@@ -22,6 +22,7 @@ const (
 	typeSetupAckRequest        = "SetupAckRequest"
 	typeSetupAckResponse       = "SetupAckResponse"
 	typeServerCheckRequest     = "ServerCheckRequest"
+	typeHealthCheckRequest     = "HealthCheckRequest"
 
 	typeInstanceRequest          = "InstanceRequest"
 	typeQueryServiceResponse     = "QueryServiceResponse"
@@ -85,6 +86,20 @@ func (SetupAckRequest) typeName() string { return typeSetupAckRequest }
 type SetupAckResponse struct{}
 
 func (SetupAckResponse) typeName() string { return typeSetupAckResponse }
+
+// HealthCheckRequest is the application-level idle keepalive probe
+// (api/.../remote/request/HealthCheckRequest.java:25 extends InternalRequest,
+// so it adds no fields of its own). It probes whether the *connection* is alive;
+// it does NOT keep an instance registered — ephemeral liveness *is* the
+// connection (harbor-vs-nacos.md §8.5, gRPC 模型无 beat).
+type HealthCheckRequest struct {
+	// RequestID mirrors Request.requestId (api/.../remote/request/Request.java:32),
+	// which Jackson serialises; the server routes its answer back to it via
+	// RpcAckCallbackSynchronizer.
+	RequestID string `json:"requestId,omitempty"`
+}
+
+func (HealthCheckRequest) typeName() string { return "HealthCheckRequest" }
 
 // ServerCheckRequest is the smallest unary call available and is what Nacos
 // itself uses to probe a server (GrpcClient.java:239-247).

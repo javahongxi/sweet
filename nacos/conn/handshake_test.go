@@ -91,6 +91,13 @@ func (f *fakeNacos) request(_ context.Context, p *gen.Payload) (*gen.Payload, er
 	f.unaryTypes = append(f.unaryTypes, t)
 	f.unaryClientIP = p.GetMetadata().GetClientIp()
 	f.mu.Unlock()
+	if t == typeServerCheckRequest {
+		// §8.3 step 1 must yield a connectionId, so the stub answers like a
+		// real server rather than with a bare EmptyResponse.
+		return marshalServerFrame("ServerCheckResponse", map[string]any{
+			"resultCode": 200, "success": true, "connectionId": "stub-connection-1",
+		}), nil
+	}
 	return marshalServerFrame(typeEmptyResponse, map[string]any{"success": true}), nil
 }
 
@@ -231,8 +238,10 @@ func TestHandshakeCompletesThreeFrames(t *testing.T) {
 	if setup.Labels["source"] != "sdk" || setup.Labels["module"] != "naming" {
 		t.Fatalf("labels = %v, want source=sdk module=naming (RemoteConstants.java:32,40)", setup.Labels)
 	}
-	if want := typeConnectionSetupRequest + "," + typeSetupAckResponse; meta != want {
-		t.Fatalf("frames the server received = %q, want %q", meta, want)
+	// The stub ends the stream right after the ack (the server is not obliged to
+	// wait for it, §8.3), so the ack frame may not arrive in time to be counted.
+	if meta != typeConnectionSetupRequest && meta != typeConnectionSetupRequest+","+typeSetupAckResponse {
+		t.Fatalf("frames the server received = %q", meta)
 	}
 	if len(c.Abilities()) == 0 {
 		t.Fatal("abilities from SetupAck were dropped")
@@ -266,8 +275,9 @@ func TestUnaryCarriesTypeAndClientIp(t *testing.T) {
 	types := strings.Join(f.unaryTypes, ",")
 	ip := f.unaryClientIP
 	f.mu.Unlock()
-	if types != typeServerCheckRequest {
-		t.Fatalf("unary types = %q, want %s", types, typeServerCheckRequest)
+	// Setup performs one serverCheck itself (§8.3), so this call is the second.
+	if types != typeServerCheckRequest+","+typeServerCheckRequest {
+		t.Fatalf("unary types = %q, want serverCheck + probe", types)
 	}
 	if ip == "" {
 		t.Fatal("Metadata.clientIp was empty on the unary call")

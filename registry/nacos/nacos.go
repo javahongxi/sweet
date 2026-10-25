@@ -1,10 +1,19 @@
 // Package nacos implements registry.Registry over Nacos' naming protocol with
 // the client protocol written by hand (see nacos/conn) — no nacos-sdk-go.
 //
-// Scope is deliberately the ephemeral-instance path only: registration,
-// deregistration, and subscription over the gRPC naming surface. Nacos 2.x/3.x
-// carries all of that on gRPC (the HTTP surface remains only for persistent
-// instances and the maintenance API), so this registry needs no HTTP at all.
+// Scope is the ephemeral-instance path: register, deregister, subscribe, and
+// pushes, all over gRPC. Nacos 2.x/3.x carries all of that on the gRPC surface,
+// so this package uses no HTTP at all.
+//
+// Two things this package treats as load-bearing, both learned from the live
+// server rather than from reading the request classes:
+//
+//   - Ephemeral liveness IS the connection (harbor-vs-nacos.md §8.5): the
+//     server drops every instance of a connection the moment its stream goes
+//     away, and there is no beat to keep it alive. So reconnect + replay is not
+//     an optimisation, it is what keeps a registration existing.
+//   - "注销优先" (§8.6): a deregistration must survive a reconnect. Redo data
+//     therefore records an intent, not just a last-known value.
 package nacos
 
 import (
@@ -12,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -24,35 +34,48 @@ import (
 type Options struct {
 	// ServerAddr is the SDK gRPC port, i.e. mainPort + 1000 (9848 for 8848).
 	ServerAddr string
-	// Namespace is the tenant. Empty means "public", which Nacos' own client
-	// normalises the same way.
+	// Namespace is the tenant. Empty means "public".
 	Namespace string
 	// GroupName defaults to DEFAULT_GROUP.
 	GroupName string
 	// HealthyOnly filters queried instances.
 	HealthyOnly bool
+	// ReconnectDelay is the gap between recovery attempts.
+	ReconnectDelay time.Duration
+	// Logger, if set, receives connection lifecycle events. Recovery that is
+	// invisible is indistinguishable from recovery that never happens.
+	Logger *log.Logger
+}
+
+// intent is the redo record: what the client *wants* to be true, so a
+// reconnect can rebuild server state from intent rather than from whatever the
+// server last acknowledged.
+type intent struct {
+	service string
+	want    registry.Instance
+	// live is false once deregister/unsubscribe ran, so replay skips it and a
+	// finished lifecycle can never resurrect itself.
+	live bool
 }
 
 // Registry is a Nacos-backed registry.
 type Registry struct {
-	opts     Options
-	serverIP string
+	opts Options
 
-	mu       sync.Mutex
-	c        *conn.Conn
-	subs     map[string]struct{} // "group@@service" -> subscribed
-	watchers map[string][]chan []registry.Instance
+	mu         sync.Mutex
+	c          *conn.Conn
+	recovering bool
+	closing    bool
+
+	registrations map[string]*intent // "<service>|<host:port>" -> register intent
+	subscriptions map[string]*intent // service -> subscribe intent
+	watchers      map[string][]chan []registry.Instance
 }
 
-// New validates opts. No connection is opened yet: the first call or watch
-// establishes it, so constructing a registry cannot block.
+// New validates opts. No connection is opened yet.
 func New(opts Options) (*Registry, error) {
 	if opts.ServerAddr == "" {
 		return nil, errors.New("nacos: Options.ServerAddr required")
-	}
-	host, _, err := splitHostPort(opts.ServerAddr)
-	if err != nil {
-		return nil, fmt.Errorf("nacos: ServerAddr: %w", err)
 	}
 	if opts.Namespace == "" {
 		opts.Namespace = "public"
@@ -60,35 +83,55 @@ func New(opts Options) (*Registry, error) {
 	if opts.GroupName == "" {
 		opts.GroupName = "DEFAULT_GROUP"
 	}
+	if opts.ReconnectDelay <= 0 {
+		opts.ReconnectDelay = time.Second
+	}
 	return &Registry{
-		opts:     opts,
-		serverIP: host,
-		subs:     map[string]struct{}{},
-		watchers: map[string][]chan []registry.Instance{},
+		opts:          opts,
+		registrations: map[string]*intent{},
+		subscriptions: map[string]*intent{},
+		watchers:      map[string][]chan []registry.Instance{},
 	}, nil
 }
 
 // Name makes this registry answer the "nacos:///<service>" scheme.
 func (r *Registry) Name() string { return "nacos" }
 
-// Expose registers the instance and returns its deregistration.
+// Expose registers one instance and returns its deregistration.
 func (r *Registry) Expose(ctx context.Context, serviceName string, in registry.Instance) (func(), error) {
 	c, err := r.ensureConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req := r.instanceRequest(serviceName, conn.TypeRegisterInstance, in)
-	if err := r.call(c, req); err != nil {
-		return nil, fmt.Errorf("nacos: register %s: %w", serviceName, err)
+	key := regKey(serviceName, in)
+	if err := r.register(ctx, c, serviceName, in); err != nil {
+		return nil, err
 	}
+	r.mu.Lock()
+	r.registrations[key] = &intent{service: serviceName, want: in, live: true}
+	r.mu.Unlock()
+
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			r.mu.Lock()
+			rec := r.registrations[key]
+			if rec != nil {
+				rec.live = false // 注销优先: replay must not bring it back
+			}
+			r.mu.Unlock()
+
 			dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if c, err := r.ensureConn(dctx); err == nil {
-				_ = r.call(c, r.instanceRequest(serviceName, conn.TypeDeregisterInstance, in))
+			if dc, err := r.currentConn(); err == nil {
+				if err := r.register(dctx, dc, serviceName, deregType(in)); err != nil {
+					r.logf("deregister %s: %v", serviceName, err)
+				}
 			}
+
+			r.mu.Lock()
+			delete(r.registrations, key)
+			r.mu.Unlock()
 		})
 	}, nil
 }
@@ -101,41 +144,66 @@ func (r *Registry) Watch(ctx context.Context, serviceName string) (<-chan []regi
 		return nil, err
 	}
 	ch := make(chan []registry.Instance, 4)
-	key := r.key(serviceName)
 	r.mu.Lock()
-	first := len(r.watchers[key]) == 0
-	r.watchers[key] = append(r.watchers[key], ch)
+	first := len(r.watchers[serviceName]) == 0
+	r.watchers[serviceName] = append(r.watchers[serviceName], ch)
 	r.mu.Unlock()
 
 	if first {
-		resp, err := r.subscribe(ctx, c, serviceName, true)
+		snapshot, err := r.subscribe(ctx, c, serviceName, true)
 		if err != nil {
-			r.dropWatcher(key, ch)
+			r.dropWatcher(serviceName, ch)
 			return nil, fmt.Errorf("nacos: subscribe %s: %w", serviceName, err)
 		}
-		// Nacos answers a subscribe with the current snapshot, so no separate
-		// query is needed to seed the view.
+		r.mu.Lock()
+		r.subscriptions[serviceName] = &intent{service: serviceName, live: true}
+		r.mu.Unlock()
+		// A subscribe response already carries the current list (§8.4), so no
+		// separate query is needed to seed the view.
 		select {
-		case ch <- toInstances(resp.ServiceInfo.Hosts):
+		case ch <- snapshot:
 		default:
 		}
 	}
 	return ch, nil
 }
 
-// Close deregisters nothing; it only tears the connection down. Callers that
-// need graceful offline must run the closures returned by Expose first.
+// Unsubscribe stops pushes for a service and forgets its watchers.
+func (r *Registry) Unsubscribe(ctx context.Context, serviceName string) error {
+	r.mu.Lock()
+	chans := r.watchers[serviceName]
+	delete(r.watchers, serviceName)
+	sub := r.subscriptions[serviceName]
+	if sub != nil {
+		sub.live = false
+	}
+	delete(r.subscriptions, serviceName)
+	r.mu.Unlock()
+	for _, ch := range chans {
+		close(ch)
+	}
+	c, err := r.currentConn()
+	if err != nil {
+		return nil // nothing subscribed server-side that we can still reach
+	}
+	_, err = r.subscribe(ctx, c, serviceName, false)
+	return err
+}
+
+// Close stops recovery and drops the connection. Registrations are left to the
+// server's connection-scoped cleanup: losing the stream removes them, which is
+// the same mechanism that made them exist.
 func (r *Registry) Close() error {
 	r.mu.Lock()
+	r.closing = true
 	c := r.c
 	r.c = nil
-	for _, chans := range r.watchers {
+	for name, chans := range r.watchers {
 		for _, ch := range chans {
 			close(ch)
 		}
+		delete(r.watchers, name)
 	}
-	r.watchers = map[string][]chan []registry.Instance{}
-	r.subs = map[string]struct{}{}
 	r.mu.Unlock()
 	if c != nil {
 		return c.Close()
@@ -150,200 +218,185 @@ func (r *Registry) ensureConn(ctx context.Context) (*conn.Conn, error) {
 	if c != nil && c.Ready() {
 		return c, nil
 	}
-	fresh, err := conn.Dial(r.opts.ServerAddr)
+	fresh, err := r.dialAndHandshake(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if err := fresh.Setup(ctx, r.opts.Namespace, nil); err != nil {
-		_ = fresh.Close()
-		return nil, fmt.Errorf("nacos: handshake with %s: %w", r.opts.ServerAddr, err)
 	}
 	r.mu.Lock()
 	if r.c != nil && r.c.Ready() {
 		old := r.c
 		r.mu.Unlock()
-		_ = old.Close()
 		_ = fresh.Close()
+		_ = old.Close()
 		return old, nil
+	}
+	if r.closing {
+		r.mu.Unlock()
+		_ = fresh.Close()
+		return nil, errors.New("nacos: registry closed")
 	}
 	r.c = fresh
 	r.mu.Unlock()
-	go r.readPushes(fresh)
+	go r.consumePushes(fresh)
 	return fresh, nil
 }
 
-// readPushes is the single consumer of server pushes: it decodes
-// NotifySubscriberRequest and fans the instance list out to local watchers.
-func (r *Registry) readPushes(c *conn.Conn) {
-	for push := range c.Pushes() {
-		if push.Type != conn.TypeNotifySubscriberRequest {
-			continue
-		}
-		var note notifyPush
-		if err := json.Unmarshal(push.Body, &note); err != nil {
-			continue
-		}
-		name := note.serviceName()
-		// Ack first: the server re-pushes until it gets the answer, and a
-		// stalled re-push looks exactly like "subscription works, updates slow".
-		if push.RequestID != "" {
-			_ = c.Ack(conn.Push{Type: push.Type, RequestID: push.RequestID}, "ok")
-		}
-		r.deliver(name, toInstances(note.ServiceInfo.Hosts))
-	}
-}
-
-// notifyPush mirrors NotifySubscriberRequest. Measured on a live 3.2.3 server,
-// its JSON is {"headers":{},"requestId":"5","serviceInfo":{...}} — there is no
-// top-level serviceName: the service identity lives inside serviceInfo, whose
-// `name` is qualified ("GROUP@@service" whenever the group is not DEFAULT_GROUP).
-// Keying a push off a field that is not on the wire is how the first version of
-// this code silently dropped every notification.
-type notifyPush struct {
-	Headers     map[string]string `json:"headers,omitempty"`
-	RequestID   string            `json:"requestId,omitempty"`
-	Namespace   string            `json:"namespace,omitempty"`
-	ServiceInfo conn.ServiceInfo  `json:"serviceInfo"`
-}
-
-// serviceName recovers the plain service name from a qualified one.
-func (n notifyPush) serviceName() string {
-	return trimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
-}
-
-func trimGroup(qualified, group string) string {
-	if qualified == "" {
-		return qualified
-	}
-	if group != "" && group != "DEFAULT_GROUP" {
-		return strings.TrimPrefix(qualified, group+"@@")
-	}
-	return strings.TrimPrefix(strings.TrimPrefix(qualified, "DEFAULT_GROUP@@"), "default@@")
-}
-
-func (r *Registry) deliver(serviceName string, insts []registry.Instance) {
-	key := r.key(serviceName)
-	r.mu.Lock()
-	chans := append([]chan []registry.Instance(nil), r.watchers[key]...)
-	r.mu.Unlock()
-	for _, ch := range chans {
-		select {
-		case ch <- insts:
-		default:
-			// A slow consumer misses one update and is corrected by the next
-			// push; blocking the dispatcher would stall every other service.
-		}
-	}
-}
-
-func (r *Registry) subscribe(ctx context.Context, c *conn.Conn, serviceName string, subscribe bool) (*conn.SubscribeServiceResponse, error) {
-	req := conn.SubscribeServiceRequest{
-		Namespace:   r.opts.Namespace,
-		ServiceName: serviceName,
-		GroupName:   r.opts.GroupName,
-		Subscribe:   subscribe,
-	}
-	t, body, err := c.Unary(ctx, req)
+// dialAndHandshake opens a Conn, wires recovery, and performs the handshake.
+// The hook must be installed before Setup so a stream that dies immediately is
+// still caught.
+func (r *Registry) dialAndHandshake(ctx context.Context) (*conn.Conn, error) {
+	c, err := conn.Dial(r.opts.ServerAddr)
 	if err != nil {
 		return nil, err
 	}
-	if t != conn.TypeSubscribeServiceResponse {
-		return nil, fmt.Errorf("nacos: subscribe answered with type %q", t)
-	}
-	var resp conn.SubscribeServiceResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
-	}
-	r.mu.Lock()
-	if subscribe {
-		r.subs[r.key(serviceName)] = struct{}{}
-	} else {
-		delete(r.subs, r.key(serviceName))
-	}
-	r.mu.Unlock()
-	return &resp, nil
-}
-
-// Unsubscribe stops pushes for a service once no watcher remains.
-func (r *Registry) Unsubscribe(ctx context.Context, serviceName string) error {
-	r.mu.Lock()
-	key := r.key(serviceName)
-	n := len(r.watchers[key])
-	if n == 0 {
-		r.mu.Unlock()
-		return nil
-	}
-	chans := r.watchers[key]
-	delete(r.watchers, key)
-	for _, ch := range chans {
-		close(ch)
-	}
-	r.mu.Unlock()
-	c, err := r.currentConn()
-	if err != nil {
-		return err
-	}
-	_, err = r.subscribe(ctx, c, serviceName, false)
-	return err
-}
-
-func (r *Registry) currentConn() (*conn.Conn, error) {
-	r.mu.Lock()
-	c := r.c
-	r.mu.Unlock()
-	if c == nil || !c.Ready() {
-		return nil, errors.New("nacos: not connected")
+	c.SetStreamLostHook(func(cause error) { r.onStreamLost(c, cause) })
+	if err := c.Setup(ctx, r.opts.Namespace, nil); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("nacos: handshake with %s: %w", r.opts.ServerAddr, err)
 	}
 	return c, nil
 }
 
-func (r *Registry) dropWatcher(key string, ch chan []registry.Instance) {
+// onStreamLost is the redo trigger. Per §8.6 the disconnect itself sends
+// nothing; a scheduled pass replays every intent still marked live.
+func (r *Registry) onStreamLost(dead *conn.Conn, cause error) {
+	r.logf("connection to %s lost (%v); scheduling reconnect", dead.Addr(), cause)
+	dead.CloseStream()
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	kept := r.watchers[key][:0]
-	for _, w := range r.watchers[key] {
-		if w != ch {
-			kept = append(kept, w)
-		}
-	}
-	if len(kept) == 0 {
-		delete(r.watchers, key)
+	if r.closing {
+		r.mu.Unlock()
 		return
 	}
-	r.watchers[key] = kept
+	if r.recovering {
+		r.mu.Unlock()
+		return
+	}
+	if r.c == dead {
+		r.c = nil
+	}
+	r.recovering = true
+	r.mu.Unlock()
+
+	go r.recover()
 }
 
-func (r *Registry) instanceRequest(serviceName, action string, in registry.Instance) conn.InstanceRequest {
-	meta := map[string]string{}
-	for k, v := range in.Metadata {
-		meta[k] = v
+func (r *Registry) recover() {
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		c, err := r.dialAndHandshake(ctx)
+		status := r.connStatus()
+		cancel()
+		if status == connStatusClosed {
+			return
+		}
+		if err == nil {
+			r.mu.Lock()
+			r.c = c
+			r.recovering = false
+			r.mu.Unlock()
+			go r.consumePushes(c)
+			if err := r.replay(); err != nil {
+				r.logf("replay after reconnect: %v", err)
+			}
+			return
+		}
+		r.logf("reconnect attempt %d failed: %v", attempt+1, err)
+		r.mu.Lock()
+		closing := r.closing
+		r.mu.Unlock()
+		if closing {
+			return
+		}
+		time.Sleep(r.opts.ReconnectDelay * time.Duration(attempt+1))
+		if attempt > 30 {
+			r.logf("giving up reconnecting to %s after %d attempts", r.opts.ServerAddr, attempt+1)
+			return
+		}
 	}
-	if len(meta) == 0 {
-		meta = nil
+}
+
+// replay re-sends every still-live intent. Instances first, then subscriptions:
+// a subscriber of a service we ourselves provide should not observe a moment
+// where we are subscribed to nothing we publish.
+func (r *Registry) replay() error {
+	r.mu.Lock()
+	regs := make([]*intent, 0, len(r.registrations))
+	for _, rec := range r.registrations {
+		if rec.live {
+			regs = append(regs, rec)
+		}
 	}
-	weight := float64(in.Weight)
-	if weight == 0 {
-		weight = 100
+	subs := make([]*intent, 0, len(r.subscriptions))
+	for _, rec := range r.subscriptions {
+		if rec.live {
+			subs = append(subs, rec)
+		}
 	}
-	return conn.InstanceRequest{
+	c := r.c
+	r.mu.Unlock()
+	if c == nil {
+		return errors.New("nacos: no connection to replay onto")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, rec := range regs {
+		if err := r.register(ctx, c, rec.service, rec.want); err != nil {
+			return err
+		}
+	}
+	for _, rec := range subs {
+		if _, err := r.subscribe(ctx, c, rec.service, true); err != nil {
+			return err
+		}
+		r.deliver(rec.service, nil, true) // nudge watchers with whatever the server sends next
+	}
+	r.logf("replayed %d registration(s) and %d subscription(s)", len(regs), len(subs))
+	return nil
+}
+
+// consumePushes is the single reader of one connection's pushes. The
+// generation check makes a goroutine belonging to a dead connection stop as soon
+// as its channel closes, instead of racing a newer connection's deliveries.
+func (r *Registry) consumePushes(c *conn.Conn) {
+	for push := range c.Pushes() {
+		// A goroutine belonging to a superseded connection must stop touching
+		// anything: acking on a stream that is already gone was producing
+		// "ack ClientDetectionRequest: nacos: stream not open" in the logs,
+		// and delivering from a stale connection would overwrite newer state.
+		if !r.stillCurrent(c) {
+			return
+		}
+		if push.Type != conn.TypeNotifySubscriberRequest {
+			// Anything else (ConnectResetRequest, ClientDetectionRequest, …) is
+			// a server request that expects an answer: ack it so the server does
+			// not hold the slot and re-push.
+			if err := c.Ack(push); err != nil {
+				r.logf("ack %s: %v", push.Type, err)
+			}
+			continue
+		}
+		var note notifyPush
+		if err := json.Unmarshal(push.Body, &note); err != nil {
+			r.logf("decode %s: %v", push.Type, err)
+			continue
+		}
+		name := note.serviceName()
+		if err := c.Ack(push); err != nil { // stop the re-push loop (§8.4)
+			r.logf("ack %s: %v", push.Type, err)
+		}
+		r.deliver(name, toInstances(note.ServiceInfo.Hosts), false)
+	}
+}
+
+func (r *Registry) register(ctx context.Context, c *conn.Conn, serviceName string, in registry.Instance) error {
+	req := conn.InstanceRequest{
 		Namespace:   r.opts.Namespace,
 		ServiceName: serviceName,
 		GroupName:   r.opts.GroupName,
-		Type:        action,
-		Instance: conn.Instance{
-			IP: in.Host, Port: in.Port, Weight: weight,
-			Healthy: true, Enabled: true, Ephemeral: true,
-			ClusterName: "DEFAULT", Metadata: meta,
-		},
+		Type:        actionFor(in),
+		Instance:    toWireInstance(in),
 	}
-}
-
-func (r *Registry) call(c *conn.Conn, req conn.InstanceRequest) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	t, body, err := c.Unary(ctx, req)
 	if err != nil {
 		return err
@@ -358,15 +411,35 @@ func (r *Registry) call(c *conn.Conn, req conn.InstanceRequest) error {
 	return nil
 }
 
-// query is a plain ServiceQueryRequest; it exists so tests can assert what
-// Nacos believes is registered without depending on the push path.
+func (r *Registry) subscribe(ctx context.Context, c *conn.Conn, serviceName string, subscribe bool) ([]registry.Instance, error) {
+	t, body, err := c.Unary(ctx, conn.SubscribeServiceRequest{
+		Namespace:   r.opts.Namespace,
+		ServiceName: serviceName,
+		GroupName:   r.opts.GroupName,
+		Subscribe:   subscribe,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if t != conn.TypeSubscribeServiceResponse {
+		return nil, fmt.Errorf("nacos: subscribe answered with type %q", t)
+	}
+	var resp conn.SubscribeServiceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	}
+	return toInstances(resp.ServiceInfo.Hosts), nil
+}
+
+// query is a plain ServiceQueryRequest; tests use it to assert what the server
+// believes is registered, independently of the push path.
 func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.Instance, error) {
 	c, err := r.currentConn()
 	if err != nil {
-		c, err = r.ensureConn(ctx)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	t, body, err := c.Unary(ctx, conn.ServiceQueryRequest{
 		Namespace:   r.opts.Namespace,
@@ -390,8 +463,102 @@ func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.In
 	return toInstances(resp.ServiceInfo.Hosts), nil
 }
 
-func (r *Registry) key(serviceName string) string {
-	return strings.TrimSpace(r.opts.GroupName) + "@@" + strings.TrimSpace(serviceName)
+// stillCurrent reports whether c is the connection this registry is now using.
+func (r *Registry) stillCurrent(c *conn.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.c == c
+}
+
+func (r *Registry) currentConn() (*conn.Conn, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.c == nil || !r.c.Ready() {
+		return nil, errors.New("nacos: not connected")
+	}
+	return r.c, nil
+}
+
+const (
+	connStatusLive = iota
+	connStatusClosed
+)
+
+func (r *Registry) connStatus() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closing {
+		return connStatusClosed
+	}
+	return connStatusLive
+}
+
+func (r *Registry) deliver(serviceName string, insts []registry.Instance, nudge bool) {
+	r.mu.Lock()
+	chans := append([]chan []registry.Instance(nil), r.watchers[serviceName]...)
+	r.mu.Unlock()
+	for _, ch := range chans {
+		if nudge {
+			select {
+			case ch <- nil:
+			default:
+			}
+			continue
+		}
+		select {
+		case ch <- insts:
+		default:
+			// Dropping one update is recoverable (the next push replaces it);
+			// blocking the dispatcher would stall every other service.
+		}
+	}
+}
+
+func (r *Registry) dropWatcher(serviceName string, ch chan []registry.Instance) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.watchers[serviceName][:0]
+	for _, w := range r.watchers[serviceName] {
+		if w != ch {
+			kept = append(kept, w)
+		}
+	}
+	if len(kept) == 0 {
+		delete(r.watchers, serviceName)
+		return
+	}
+	r.watchers[serviceName] = kept
+}
+
+func (r *Registry) logf(format string, args ...any) {
+	if r.opts.Logger != nil {
+		r.opts.Logger.Printf("sweet/registry/nacos: "+format, args...)
+	}
+}
+
+// notifyPush mirrors NotifySubscriberRequest. Measured on a live 3.2.3 server
+// its JSON is {"headers":{},"requestId":"5","serviceInfo":{...}} — there is no
+// top-level serviceName; identity lives in serviceInfo.name and is qualified
+// ("GROUP@@service" whenever the group is not DEFAULT_GROUP).
+type notifyPush struct {
+	Headers     map[string]string `json:"headers,omitempty"`
+	RequestID   string            `json:"requestId,omitempty"`
+	Namespace   string            `json:"namespace,omitempty"`
+	ServiceInfo conn.ServiceInfo  `json:"serviceInfo"`
+}
+
+func (n notifyPush) serviceName() string {
+	return trimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
+}
+
+func trimGroup(qualified, group string) string {
+	if qualified == "" {
+		return qualified
+	}
+	if group != "" && group != "DEFAULT_GROUP" {
+		return strings.TrimPrefix(qualified, group+"@@")
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(qualified, "DEFAULT_GROUP@@"), "default@@")
 }
 
 func toInstances(hosts []conn.Instance) []registry.Instance {
@@ -407,11 +574,43 @@ func toInstances(hosts []conn.Instance) []registry.Instance {
 	return out
 }
 
-func splitHostPort(addr string) (string, string, error) {
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[:i], addr[i+1:], nil
-		}
+func toWireInstance(in registry.Instance) conn.Instance {
+	meta := map[string]string{}
+	for k, v := range in.Metadata {
+		meta[k] = v
 	}
-	return "", "", errors.New("want host:port")
+	if len(meta) == 0 {
+		meta = nil
+	}
+	weight := float64(in.Weight)
+	if weight == 0 {
+		weight = 100
+	}
+	return conn.Instance{
+		IP: in.Host, Port: in.Port, Weight: weight,
+		Healthy: true, Enabled: true, Ephemeral: true,
+		ClusterName: "DEFAULT", Metadata: meta,
+	}
+}
+
+const deregMarker = "\x00deregister"
+
+// deregType tags an instance for deregistration by carrying the action in the
+// instance metadata until the request is built; keeps Expose's closure and
+// replay on one code path.
+func deregType(in registry.Instance) registry.Instance {
+	out := registry.Instance{Host: in.Host, Port: in.Port, Weight: in.Weight}
+	out.Metadata = map[string]string{deregMarker: "1"}
+	return out
+}
+
+func actionFor(in registry.Instance) string {
+	if in.Metadata[deregMarker] == "1" {
+		return conn.TypeDeregisterInstance
+	}
+	return conn.TypeRegisterInstance
+}
+
+func regKey(serviceName string, in registry.Instance) string {
+	return serviceName + "|" + in.Host + ":" + fmt.Sprint(in.Port)
 }
