@@ -438,6 +438,12 @@ func (r *Registry) subscribe(ctx context.Context, c *conn.Conn, serviceName stri
 	return toInstances(resp.ServiceInfo.Hosts), nil
 }
 
+// Query is the exported form of query, for tests and for callers that want to
+// assert server state independently of the push path.
+func (r *Registry) Query(ctx context.Context, serviceName string) ([]registry.Instance, error) {
+	return r.query(ctx, serviceName)
+}
+
 // query is a plain ServiceQueryRequest; tests use it to assert what the server
 // believes is registered, independently of the push path.
 func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.Instance, error) {

@@ -121,3 +121,7 @@ func TestLiveWatchSeedsAndPushes(t *testing.T) {
 	}
 	t.Fatal("no push observed after a registration")
 }
+
+func instanceAt(port int) registry.Instance {
+	return registry.Instance{Host: "127.0.0.1", Port: port, Weight: 100}
+}
