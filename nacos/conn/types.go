@@ -3,18 +3,42 @@ package conn
 // Java class simple names that appear in Metadata.type on the naming path.
 // Verified against nacos @3.2.3: GrpcClient.java:404 (setup), :607-625 (setup
 // ack pair), and api/.../naming/remote/request/*.java for the naming requests.
+// Exported spellings for callers that dispatch on frames.
+const (
+	TypeInstanceRequest          = "InstanceRequest"
+	TypeServiceQueryRequest      = "ServiceQueryRequest"
+	TypeSubscribeServiceRequest  = "SubscribeServiceRequest"
+	TypeNotifySubscriberRequest  = "NotifySubscriberRequest"
+	TypeSubscribeServiceResponse = "SubscribeServiceResponse"
+
+	// TypeRegisterInstance / TypeDeregisterInstance are the InstanceRequest.type
+	// values (NamingRemoteConstants.java:27,31), not Metadata.type.
+	TypeRegisterInstance   = "registerInstance"
+	TypeDeregisterInstance = "deregisterInstance"
+)
+
 const (
 	typeConnectionSetupRequest = "ConnectionSetupRequest"
 	typeSetupAckRequest        = "SetupAckRequest"
 	typeSetupAckResponse       = "SetupAckResponse"
 	typeServerCheckRequest     = "ServerCheckRequest"
 
-	typeInstanceRequest         = "InstanceRequest"
-	typeServiceQueryRequest     = "ServiceQueryRequest"
-	typeSubscribeServiceRequest = "SubscribeServiceRequest"
-	typeNotifySubscriberRequest = "NotifySubscriberRequest"
-	typeEmptyResponse           = "EmptyResponse"
+	typeInstanceRequest          = "InstanceRequest"
+	typeQueryServiceResponse     = "QueryServiceResponse"
+	typeSubscribeServiceResponse = "SubscribeServiceResponse"
+	typeServiceQueryRequest      = "ServiceQueryRequest"
+	typeSubscribeServiceRequest  = "SubscribeServiceRequest"
+	typeNotifySubscriberRequest  = "NotifySubscriberRequest"
+	typeEmptyResponse            = "EmptyResponse"
 )
+
+// Correction, measured against a live 3.2.3 server: requestId *does* appear on
+// the naming push path, but not where the earlier note expected it — it is a
+// field of the pushed object's JSON (ServerRequest.requestId, e.g.
+// NotifySubscriberRequest → {"headers":{},"requestId":"5","serviceInfo":{...}}),
+// never a Metadata.headers key. Unary calls still need no correlation id of
+// their own (gRPC does it), but a push MUST be acked with the same requestId or
+// the server re-pushes it. See Conn.Ack.
 
 // ClientVersion is reported in the setup request. The server only records it
 // (GrpcBiStreamRequestAcceptor.java:170 → RemotingHeartBeatEvent), it does not

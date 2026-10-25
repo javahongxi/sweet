@@ -15,21 +15,34 @@ import (
 
 	"github.com/javahongxi/sweet/client"
 	"github.com/javahongxi/sweet/example/helloworld/ping"
+	"github.com/javahongxi/sweet/registry"
 	"github.com/javahongxi/sweet/registry/direct"
+	nacosregistry "github.com/javahongxi/sweet/registry/nacos"
 )
 
 func main() {
-	registryKind := flag.String("registry", "direct", "registry implementation: direct (nacos pending)")
+	registryKind := flag.String("registry", "nacos", "nacos | direct")
 	endpoints := flag.String("endpoints", "127.0.0.1:20000", "comma-separated host:port, used by direct")
+	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
 	service := flag.String("service", ping.ServiceName, "service name to resolve")
 	flag.Parse()
 
-	if *registryKind != "direct" {
-		log.Fatalf("registry %q not implemented yet (registry/nacos is the hand-written part of this project)", *registryKind)
-	}
-	reg, err := direct.New(*endpoints)
-	if err != nil {
-		log.Fatalf("registry: %v", err)
+	var reg registry.Registry
+	switch *registryKind {
+	case "nacos":
+		nr, err := nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr})
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = nr
+	case "direct":
+		dr, err := direct.New(*endpoints)
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = dr
+	default:
+		log.Fatalf("unknown -registry %q", *registryKind)
 	}
 
 	conn, err := client.Dial(reg, *service, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -49,6 +62,5 @@ func main() {
 	if err != nil {
 		log.Fatalf("Events: %v", err)
 	}
-	log.Printf("resolved %s through %s registry (%s) → Ping=%q Events=%v",
-		*service, reg.Name(), *endpoints, pong, events)
+	log.Printf("resolved %s through %s registry → Ping=%q Events=%v", *service, reg.Name(), pong, events)
 }

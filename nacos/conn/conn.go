@@ -2,6 +2,7 @@ package conn
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/javahongxi/sweet/gen"
 )
@@ -27,13 +29,16 @@ const (
 // connection, not a slow one.
 const DefaultSetupTimeout = 3 * time.Second
 
-// Push is a server-initiated request arriving on the bidi stream. S4 consumes
-// these (NotifySubscriberRequest); S2 only needs the channel to exist so the
-// read loop never blocks on an unread push.
+// Push is a server-initiated request arriving on the bidi stream.
+//
+// RequestID is copied from the frame's own JSON body (api/.../remote/request/
+// ServerRequest.java:29 declares it): the server's RpcAckCallbackSynchronizer
+// waits for an ack carrying the same requestId per connection and retries the
+// push until it sees one, so echoing it back is mandatory, not optional.
 type Push struct {
-	Type   string
-	Body   []byte
-	AckFor *gen.Payload // the frame to acknowledge, nil once acking is wired
+	Type      string
+	RequestID string
+	Body      []byte
 }
 
 // Conn is one connection to a Nacos server: a lazily opened bidi stream plus
@@ -185,12 +190,43 @@ func (c *Conn) readLoop(cs grpc.ClientStream) {
 			}
 			c.setupOnce.Do(func() { close(c.setupDone) })
 		default:
-			c.offer(Push{Type: t, Body: append([]byte(nil), p.GetBody().GetValue()...), AckFor: &p})
+			var sr serverRequestMeta
+			_, _ = unmarshal(&p, &sr)
+			c.offer(Push{Type: t, RequestID: sr.RequestID, Body: append([]byte(nil), p.GetBody().GetValue()...)})
 		}
 	}
 }
 
-// Pushes exposes server-initiated frames. S4 consumes it.
+// serverRequestMeta is the piece of a pushed ServerRequest we must understand:
+// its requestId.
+type serverRequestMeta struct {
+	RequestID string `json:"requestId,omitempty"`
+}
+
+// Ack echoes a pushed request back as a response, which is what stops the
+// server's re-push loop. Nacos' own client does the same via
+// RpcClient.requestReply (RpcClient.java:859).
+func (c *Conn) Ack(p Push, result string) error {
+	body, err := json.Marshal(ackPayload{Headers: map[string]string{}, RequestID: p.RequestID, Result: result})
+	if err != nil {
+		return err
+	}
+	frame := &gen.Payload{
+		Metadata: &gen.Metadata{Type: p.Type + "Response"},
+		Body:     &anypb.Any{Value: body},
+	}
+	return c.send(frame)
+}
+
+// ackPayload is the wire shape of a client answering a server push: it mirrors
+// AckResponse, whose JSON carries headers, requestId and result.
+type ackPayload struct {
+	Headers   map[string]string `json:"headers"`
+	RequestID string            `json:"requestId,omitempty"`
+	Result    string            `json:"result,omitempty"`
+}
+
+// Pushes exposes server-initiated frames.
 func (c *Conn) Pushes() <-chan Push { return c.pushes }
 
 func (c *Conn) offer(p Push) {
@@ -262,17 +298,30 @@ func (c *Conn) Call(ctx context.Context, req envelope, resp envelope) error {
 // CallNoResponse sends a unary request and discards the reply body; useful for
 // probes where only the transport-level success matters.
 func (c *Conn) CallNoResponse(ctx context.Context, req envelope) error {
+	_, _, err := c.Unary(ctx, req)
+	return err
+}
+
+// Unary performs one request and returns the raw reply. Unlike Call it does not
+// assert the response class name, which is what naming calls need: Nacos answers
+// a subscribe with SubscribeServiceResponse and a query with
+// QueryServiceResponse, and callers dispatch on the returned type themselves.
+func (c *Conn) Unary(ctx context.Context, req envelope) (string, []byte, error) {
 	p, err := marshalRequest(req, c.ip)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	var out gen.Payload
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := c.cc.Invoke(callCtx, methodUnary, p, &out); err != nil {
-		return fmt.Errorf("nacos: call %s: %w", req.typeName(), err)
+		return "", nil, fmt.Errorf("nacos: call %s: %w", req.typeName(), err)
 	}
-	return nil
+	t, err := unmarshal(&out, nil)
+	if err != nil {
+		return t, nil, err
+	}
+	return t, append([]byte(nil), out.GetBody().GetValue()...), nil
 }
 
 // Addr is the server address this connection points at.

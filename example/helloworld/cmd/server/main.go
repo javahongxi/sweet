@@ -17,7 +17,9 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/javahongxi/sweet/example/helloworld/ping"
+	"github.com/javahongxi/sweet/registry"
 	"github.com/javahongxi/sweet/registry/direct"
+	nacosregistry "github.com/javahongxi/sweet/registry/nacos"
 	"github.com/javahongxi/sweet/server"
 )
 
@@ -40,11 +42,28 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:20000", "address to listen on")
 	advertise := flag.String("advertise", "", "address reported to the registry (default: -listen)")
 	weight := flag.Int("weight", 100, "weight advertised to the load balancer")
+	registryKind := flag.String("registry", "nacos", "nacos | direct")
+	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
 	flag.Parse()
 
-	reg, err := direct.New(orDefault(*advertise, *listen))
-	if err != nil {
-		log.Fatalf("registry: %v", err)
+	var reg registry.Registry
+	switch *registryKind {
+	case "nacos":
+		nr, err := nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr})
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = nr
+	case "direct":
+		dr, err := direct.New(orDefault(*advertise, *listen))
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = dr
+		// direct registers nothing, so peers must be told the address out of band.
+		log.Printf("registry=direct is a passthrough: clients should dial -endpoints %s", orDefault(*advertise, *listen))
+	default:
+		log.Fatalf("unknown -registry %q", *registryKind)
 	}
 
 	srv, err := server.New(server.Options{
