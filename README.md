@@ -8,18 +8,31 @@ sweet 不重新发明 RPC 线格式：需要跨语言互通时用 gRPC 本身就
 ## 对外提供什么
 
 ```go
-// 服务端：注册实现 + 上线 + 优雅下线
-srv := server.New(server.Options{Registry: "nacos", Endpoint: "127.0.0.1:9848", ServiceName: "greeter.Greeter"})
-pb.RegisterGreeterServer(srv.GRPCServer(), impl)
-srv.Serve()
-defer srv.Stop()   // drain → 注销 → 等连接排空
+reg, err := nacos.New(nacos.Options{ServerAddr: "127.0.0.1:9848"})   // reg.Name() == "nacos"
 
-// 客户端：按服务名寻址
-conn := client.Dial("nacos://public/greeter.Greeter?weight=100")
+srv, err := server.New(server.Options{
+    Address:     "127.0.0.1:0",     // ":0" 由系统分配端口，注册时上报实际端口
+    ServiceName: "greeter.Greeter", // 留空则取 Register 时 ServiceDesc 的名字
+    Weight:      100,
+    Metadata:    map[string]string{"group": "DEFAULT_GROUP", "version": "1.0.0"},
+    Registry:    reg,
+    DrainDelay:  200 * time.Millisecond,
+})
+defer srv.Stop() // 注销 → 等 drain → GracefulStop
+
+if err := srv.Register(&pb.GreeterServiceDesc, impl); err != nil { ... }
+
+go func() { _ = srv.Serve() }()   // 先注册进 registry，再开始 accept
+if err := srv.Listen(); err != nil { ... } // 同步点：返回 nil 后 Addr()/Port() 才可读
+
+conn, err := client.Dial(reg, "greeter.Greeter",
+    grpc.WithTransportCredentials(insecure.NewCredentials()))
 cli := pb.NewGreeterClient(conn)
 ```
 
-服务名取自 gRPC 自身的 `grpc.ServiceInfo.ServiceName()`，不需要额外声明一套服务标识。
+服务名只有一套：`Register` 时取 `grpc.ServiceDesc.ServiceName`，也就是生成码里的 `<package>.<Service>`，框架不再引入第二套标识。寻址目标是 `"<registry.Name()>:///<serviceName>"`，由 `Dial` 拼出，不需要手写 URI。
+
+`registry/direct` 已可用（不接注册中心即可跑通端到端，也作 nacos 实现的测试替身）；`registry/nacos` 是本项目的手写部分，尚未落地。
 
 ## 手写 / 用库的边界
 
@@ -27,8 +40,8 @@ cli := pb.NewGreeterClient(conn)
 |---|---|---|
 | 传输与调用模型 | **用库**（`grpc-go`） | HTTP/2、SETTINGS/流控/HEADERS/DATA/trailers、unary 与三种 stream、codec、interceptor |
 | 服务端封装 | 自写（薄） | `Serve`/`Stop` 生命周期、监听端口回填、注销与 drain 顺序 |
-| 客户端封装 | 自写（薄） | `Dial` 目标解析、与 resolver/balancer 的接线 |
-| `registry` 抽象 | 自写 | 一个接口 + 两个实现：`nacos`（真）与 `direct`（直连，兼作集成测试替身） |
+| 客户端封装 | 自写（薄） | 拼 target（scheme + 服务名）、按连接注入 resolver builder（不注册全局） |
+| `registry` 抽象 | 自写 | 一个接口（`Name`/`Expose`/`Watch`）+ 两个实现：`direct`（已可用，兼测试替身）与 `nacos`（手写，未落地） |
 | **Nacos 客户端协议** | **自写（主战场）** | `Payload{Metadata{type,headers}, body}` 信封、bidi 常连与 `ConnectionSetupRequest` 握手（含能力协商）、保活与重连状态机、推送接收与 `requestReply` ACK、注册/注销/查询/订阅 |
 | 实例视图 | 自写 | `atomic.Pointer[map]` 快照换、单写 goroutine 消费推送、done-chan 桥接 `context` |
 | 寻址咬合 | 自写（薄） | `resolver.Builder`/`State`/`ClientConn.UpdateState`；权重等属性经 `resolver.Address.Attributes` 交给 balancer |
