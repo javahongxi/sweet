@@ -1,16 +1,20 @@
 // Command server brings a sweet server online.
 //
-// The example ships with registry=direct, which is a passthrough: it registers
-// nothing and discovers nothing, so the address clients must reach is given
-// with -advertise. When registry/nacos lands, that argument disappears — the
-// instance registers itself and peers find it by service name.
+// -registry=nacos (the default) registers the instance through the
+// hand-written naming protocol, so peers find it by service name alone.
+// -registry=direct is a passthrough used for development without a registry:
+// it registers nothing and discovers nothing, so clients must be told the
+// address with -advertise.
 package main
 
 import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -44,6 +48,7 @@ func main() {
 	weight := flag.Int("weight", 100, "weight advertised to the load balancer")
 	registryKind := flag.String("registry", "nacos", "nacos | direct")
 	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
+	serviceName := flag.String("service", ping.ServiceName, "service name to register and serve")
 	flag.Parse()
 
 	var reg registry.Registry
@@ -68,7 +73,7 @@ func main() {
 
 	srv, err := server.New(server.Options{
 		Address:     *listen,
-		ServiceName: ping.ServiceName,
+		ServiceName: *serviceName,
 		Weight:      *weight,
 		Registry:    reg,
 		DrainDelay:  200 * time.Millisecond,
@@ -81,6 +86,13 @@ func main() {
 	}
 	defer srv.Stop()
 
+	// SIGTERM/SIGINT must reach Stop(): without a signal handler the process
+	// dies outright, the connection drops, and Nacos removes the instance with
+	// no chance to drain — which is exactly the difference between "graceful
+	// offline" and "the instance vanished".
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+
 	go func() {
 		if err := srv.Serve(); err != nil {
 			log.Printf("serve: %v", err)
@@ -92,7 +104,10 @@ func main() {
 	log.Printf("sweet server up: listen=%s advertised=%s service=%s registry=%s",
 		srv.Addr(), orDefault(*advertise, *listen), srv.ServiceName(), reg.Name())
 
-	select {}
+	<-stop
+	log.Printf("signal received, draining (grace period %s)", srv.DrainDelay())
+	srv.Stop()
+	log.Printf("stopped: deregistered then drained")
 }
 
 func orDefault(v, def string) string {

@@ -40,6 +40,10 @@ type Options struct {
 	GroupName string
 	// HealthyOnly filters queried instances.
 	HealthyOnly bool
+	// WatchFilter, when set, receives every instance list this registry
+	// publishes to watchers (initial snapshots and pushes). It exists for the
+	// restart drill: convergence must be observed, not assumed.
+	WatchFilter func(serviceName string, insts []registry.Instance)
 	// ReconnectDelay is the gap between recovery attempts.
 	ReconnectDelay time.Duration
 	// Logger, if set, receives connection lifecycle events. Recovery that is
@@ -494,6 +498,9 @@ func (r *Registry) connStatus() int {
 }
 
 func (r *Registry) deliver(serviceName string, insts []registry.Instance, nudge bool) {
+	if r.opts.WatchFilter != nil && !nudge {
+		r.opts.WatchFilter(serviceName, insts)
+	}
 	r.mu.Lock()
 	chans := append([]chan []registry.Instance(nil), r.watchers[serviceName]...)
 	r.mu.Unlock()

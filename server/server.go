@@ -119,6 +119,9 @@ func (s *Server) Port() int {
 	return s.port
 }
 
+// DrainDelay is the configured grace period Stop waits after deregistering.
+func (s *Server) DrainDelay() time.Duration { return s.opts.DrainDelay }
+
 // ServiceName is the name this instance is exposed under.
 func (s *Server) ServiceName() string {
 	s.mu.Lock()
