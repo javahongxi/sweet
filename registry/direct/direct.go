@@ -18,7 +18,8 @@ import (
 	"github.com/javahongxi/sweet/registry"
 )
 
-// Registry resolves every service name to a fixed instance list.
+// Registry resolves every service name to a fixed instance list. A zero value
+// is a valid read-only registry (see Nope).
 type Registry struct {
 	mu      sync.Mutex
 	fixed   []registry.Instance
@@ -51,6 +52,9 @@ func (r *Registry) Name() string { return "direct" }
 // addressed by the endpoints given to New, not by anything servers report.
 // The returned function is idempotent.
 func (r *Registry) Expose(_ context.Context, serviceName string, in registry.Instance) (func(), error) {
+	if r.fixed == nil && r.exposed == nil {
+		return func() {}, nil // Nope: nothing to record
+	}
 	if in.Host == "" || in.Port <= 0 {
 		return nil, fmt.Errorf("direct: instance %q has no usable address", serviceName)
 	}
@@ -74,8 +78,11 @@ func (r *Registry) Expose(_ context.Context, serviceName string, in registry.Ins
 func (r *Registry) Watch(_ context.Context, _ string) (<-chan []registry.Instance, error) {
 	ch := make(chan []registry.Instance, 1)
 	r.mu.Lock()
-	ch <- append([]registry.Instance(nil), r.fixed...)
+	fixed := r.fixed
 	r.mu.Unlock()
+	if len(fixed) > 0 {
+		ch <- append([]registry.Instance(nil), fixed...)
+	}
 	close(ch)
 	return ch, nil
 }
@@ -99,3 +106,9 @@ func splitHostPort(ep string) (string, int, error) {
 	}
 	return ep[:i], port, nil
 }
+
+// Nope returns a read-only registry for the case where a server is started
+// purely to serve an already-addressable peer — interop tests against a stock
+// gRPC client, for instance. It is not a discovery mechanism: it registers
+// nothing and resolves nothing.
+func Nope() registry.Registry { return &Registry{} }
