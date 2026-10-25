@@ -1,22 +1,28 @@
 // Package direct implements registry.Registry without a registry server: the
-// peer addresses are the ones written into the target URI.
+// peer addresses are the ones written into the constructor.
 //
-// It exists for two reasons: sweet's end-to-end path must be exercisable
-// without a running Nacos, and it is the test double the nacos registry is
-// compared against. It is not a feature — there is no discovery in it.
+// It exists so sweet's end-to-end path is exercisable without a running Nacos,
+// and as the stand-in the nacos registry is compared against. It performs no
+// discovery: Expose is a recorded no-op (a server can come up on it), Watch
+// returns a fixed list once and closes.
 package direct
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/javahongxi/sweet/registry"
 )
 
 // Registry resolves every service name to a fixed instance list.
 type Registry struct {
-	instances []registry.Instance
+	mu      sync.Mutex
+	fixed   []registry.Instance
+	exposed map[string]int // service name → live Expose calls, for observability
 }
 
 // New parses a comma-separated list of host:port endpoints.
@@ -36,27 +42,50 @@ func New(endpoints string) (*Registry, error) {
 	if len(out) == 0 {
 		return nil, errors.New("direct: no endpoints")
 	}
-	return &Registry{instances: out}, nil
+	return &Registry{fixed: out, exposed: map[string]int{}}, nil
 }
 
 func (r *Registry) Name() string { return "direct" }
 
-// Expose is not supported: there is nothing to register into.
-func (r *Registry) Expose(context.Context, string, registry.Instance) (func(), error) {
-	return nil, errors.New("direct: registry is read-only")
+// Expose acknowledges the instance without publishing it: a direct client is
+// addressed by the endpoints given to New, not by anything servers report.
+// The returned function is idempotent.
+func (r *Registry) Expose(_ context.Context, serviceName string, in registry.Instance) (func(), error) {
+	if in.Host == "" || in.Port <= 0 {
+		return nil, fmt.Errorf("direct: instance %q has no usable address", serviceName)
+	}
+	r.mu.Lock()
+	r.exposed[serviceName]++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if n := r.exposed[serviceName]; n > 0 {
+				r.exposed[serviceName] = n - 1
+			}
+			r.mu.Unlock()
+		})
+	}, nil
 }
 
-// Watch returns the fixed list once. The channel is closed immediately after,
-// which the resolver treats as "no further updates".
-func (r *Registry) Watch(ctx context.Context, _ string) (<-chan []registry.Instance, error) {
+// Watch sends the fixed list once and closes the channel; a closed channel
+// simply means "no further updates", which the resolver treats as terminal.
+func (r *Registry) Watch(_ context.Context, _ string) (<-chan []registry.Instance, error) {
 	ch := make(chan []registry.Instance, 1)
-	select {
-	case ch <- append([]registry.Instance(nil), r.instances...):
-	case <-ctx.Done():
-		close(ch)
-	}
+	r.mu.Lock()
+	ch <- append([]registry.Instance(nil), r.fixed...)
+	r.mu.Unlock()
 	close(ch)
 	return ch, nil
+}
+
+// Exposed reports how many instances are currently acknowledged for a service.
+// It exists so tests can assert the server side actually called through.
+func (r *Registry) Exposed(serviceName string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.exposed[serviceName]
 }
 
 func splitHostPort(ep string) (string, int, error) {
@@ -64,12 +93,9 @@ func splitHostPort(ep string) (string, int, error) {
 	if i <= 0 || i == len(ep)-1 {
 		return "", 0, errors.New("direct: bad endpoint " + ep)
 	}
-	port := 0
-	for _, c := range ep[i+1:] {
-		if c < '0' || c > '9' {
-			return "", 0, errors.New("direct: bad port in " + ep)
-		}
-		port = port*10 + int(c-'0')
+	port, err := strconv.Atoi(ep[i+1:])
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, errors.New("direct: bad port in " + ep)
 	}
 	return ep[:i], port, nil
 }

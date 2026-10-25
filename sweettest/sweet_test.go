@@ -292,22 +292,70 @@ func TestStopDeregistersFirst(t *testing.T) {
 	}
 }
 
-// TestDirectRegistryIsReadOnly documents the one thing direct.Registry refuses.
-func TestDirectRegistryIsReadOnly(t *testing.T) {
+// TestDirectRegistryFeed covers direct.Registry's own contract: a fixed list
+// delivered once and then closed, and Expose acknowledged without publishing.
+func TestDirectRegistryFeed(t *testing.T) {
 	reg, err := direct.New("127.0.0.1:12345,127.0.0.1:12346")
 	if err != nil {
 		t.Fatalf("direct.New: %v", err)
 	}
 	if _, err := reg.Expose(context.Background(), svcName, registry.Instance{}); err == nil {
-		t.Fatal("direct.Expose should fail: there is nothing to register into")
+		t.Fatal("direct.Expose should reject an instance with no usable address")
+	}
+	unreg, err := reg.Expose(context.Background(), svcName, registry.Instance{Host: "127.0.0.1", Port: 12345})
+	if err != nil {
+		t.Fatalf("direct.Expose: %v", err)
+	}
+	if got := reg.Exposed(svcName); got != 1 {
+		t.Fatalf("Exposed = %d, want 1", got)
+	}
+	unreg()
+	unreg() // idempotent
+	if got := reg.Exposed(svcName); got != 0 {
+		t.Fatalf("Exposed after double unreg = %d, want 0", got)
 	}
 	ch, err := reg.Watch(context.Background(), svcName)
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
-	insts := <-ch
-	if len(insts) != 2 {
-		t.Fatalf("Watch returned %d instances, want 2", len(insts))
+	insts, ok := <-ch
+	if !ok || len(insts) != 2 {
+		t.Fatalf("Watch returned %d instances (ok=%v), want 2", len(insts), ok)
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("direct.Watch should close after the fixed snapshot")
+	}
+}
+
+// TestServerUpAndDialledThroughDirect is the claim the README makes: with the
+// direct registry a server comes up and a client reaches it, no Nacos needed.
+// S1 only proved this against a live fake registry, so the shipped path was
+// untested — and direct.Registry used to refuse Expose, which broke exactly
+// this demo.
+func TestServerUpAndDialledThroughDirect(t *testing.T) {
+	srv := startServer(t, newFakeRegistry("nacos"))
+	defer srv.Stop()
+
+	reg, err := direct.New(srv.Addr())
+	if err != nil {
+		t.Fatalf("direct.New: %v", err)
+	}
+	if got := reg.Exposed(svcName); got != 0 {
+		t.Fatalf("direct registry should not have seen the fake registry's server, got %d", got)
+	}
+
+	conn, err := client.Dial(reg, srv.ServiceName(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("client.Dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pong, events := callPair(t, conn, ctx)
+	if pong != "pong" || strings.Join(events, "|") != "a|b|c" {
+		t.Fatalf("got pong=%q events=%v", pong, events)
 	}
 }
 
