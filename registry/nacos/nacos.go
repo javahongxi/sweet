@@ -3,7 +3,9 @@
 //
 // Scope is the ephemeral-instance path: register, deregister, subscribe, and
 // pushes, all over gRPC. Nacos 2.x/3.x carries all of that on the gRPC surface,
-// so this package uses no HTTP at all.
+// so this package uses no HTTP at all. The protocol lives in the nacos package
+// (imported here as naming); this package is the adapter to registry.Registry
+// plus the reconnect-and-replay owner.
 //
 // Two things this package treats as load-bearing, both learned from the live
 // server rather than from reading the request classes:
