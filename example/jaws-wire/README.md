@@ -47,6 +47,20 @@ stream SayHelloStream → "Hello #3, sweet! (from jaws-wire stream)"
   字段一字未改，`java_*` 选项也留着（对 Go 生成无影响）。加 `go_package` 只影响生成代码的
   导入路径，不碰线上格式。
 
-生成桩需要 `protoc-gen-go-grpc`（`go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`）；
-它是**代码生成期的工具**，不引入任何运行时依赖 —— 产物只 import `google.golang.org/grpc` 与
-`google.golang.org/protobuf`，都在现有依赖里。（这与 `gen/` 的做法不同：那里故意不用 grpc 桩。）
+重新生成桩不需要手敲 protoc —— 配方写成了 `go:generate`，就地可跑（完整命令见
+`greeterpb/doc.go`）：
+
+```
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+go generate ./example/jaws-wire/greeterpb
+```
+
+这些插件是**代码生成期的工具**，不引入任何运行时依赖 —— 产物只 import
+`google.golang.org/grpc` 与 `google.golang.org/protobuf`，都在现有依赖里。
+（`gen/` 那边故意不用 grpc 桩，只生成 message 类型，方法名写在代码里。）
+
+上面第三条已做过破坏性验证：删掉两份产物后重跑，重建结果与原件逐字节一致。
+第一次跑失败过，原因是 pragma 里把插件写成裸名 `protoc-gen-go`，而 protoc 按**它自己的
+PATH** 找可执行文件，构建/CI 环境常常没有 `~/go/bin` —— 现在写的是 `$HOME/go/bin/...`
+绝对路径（包在 `sh -c` 里才能展开 `$HOME`，`go:generate` 自身不做变量展开）。
