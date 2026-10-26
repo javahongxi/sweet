@@ -19,4 +19,6 @@
 //
 // Everything in this package except this file is generated — put hand-written
 // notes here, because regenerating wipes comments added inside the .pb.go.
+//
+//go:generate sh -c "protoc -I \"$HOME/github/nacos/api/src/main/proto\" --go_out=. --go_opt=paths=source_relative --go_opt=Mnacos_grpc_service.proto=github.com/javahongxi/sweet/gen \"$HOME/github/nacos/api/src/main/proto/nacos_grpc_service.proto\""
 package gen
