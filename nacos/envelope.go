@@ -13,7 +13,7 @@
 //     headers map (GrpcUtils.java:108-113 clears them before serialising).
 //   - Naming requests never call putHeader(), so for naming the headers map is
 //     empty and the only mandatory fields are type + clientIp.
-package conn
+package nacos
 
 import (
 	"encoding/json"

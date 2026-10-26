@@ -1,4 +1,4 @@
-package conn
+package nacos
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 )
 
 // NACOS_GRPC_ADDR opts the tests into talking to a real Nacos server.
-// Example: NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos/conn -run Live -v
+// Example: NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos -run Live -v
 const envAddr = "NACOS_GRPC_ADDR"
 
 func liveAddr(t *testing.T) string {

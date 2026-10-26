@@ -99,7 +99,7 @@ type Registry interface {
 }
 ```
 
-两个实现：`registry/nacos`（手写协议）与 `registry/direct`（直通）。`Expose` 返回注销闭包；`Watch` 首次调用即订阅，返回的第一个快照来自订阅响应本身（Nacos 的 subscribe 会带回当前实例列表，不需要额外查一次）。
+两个实现：`registry/nacos`（把下面那套手写协议包成 `Registry`）与 `registry/direct`（直通，兼测试替身）。协议本身在 `nacos` 包里（信封、握手、保活探针、重连钩子、推送与 ACK），`registry/nacos` 只做适配与重放。`Expose` 返回注销闭包；`Watch` 首次调用即订阅，返回的第一个快照来自订阅响应本身（Nacos 的 subscribe 会带回当前实例列表，不需要额外查一次）。
 
 ## 测试
 
@@ -108,7 +108,7 @@ go test ./...                                    # 离线，用进程内协议�
 ```
 
 ```
-ok  github.com/javahongxi/sweet/nacos/conn
+ok  github.com/javahongxi/sweet/nacos
 ok  github.com/javahongxi/sweet/registry/nacos
 ok  github.com/javahongxi/sweet/sweettest
 ok  github.com/javahongxi/sweet/interoptest
@@ -117,7 +117,7 @@ ok  github.com/javahongxi/sweet/interoptest
 连真实 Nacos 的测试用环境变量打开（不设就 skip，不会假装跑过）：
 
 ```
-NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos/conn ./registry/nacos ./interoptest -count=1
+NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos ./interoptest -count=1
 ```
 
 几条值得单独看的：

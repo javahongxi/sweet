@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javahongxi/sweet/nacos/conn"
+	naming "github.com/javahongxi/sweet/nacos"
 	"github.com/javahongxi/sweet/registry"
 )
 
@@ -25,7 +25,7 @@ func TestProbeWhoActualPushes(t *testing.T) {
 	defer cancel()
 
 	// Watcher on a raw conn we read ourselves.
-	c, err := conn.Dial(addr)
+	c, err := naming.Dial(addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestProbeWhoActualPushes(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	const service = "sweet.example.v1.ProbePush"
-	_, _, err = c.Unary(ctx, conn.SubscribeServiceRequest{
+	_, _, err = c.Unary(ctx, naming.SubscribeServiceRequest{
 		Namespace: "public", ServiceName: service, GroupName: "DEFAULT_GROUP", Subscribe: true,
 	})
 	if err != nil {

@@ -1,4 +1,4 @@
-package conn
+package nacos
 
 // Naming wire shapes, verified against nacos @3.2.3 (tag c843da5be):
 //

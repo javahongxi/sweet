@@ -1,4 +1,4 @@
-package conn
+package nacos
 
 // Java class simple names that appear in Metadata.type on the naming path.
 // Verified against nacos @3.2.3: GrpcClient.java:404 (setup), :607-625 (setup

@@ -1,5 +1,5 @@
 // Package nacos implements registry.Registry over Nacos' naming protocol with
-// the client protocol written by hand (see nacos/conn) — no nacos-sdk-go.
+// the client protocol written by hand (see the nacos package) — no nacos-sdk-go.
 //
 // Scope is the ephemeral-instance path: register, deregister, subscribe, and
 // pushes, all over gRPC. Nacos 2.x/3.x carries all of that on the gRPC surface,
@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/javahongxi/sweet/nacos/conn"
+	naming "github.com/javahongxi/sweet/nacos"
 	"github.com/javahongxi/sweet/registry"
 )
 
@@ -67,7 +67,7 @@ type Registry struct {
 	opts Options
 
 	mu         sync.Mutex
-	c          *conn.Conn
+	c          *naming.Conn
 	recovering bool
 	closing    bool
 
@@ -215,7 +215,7 @@ func (r *Registry) Close() error {
 	return nil
 }
 
-func (r *Registry) ensureConn(ctx context.Context) (*conn.Conn, error) {
+func (r *Registry) ensureConn(ctx context.Context) (*naming.Conn, error) {
 	r.mu.Lock()
 	c := r.c
 	r.mu.Unlock()
@@ -248,8 +248,8 @@ func (r *Registry) ensureConn(ctx context.Context) (*conn.Conn, error) {
 // dialAndHandshake opens a Conn, wires recovery, and performs the handshake.
 // The hook must be installed before Setup so a stream that dies immediately is
 // still caught.
-func (r *Registry) dialAndHandshake(ctx context.Context) (*conn.Conn, error) {
-	c, err := conn.Dial(r.opts.ServerAddr)
+func (r *Registry) dialAndHandshake(ctx context.Context) (*naming.Conn, error) {
+	c, err := naming.Dial(r.opts.ServerAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +263,7 @@ func (r *Registry) dialAndHandshake(ctx context.Context) (*conn.Conn, error) {
 
 // onStreamLost is the redo trigger. Per §8.6 the disconnect itself sends
 // nothing; a scheduled pass replays every intent still marked live.
-func (r *Registry) onStreamLost(dead *conn.Conn, cause error) {
+func (r *Registry) onStreamLost(dead *naming.Conn, cause error) {
 	r.logf("connection to %s lost (%v); scheduling reconnect", dead.Addr(), cause)
 	dead.CloseStream()
 
@@ -362,7 +362,7 @@ func (r *Registry) replay() error {
 // consumePushes is the single reader of one connection's pushes. The
 // generation check makes a goroutine belonging to a dead connection stop as soon
 // as its channel closes, instead of racing a newer connection's deliveries.
-func (r *Registry) consumePushes(c *conn.Conn) {
+func (r *Registry) consumePushes(c *naming.Conn) {
 	for push := range c.Pushes() {
 		// A goroutine belonging to a superseded connection must stop touching
 		// anything: acking on a stream that is already gone was producing
@@ -371,7 +371,7 @@ func (r *Registry) consumePushes(c *conn.Conn) {
 		if !r.stillCurrent(c) {
 			return
 		}
-		if push.Type != conn.TypeNotifySubscriberRequest {
+		if push.Type != naming.TypeNotifySubscriberRequest {
 			// Anything else (ConnectResetRequest, ClientDetectionRequest, …) is
 			// a server request that expects an answer: ack it so the server does
 			// not hold the slot and re-push.
@@ -393,8 +393,8 @@ func (r *Registry) consumePushes(c *conn.Conn) {
 	}
 }
 
-func (r *Registry) register(ctx context.Context, c *conn.Conn, serviceName string, in registry.Instance) error {
-	req := conn.InstanceRequest{
+func (r *Registry) register(ctx context.Context, c *naming.Conn, serviceName string, in registry.Instance) error {
+	req := naming.InstanceRequest{
 		Namespace:   r.opts.Namespace,
 		ServiceName: serviceName,
 		GroupName:   r.opts.GroupName,
@@ -405,7 +405,7 @@ func (r *Registry) register(ctx context.Context, c *conn.Conn, serviceName strin
 	if err != nil {
 		return err
 	}
-	var resp conn.Response
+	var resp naming.Response
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
 	}
@@ -415,8 +415,8 @@ func (r *Registry) register(ctx context.Context, c *conn.Conn, serviceName strin
 	return nil
 }
 
-func (r *Registry) subscribe(ctx context.Context, c *conn.Conn, serviceName string, subscribe bool) ([]registry.Instance, error) {
-	t, body, err := c.Unary(ctx, conn.SubscribeServiceRequest{
+func (r *Registry) subscribe(ctx context.Context, c *naming.Conn, serviceName string, subscribe bool) ([]registry.Instance, error) {
+	t, body, err := c.Unary(ctx, naming.SubscribeServiceRequest{
 		Namespace:   r.opts.Namespace,
 		ServiceName: serviceName,
 		GroupName:   r.opts.GroupName,
@@ -425,10 +425,10 @@ func (r *Registry) subscribe(ctx context.Context, c *conn.Conn, serviceName stri
 	if err != nil {
 		return nil, err
 	}
-	if t != conn.TypeSubscribeServiceResponse {
+	if t != naming.TypeSubscribeServiceResponse {
 		return nil, fmt.Errorf("nacos: subscribe answered with type %q", t)
 	}
-	var resp conn.SubscribeServiceResponse
+	var resp naming.SubscribeServiceResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
@@ -451,7 +451,7 @@ func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.In
 	if err != nil {
 		return nil, err
 	}
-	t, body, err := c.Unary(ctx, conn.ServiceQueryRequest{
+	t, body, err := c.Unary(ctx, naming.ServiceQueryRequest{
 		Namespace:   r.opts.Namespace,
 		ServiceName: serviceName,
 		GroupName:   r.opts.GroupName,
@@ -463,7 +463,7 @@ func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.In
 	if t != "QueryServiceResponse" {
 		return nil, fmt.Errorf("nacos: query answered with type %q", t)
 	}
-	var resp conn.QueryServiceResponse
+	var resp naming.QueryServiceResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
@@ -474,13 +474,13 @@ func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.In
 }
 
 // stillCurrent reports whether c is the connection this registry is now using.
-func (r *Registry) stillCurrent(c *conn.Conn) bool {
+func (r *Registry) stillCurrent(c *naming.Conn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.c == c
 }
 
-func (r *Registry) currentConn() (*conn.Conn, error) {
+func (r *Registry) currentConn() (*naming.Conn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.c == nil || !r.c.Ready() {
@@ -554,10 +554,10 @@ func (r *Registry) logf(format string, args ...any) {
 // top-level serviceName; identity lives in serviceInfo.name and is qualified
 // ("GROUP@@service" whenever the group is not DEFAULT_GROUP).
 type notifyPush struct {
-	Headers     map[string]string `json:"headers,omitempty"`
-	RequestID   string            `json:"requestId,omitempty"`
-	Namespace   string            `json:"namespace,omitempty"`
-	ServiceInfo conn.ServiceInfo  `json:"serviceInfo"`
+	Headers     map[string]string  `json:"headers,omitempty"`
+	RequestID   string             `json:"requestId,omitempty"`
+	Namespace   string             `json:"namespace,omitempty"`
+	ServiceInfo naming.ServiceInfo `json:"serviceInfo"`
 }
 
 func (n notifyPush) serviceName() string {
@@ -574,7 +574,7 @@ func trimGroup(qualified, group string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(qualified, "DEFAULT_GROUP@@"), "default@@")
 }
 
-func toInstances(hosts []conn.Instance) []registry.Instance {
+func toInstances(hosts []naming.Instance) []registry.Instance {
 	out := make([]registry.Instance, 0, len(hosts))
 	for _, h := range hosts {
 		if !h.Enabled {
@@ -587,7 +587,7 @@ func toInstances(hosts []conn.Instance) []registry.Instance {
 	return out
 }
 
-func toWireInstance(in registry.Instance) conn.Instance {
+func toWireInstance(in registry.Instance) naming.Instance {
 	meta := map[string]string{}
 	for k, v := range in.Metadata {
 		meta[k] = v
@@ -599,7 +599,7 @@ func toWireInstance(in registry.Instance) conn.Instance {
 	if weight == 0 {
 		weight = 100
 	}
-	return conn.Instance{
+	return naming.Instance{
 		IP: in.Host, Port: in.Port, Weight: weight,
 		Healthy: true, Enabled: true, Ephemeral: true,
 		ClusterName: "DEFAULT", Metadata: meta,
@@ -619,9 +619,9 @@ func deregType(in registry.Instance) registry.Instance {
 
 func actionFor(in registry.Instance) string {
 	if in.Metadata[deregMarker] == "1" {
-		return conn.TypeDeregisterInstance
+		return naming.TypeDeregisterInstance
 	}
-	return conn.TypeRegisterInstance
+	return naming.TypeRegisterInstance
 }
 
 func regKey(serviceName string, in registry.Instance) string {
