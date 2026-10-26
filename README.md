@@ -1,22 +1,18 @@
 # sweet
 
-基于 gRPC 的 Go RPC 框架，用 Nacos 做服务注册与发现；Nacos 命名协议的 Go 客户端自己手写，不依赖 nacos-sdk-go。
+基于 gRPC 的 Go RPC 框架，用 Nacos 做注册中心，手写服务注册与发现，不依赖 nacos-sdk-go。
 
-传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。sweet 只管这一层的事——一个 Go 服务如何上线、被对端找到、被调通、下线时不丢请求。
-
-学习/演示性质，不承诺生产可用（无压测、无重试/限流、无版本兼容矩阵）。但下面每条主张都附了可当场跑的命令或测试，跑不出来就算 bug。
+传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。
 
 ## 状态
 
 已完成：注册 / 注销 / 查询 / 订阅 + 推送 + ACK、优雅上下线、连接断开后的重连与重放、保活探针与死流检测。
 
-未做（原因见「不做什么」）：鉴权、TLS、配置中心、持久实例、加权负载均衡、磁盘快照容灾、压测与性能基线。
-
 ## 要求与兼容
 
 - Go ≥ 1.27（`go.mod` 声明 `go 1.27.3`）
 - 唯一第三方依赖：`google.golang.org/grpc v1.84.0`（`google.golang.org/protobuf` 是它自身的依赖，不算第二个库）
-- Nacos 3.x。ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC，没有 HTTP 命名面**（1.x 那套「HTTP 注册 + 长轮询订阅」在 2.x/3.x 已不成立）
+- Nacos 3.x。ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC**
 - 连接地址是 SDK gRPC 口：`9848 = mainPort(8848) + 1000`，不是 HTTP 的 8848
 - 服务端鉴权需关闭（`nacos.core.auth.enabled=false`）
 - 用嵌入式 Derby 时它是单实例锁：再启一个 standalone 会报 `XSDB6`；正确停法是 `bin/shutdown.sh`，进程存活时不要删 `db.lck`
@@ -135,31 +131,5 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos/conn ./registry/nacos ./interopte
 | `TestNacosBackendContract` / `TestHarborBackendContract` | 同一份客户端代码对两个不同实现的服务端都成立 | 两端全绿，无 harbor 分支 |
 | `TestNativeClientCallsSweetServer` / `TestSweetClientDiscoversNativeServer` | 与**改不了的**原生 grpc-go 桩（stock `grpc.health.v1.Health`）互通 | 一元与生成式流方法都通 |
 
-## 不做什么
 
-- 不写私有协议、不写 HTTP/2 帧层：线格式交给 `grpc-go`。需要跨语言互通时应当直接用 gRPC，而不是本项目。
-- 不做服务治理控制面：路由规则、限流、熔断、降级都不是注册发现这一层的事。
-- 不做加权负载均衡：sweet 自己不配负载均衡策略（只有滚动重启那个测试为了断言分布，显式设了 `round_robin`），因此没有任何读 weight 的逻辑。`Weight` 只透传给对端（例如按 weight 做 warmup 的 Java 客户端会读它），Go provider 没有 JIT 预热需求，本地不解释。
-- 不做配置中心模块，也不借用 naming 那条连接做配置长轮询。
-- 不做持久实例（`ephemeral=false`）与其 `BeatReactor` 路径。
-- 不做鉴权、TLS，也不碰服务端的 `negotiator`。
-- 不做磁盘快照容灾，v0 只在内存里保活。
-- 不做 `nacos.address.server.list` 端点列表拉取，用显式 `host:port`。
-- 不做第二个注册中心后端；`Registry` 接口只有两个实现，`direct` 是为「不接注册中心也能开发」和当测试替身而存在。
-
-## 手写 / 用库的边界
-
-设计说明，不是使用文档；放在最后。
-
-| 组成 | 归属 | 内容 |
-|---|---|---|
-| 传输与调用模型 | **用库**（`grpc-go`） | HTTP/2、SETTINGS/流控/HEADERS/DATA/trailers、unary 与三种 stream、codec、interceptor |
-| 服务端封装 | 自写（薄） | `Serve`/`Stop` 生命周期、监听端口回填、注销与 drain 顺序 |
-| 客户端封装 | 自写（薄） | 拼 target（scheme + 服务名）、按连接注入 resolver builder（不注册全局） |
-| `registry` 抽象 | 自写 | 一个接口（`Name`/`Expose`/`Watch`）+ 两个实现：`nacos`（手写协议）、`direct`（直通，兼测试替身） |
-| **Nacos 客户端协议** | **自写（主战场）** | `Payload{Metadata{type,headers}, body}` 信封、bidi 常连与 `ConnectionSetupRequest` 握手（含能力协商）、保活与重连状态机、推送接收与 `requestReply` ACK、注册/注销/查询/订阅 |
-| 实例视图 | 自写 | registry 内部：每个服务名一个带缓冲 channel，推送单点分发；订阅响应自带初始快照。**没有独立的快照数据结构**（无 `view` 包、无 `atomic.Pointer` 换表） |
-| 寻址咬合 | 自写（薄） | `resolver.Builder`/`State`/`ClientConn.UpdateState`；weight 与 metadata 装进 `resolver.Address.Attributes` 交给 balancer |
-| 负载均衡策略 | **用库**（`grpc-go`） | sweet 不设策略，由 grpc-go 决定；没有加权逻辑（只有滚动重启测试为断言分布显式设了 `round_robin`） |
-
-即「客户端负载均衡」目前只做了一半：发现与地址交接是手写的，**选谁**完全交给库。
+&copy; [hongxi.org](http://hongxi.org)
