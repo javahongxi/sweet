@@ -138,8 +138,10 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos ./interoptest -c
 | `TestLiveSetupHandshakeIsAcknowledged` | 真机建连握手能完成 | 拿回服务端能力表 |
 | `TestLiveProbeChannelFacts` | 保活探针在一元通道有应答、在 bidi 流上无人应答 | 两条都断言 |
 | `TestIdleRegistrationSurvives` | 空载时注册是否一直存在（ephemeral 活性＝那条连接） | 3 分钟 12 次探测，实例始终在 |
-| `TestRollingRestartDrill` | provider 重启时消费端不中断 | `calls=176 failures=0`，收敛 562.6ms / 561.3ms |
-| `TestNacosBackendContract` / `TestHarborBackendContract` | 同一份客户端代码对两个不同实现的服务端都成立 | 两端全绿，无 harbor 分支 |
+| `TestRollingRestartDrill` | provider 重启时消费端不中断；失败按 gRPC 状态码分桶，不按字符串 | `calls=180 failures=0`，收敛 559.5ms / 611.1ms |
+| `TestGuardConvertsPanicToStreamLoss` | 长命 goroutine 里的 panic 变成一次流丢失（可重连），既不拖垮进程也不留下 `Ready()==true` 的死连接 | panic→hook 收到原因，`Ready()` 转 false，重握手后 `Epoch()≥2` |
+| `TestCauseStaysClassifiableThroughWrapping` | `%w` 一路包上去之后，调用方仍能用 `errors.As` 取到 gRPC 状态码；目标必须是指向接口的指针（`*status.Status` 不实现 `error`，那种写法编译不过） | 三层包装后 Unavailable / Canceled 都取得到 |
+| `TestBackendsContract/{nacos,harbor}` | 同一份客户端代码对两个不同实现的服务端都成立（表驱动子测试，缺哪个环境变量就 skip 哪个） | 两端全绿，无 harbor 分支 |
 | `TestNativeClientCallsSweetServer` / `TestSweetClientDiscoversNativeServer` | 与**改不了的**原生 grpc-go 桩（stock `grpc.health.v1.Health`）互通 | 一元与生成式流方法都通 |
 
 

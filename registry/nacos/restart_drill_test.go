@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -113,8 +115,8 @@ func TestRollingRestartDrill(t *testing.T) {
 	var calls, fails atomic.Int64
 	byKind := struct {
 		mu    sync.Mutex
-		count map[string]int
-	}{count: map[string]int{}}
+		count map[failKind]int
+	}{count: map[failKind]int{}}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -132,12 +134,8 @@ func TestRollingRestartDrill(t *testing.T) {
 			calls.Add(1)
 			if err != nil {
 				fails.Add(1)
-				key := err.Error()
-				if st, ok := status.FromError(err); ok {
-					key = fmt.Sprintf("%s/%s", st.Code(), classify(st.Message()))
-				}
 				byKind.mu.Lock()
-				byKind.count[key]++
+				byKind.count[kindOf(err)]++
 				byKind.mu.Unlock()
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -172,7 +170,13 @@ func TestRollingRestartDrill(t *testing.T) {
 
 	total, failed := calls.Load(), fails.Load()
 	byKind.mu.Lock()
-	kinds := fmt.Sprint(byKind.count)
+	// Rendered by hand: fmt's map printing sorts keys it can order, and a struct
+	// key is not one of them.
+	kinds := make([]string, 0, len(byKind.count))
+	for k, n := range byKind.count {
+		kinds = append(kinds, fmt.Sprintf("%s/%s=%d", k.code, k.reason, n))
+	}
+	sort.Strings(kinds)
 	byKind.mu.Unlock()
 	t.Logf("calls=%d failures=%d (%s) state-updates=%d convergence=%v",
 		total, failed, kinds, updates.Load(), detected)
@@ -189,30 +193,50 @@ func TestRollingRestartDrill(t *testing.T) {
 	// peer was unreachable. In-flight calls during the drain window may still
 	// fail; that is reported above rather than hidden.
 	for kind, n := range byKind.count {
-		if n > 0 && kind != codes.Unavailable.String()+"/in-flight" {
-			t.Errorf("unexpected failure kind %q: %d calls", kind, n)
+		if n > 0 && kind != tolerated {
+			t.Errorf("unexpected failure kind %+v: %d calls", kind, n)
 		}
 	}
+}
+
+// failKind is one observed call failure, keyed on typed information first. A
+// gRPC status code is part of gRPC's contract, so the assertion above compares
+// codes directly rather than matching a formatted string.
+type failKind struct {
+	code   codes.Code // codes.OK when the error is not a status at all
+	reason string
+}
+
+// tolerated is the only failure the drill accepts: a call that was already in
+// flight when its provider started draining. discovery-empty in particular
+// would mean the push path or the resolver is broken, not that the restart was
+// ungraceful.
+var tolerated = failKind{code: codes.Unavailable, reason: "in-flight"}
+
+// kindOf classifies by code first and, only within a code, by text: "produced
+// zero addresses" (the resolver had not caught up yet) and "connection error"
+// (a call that raced its address away) share code Unavailable, and nothing but
+// the message separates them. errors.As is what reaches the code through
+// whatever %w layers sweet added on the way up; status.FromError would work too
+// but re-reports the whole chain as the message — see nacos/errors_test.go.
+func kindOf(err error) failKind {
+	var gs interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &gs) {
+		st := gs.GRPCStatus()
+		return failKind{code: st.Code(), reason: classify(st.Message())}
+	}
+	return failKind{code: codes.OK, reason: "not-a-status"}
 }
 
 func classify(msg string) string {
 	switch {
-	case contains(msg, "zero addresses"):
+	case strings.Contains(msg, "zero addresses"):
 		return "discovery-empty"
-	case contains(msg, "connection error"), contains(msg, "Connection refused"):
+	case strings.Contains(msg, "connection error"), strings.Contains(msg, "Connection refused"):
 		return "dead-peer"
 	default:
 		return "in-flight"
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 func waitForInstances(t *testing.T, snap *atomic.Value, want int, timeout time.Duration) {

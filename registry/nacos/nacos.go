@@ -32,6 +32,11 @@ import (
 	"github.com/javahongxi/sweet/registry"
 )
 
+// Compile-time proof that this adapter satisfies the abstraction, without any
+// call site having to say so. registry/direct asserts the same for its backend;
+// resolver does it for grpc's Builder and Resolver interfaces.
+var _ registry.Registry = (*Registry)(nil)
+
 // Options configures a Registry.
 type Options struct {
 	// ServerAddr is the SDK gRPC port, i.e. mainPort + 1000 (9848 for 8848).
@@ -288,12 +293,22 @@ func (r *Registry) onStreamLost(dead *naming.Conn, cause error) {
 }
 
 func (r *Registry) recover() {
+	// Losing the reconnect attempt is survivable; crashing the host process is
+	// not. The next Expose/Watch/query calls ensureConn again and re-dials.
+	defer func() {
+		if v := recover(); v != nil {
+			r.mu.Lock()
+			r.recovering = false
+			r.mu.Unlock()
+			r.logf("panic during reconnect: %v; giving up this round", v)
+		}
+	}()
 	for attempt := 0; ; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		c, err := r.dialAndHandshake(ctx)
-		status := r.connStatus()
+		state := r.connStatus()
 		cancel()
-		if status == connStatusClosed {
+		if state == connStatusClosed {
 			return
 		}
 		if err == nil {
@@ -365,6 +380,21 @@ func (r *Registry) replay() error {
 // generation check makes a goroutine belonging to a dead connection stop as soon
 // as its channel closes, instead of racing a newer connection's deliveries.
 func (r *Registry) consumePushes(c *naming.Conn) {
+	// A panic here (decoding a push we did not expect, a nil map from a
+	// malformed payload) is poison on this connection, not a reason to kill the
+	// host process: drop the connection and let the next ensureConn dial a fresh
+	// one, whose replay re-establishes registrations and subscriptions.
+	defer func() {
+		if v := recover(); v != nil {
+			r.logf("panic in push consumer: %v; dropping connection", v)
+			r.mu.Lock()
+			if r.c == c {
+				r.c = nil
+			}
+			r.mu.Unlock()
+			_ = c.Close()
+		}
+	}()
 	for push := range c.Pushes() {
 		// A goroutine belonging to a superseded connection must stop touching
 		// anything: acking on a stream that is already gone was producing

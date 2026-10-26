@@ -14,6 +14,17 @@ import (
 )
 
 // Builder hands every Dial for its scheme a resolver backed by Reg.
+//
+// The assertions say what the package doc only implies: Builder is a grpc
+// resolver.Builder, res is a grpc resolver.Resolver. Naming that in one line per
+// type keeps it true even if the only user of the fact — grpc.WithResolvers in
+// client.Dial, and Build's own return type — is later refactored away, and makes
+// a drift in grpc's interface report here instead of at the call site.
+var (
+	_ resolver.Builder  = Builder{}
+	_ resolver.Resolver = (*res)(nil)
+)
+
 type Builder struct {
 	Reg registry.Registry
 }

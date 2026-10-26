@@ -79,23 +79,30 @@ func runAgainstBackend(t *testing.T, addr string) {
 	}
 }
 
-// TestNacosBackendContract runs the shared contract against Nacos.
-func TestNacosBackendContract(t *testing.T) {
-	addr := os.Getenv("NACOS_GRPC_ADDR")
-	if addr == "" {
-		t.Skip("set NACOS_GRPC_ADDR=127.0.0.1:9848")
-	}
-	runAgainstBackend(t, addr)
+// backends are the two Nacos-protocol servers this repo can be verified
+// against: the reference implementation and harbor. Each is opt-in via its own
+// environment variable, and a missing one skips its subtest rather than
+// silently passing the whole matrix.
+var backends = []struct {
+	name string
+	env  string
+	hint string
+}{
+	{"nacos", "NACOS_GRPC_ADDR", "127.0.0.1:9848"},
+	{"harbor", "SWEET_HARBOR_ADDR", "127.0.0.1:19848 (./run-sample.sh harbor-standalone 19848)"},
 }
 
-// TestHarborBackendContract is the reverse verification: identical client code,
-// no harbor-specific branch, against the registry implemented in jaws.
-func TestHarborBackendContract(t *testing.T) {
-	addr := os.Getenv("SWEET_HARBOR_ADDR")
-	if addr == "" {
-		t.Skip("set SWEET_HARBOR_ADDR=127.0.0.1:19848 (./run-sample.sh harbor-standalone 19848)")
+func TestBackendsContract(t *testing.T) {
+	for _, b := range backends {
+		b := b
+		t.Run(b.name, func(t *testing.T) {
+			addr := os.Getenv(b.env)
+			if addr == "" {
+				t.Skipf("set %s=%s", b.env, b.hint)
+			}
+			runAgainstBackend(t, addr)
+		})
 	}
-	runAgainstBackend(t, addr)
 }
 
 // TestHarborServesThroughDiscovery closes the loop: if harbor also serves the

@@ -18,6 +18,11 @@ import (
 	"github.com/javahongxi/sweet/registry"
 )
 
+// Compile-time proof that the fixed-endpoint registry satisfies the abstraction
+// — the same fact Nope()'s return type states, written where a reader looking
+// for the adapter relationship will actually find it.
+var _ registry.Registry = (*Registry)(nil)
+
 // Registry resolves every service name to a fixed instance list. A zero value
 // is a valid read-only registry (see Nope).
 type Registry struct {

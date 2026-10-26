@@ -256,9 +256,22 @@ func (c *Conn) openStream() error {
 	return nil
 }
 
+// guard turns a panic in one of the connection's long-lived goroutines into a
+// stream failure, i.e. into the same event as "the server walked away". A
+// panic while decoding a frame is a poison on this connection, not a reason to
+// take the whole process down — and leaving the goroutine dead while the
+// connection still reports Ready() is precisely the silent-death failure mode
+// this package exists to avoid.
+func (c *Conn) guard(where string) {
+	if v := recover(); v != nil {
+		c.failStream(fmt.Errorf("nacos: panic in %s: %v", where, v))
+	}
+}
+
 // readLoop owns receives on the bidi stream. Handshake frames are consumed here;
 // everything else is offered to the consumer, which is responsible for acking.
 func (c *Conn) readLoop(cs grpc.ClientStream) {
+	defer c.guard("readLoop")
 	for {
 		var p gen.Payload
 		if err := cs.RecvMsg(&p); err != nil {
@@ -321,17 +334,6 @@ func (c *Conn) failStream(err error) {
 }
 
 // keepAlive issues the application-level HealthCheckRequest, and only when
-// idle: the contract is "无活动超过 connectionKeepAlive 才发" (§8.3), not a fixed
-// timer. gRPC's HTTP/2 keepalive (6min default) is a different layer and is not
-// what makes a Nacos connection count as active.
-//
-// The probe doubles as the only reliable dead-stream detector we have. Measured
-// against an in-process server that ends just this bidi stream: RecvMsg keeps
-// blocking and SendMsg keeps returning nil, because gRPC reports a per-stream
-// close to neither. So an unanswered probe is the failure signal — "失败→
-// UNHEALTHY→重连" (§8.3) — and without it a client can keep a registration
-// that the server already removed.
-// keepAlive issues the application-level HealthCheckRequest, and only when
 // idle: §8.3 says "无活动超过 connectionKeepAlive 才发", not a fixed timer.
 // gRPC's HTTP/2 keepalive (6min default) is a different layer and is not what
 // makes a Nacos connection count as active.
@@ -354,6 +356,7 @@ func (c *Conn) keepAlive() {
 	tick := time.NewTicker(interval)
 	tick.Reset(interval) // do not fire on a connection that is microseconds old
 	defer tick.Stop()
+	defer c.guard("keepAlive")
 	for {
 		select {
 		case <-c.ctx.Done():
