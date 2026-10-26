@@ -3,3 +3,7 @@
 /bin/
 *.test
 coverage.out
+/jaws-wire
+/jaws-wire-client
+/sweet-server
+/sweet-client

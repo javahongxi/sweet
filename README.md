@@ -57,6 +57,17 @@ resolved sweet.example.v1.Ping through nacos registry → Ping="pong" Events=[a 
 Ping: rpc error: code = Unavailable desc = name resolver error: produced zero addresses
 ```
 
+### 跨语言：调 jaws 的 Java gRPC 服务端
+
+对端是 jaws 的 `WireProvider`（一行都改不了），调用侧是 `greeter.proto` 生成的标准 Go 桩，
+只把 `conn` 换成 `client.Dial` 给的。跑法与实测输出见 `example/jaws-wire/README.md`：
+
+```
+go run ./example/jaws-wire -name sweet
+unary  SayHello        → "Hello, sweet! (from jaws-wire)"
+stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
+```
+
 ## 用法
 
 ### 服务端

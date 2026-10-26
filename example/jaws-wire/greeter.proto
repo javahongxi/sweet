@@ -1,0 +1,38 @@
+// Copied from jaws (org.hongxi.jaws:jaws-sample-wire-api)
+// src/main/proto/greeter.proto — the service definition, package, service and
+// method names are unchanged. Only `option go_package` is added, which affects
+// nothing on the wire. Apache License 2.0 as in the source repository.
+
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "org.hongxi.jaws.sample.wire.proto";
+option java_outer_classname = "GreeterProto";
+option go_package = "github.com/javahongxi/sweet/example/jaws-wire/greeterpb";
+
+package greeter;
+
+// The greeting service definition.
+service Greeter {
+  // Sends a greeting (unary)
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+
+  // Sends a stream of greetings (server streaming)
+  rpc SayHelloStream (HelloRequest) returns (stream HelloReply) {}
+
+  // Client streaming: client streams names, server replies with a single greeting
+  rpc ClientStreamGreet (stream HelloRequest) returns (HelloReply) {}
+
+  // Bidirectional streaming: client streams names, server streams greetings
+  rpc BidiGreet (stream HelloRequest) returns (stream HelloReply) {}
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+}
+
+// The response message containing the greetings.
+message HelloReply {
+  string message = 1;
+}
