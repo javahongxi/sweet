@@ -14,8 +14,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/javahongxi/sweet/client"
+	"github.com/javahongxi/sweet/example/helloworld/ping"
 	"github.com/javahongxi/sweet/registry"
 	"github.com/javahongxi/sweet/registry/direct"
 	nacosregistry "github.com/javahongxi/sweet/registry/nacos"
@@ -29,20 +32,23 @@ const healthService = "grpc.health.v1.Health"
 
 // TestNativeClientCallsSweetServer: a stock grpc-go client, with no sweet code
 // on its side, must reach a service registered on sweet's server.
+//
+// The service it reaches is sweet's own health service — registered by the
+// framework, not by this test — so a SERVING answer here is also evidence that
+// the framework flipped the status once Serve had bound and exposed.
 func TestNativeClientCallsSweetServer(t *testing.T) {
 	srv, err := server.New(server.Options{
 		// ":0" and let Serve bind it: pre-binding a listener and handing its
 		// address to Serve would ask for the same port twice.
-		Address:     "127.0.0.1:0",
-		ServiceName: healthService,
-		Registry:    direct.Nope(), // this leg measures the RPC plane, not discovery
+		Address:  "127.0.0.1:0",
+		Registry: direct.Nope(), // this leg measures the RPC plane, not discovery
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
-	hs := health.NewServer()
-	srv.GRPCServer().RegisterService(&healthpb.Health_ServiceDesc, hs)
-	hs.SetServingStatus(healthService, healthpb.HealthCheckResponse_SERVING)
+	if err := srv.Register(&ping.ServiceDesc, pingServer{}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 
 	go func() { _ = srv.Serve() }()
 	if err := srv.Listen(); err != nil {
@@ -59,18 +65,111 @@ func TestNativeClientCallsSweetServer(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: healthService})
+
+	// The overall service, and the registered one by name: the second is what
+	// proves sweet tracked Register rather than just reporting "I am up".
+	for _, name := range []string{"", ping.ServiceName} {
+		resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: name})
+		if err != nil {
+			t.Fatalf("native client → sweet server (service %q): %v", name, err)
+		}
+		if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+			t.Fatalf("service %q status = %v, want SERVING", name, resp.GetStatus())
+		}
+		t.Logf("stock grpc-go client reached sweet's server: %q → %v", name, resp.GetStatus())
+	}
+
+	// Guard for how health and reflection are wired: they are registered straight
+	// on the grpc.Server, so they must not be mistaken for the instance's service
+	// name when Options.ServiceName is left to Register's descriptor.
+	if got := srv.ServiceName(); got != ping.ServiceName {
+		t.Fatalf("ServiceName() = %q, want %q — a built-in service leaked into the inference", got, ping.ServiceName)
+	}
+}
+
+// pingServer is the smallest thing that satisfies the hand-written ping service:
+// these tests only need a registered descriptor name to exist.
+type pingServer struct{}
+
+func (pingServer) Ping(context.Context, *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+	return wrapperspb.String("pong"), nil
+}
+
+func (pingServer) Events(*wrapperspb.StringValue, grpc.ServerStreamingServer[wrapperspb.StringValue]) error {
+	return nil
+}
+
+func (pingServer) Echo(grpc.BidiStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
+	return nil
+}
+
+func (pingServer) Ack(grpc.ClientStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
+	return nil
+}
+
+// TestReflectionListsRegisteredService: reflection is built in, so a standard
+// tool with no sweet code in it can enumerate what an instance serves — the
+// grpcurl equivalent is measured in the README.
+func TestReflectionListsRegisteredService(t *testing.T) {
+	srv, err := server.New(server.Options{
+		Address:  "127.0.0.1:0",
+		Registry: direct.Nope(),
+	})
 	if err != nil {
-		t.Fatalf("native client → sweet server: %v", err)
+		t.Fatalf("server.New: %v", err)
 	}
-	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
-		t.Fatalf("status = %v, want SERVING", resp.GetStatus())
+	if err := srv.Register(&ping.ServiceDesc, pingServer{}); err != nil {
+		t.Fatalf("register: %v", err)
 	}
-	t.Logf("stock grpc-go client reached sweet's server: %v", resp.GetStatus())
+	go func() { _ = srv.Serve() }()
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(srv.Addr(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("native dial: %v", err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rc, err := reflectionpb.NewServerReflectionClient(conn).ServerReflectionInfo(ctx)
+	if err != nil {
+		t.Fatalf("ServerReflectionInfo: %v", err)
+	}
+	if err := rc.Send(&reflectionpb.ServerReflectionRequest{
+		MessageRequest: &reflectionpb.ServerReflectionRequest_ListServices{ListServices: "*"},
+	}); err != nil {
+		t.Fatalf("ListServices send: %v", err)
+	}
+	got, err := rc.Recv()
+	if err != nil {
+		t.Fatalf("ListServices recv: %v", err)
+	}
+	var names []string
+	for _, s := range got.GetListServicesResponse().GetService() {
+		names = append(names, s.GetName())
+	}
+	t.Logf("reflection lists %d services: %v", len(names), names)
+	for _, want := range []string{ping.ServiceName, healthService} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("reflection did not list %q; got %v", want, names)
+		}
+	}
 }
 
 // TestNativeServerAcceptsGeneratedStreamViaSweet: streaming must survive the
-// same way, since Health.Watch is the generated server-streaming method.
+// same way, since Health.Watch is the generated server-streaming method. The
+// health service watched here is the one sweet registers itself.
 func TestNativeServerAcceptsGeneratedStreamViaSweet(t *testing.T) {
 	srv, err := server.New(server.Options{
 		Address:     "127.0.0.1:0",
@@ -80,9 +179,6 @@ func TestNativeServerAcceptsGeneratedStreamViaSweet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
-	hs := health.NewServer()
-	srv.GRPCServer().RegisterService(&healthpb.Health_ServiceDesc, hs)
-	hs.SetServingStatus(healthService, healthpb.HealthCheckResponse_SERVING)
 	go func() { _ = srv.Serve() }()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Serve: %v", err)
@@ -102,7 +198,7 @@ func TestNativeServerAcceptsGeneratedStreamViaSweet(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stream, err := healthpb.NewHealthClient(conn).Watch(ctx, &healthpb.HealthCheckRequest{Service: healthService})
+	stream, err := healthpb.NewHealthClient(conn).Watch(ctx, &healthpb.HealthCheckRequest{Service: ""})
 	if err != nil {
 		t.Fatalf("Watch via sweet resolver: %v", err)
 	}

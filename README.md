@@ -6,12 +6,13 @@
 
 ## 状态
 
-已完成：注册 / 注销 / 查询 / 订阅 + 推送 + ACK、优雅上下线、连接断开后的重连与重放、保活探针与死流检测。
+已完成：注册 / 注销 / 查询 / 订阅 + 推送 + ACK、优雅上下线、连接断开后的重连与重放、保活探针与死流检测、内置 gRPC 反射与健康服务。
 
 ## 要求与兼容
 
 - Go ≥ 1.27（`go.mod` 声明 `go 1.27.3`）
 - 唯一第三方依赖：`google.golang.org/grpc v1.84.0`（`google.golang.org/protobuf` 是它自身的依赖，不算第二个库）
+- 内置的反射与健康服务同样来自 `grpc-go`（`google.golang.org/grpc/reflection`、`.../health`），依赖清单不因它们变长
 - Nacos 3.x。ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC**
 - 连接地址是 SDK gRPC 口：`9848 = mainPort(8848) + 1000`，不是 HTTP 的 8848
 - 服务端鉴权需关闭（`nacos.core.auth.enabled=false`）
@@ -80,6 +81,38 @@ go run ./example/jaws-wire -name sweet
 unary  SayHello        → "Hello, sweet! (from jaws-wire)"
 stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
 ```
+
+## 标准工具能直接看见它
+
+`server.New` 顺手注册了 gRPC 反射与健康服务——两者都在 `grpc-go` 自己仓库里，不构成第二个
+依赖。意义不在"多了两个服务"，而在**对端不需要知道 sweet 存在**：`grpcurl` 这类标准工具能自己
+列出实例上有什么服务、读出 schema、直接调一刀。实测（2026-10-28，`grpcurl 1.9.4`，对端
+`go run ./example/greeter/cmd/server -registry=direct -listen 127.0.0.1:20001`）：
+
+```
+$ grpcurl -plaintext localhost:20001 list
+grpc.health.v1.Health
+grpc.reflection.v1.ServerReflection
+grpc.reflection.v1alpha.ServerReflection
+sweet.example.v1.Greeter
+
+$ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.example.v1.Greeter/GreetStream
+{
+  "message": "Hello #1, grpcurl!"
+}
+{
+  "message": "Hello #2, grpcurl!"
+}
+```
+
+`describe sweet.example.v1.Greeter` 会把四个 rpc 的完整 schema 打出来（含 `stream` 标注），
+说明列出来的不只是名字。
+
+健康状态跟着 sweet 的生命周期走，而不是恒为 `SERVING`：`grpc-go` 的 `health.NewServer()` 一
+开始就把总体服务标成 SERVING，而那时还没监听，所以 `New` 里显式改成 `NOT_SERVING`，直到
+`Serve` 绑好端口并 `Expose` 成功才翻成 SERVING（注册的每个服务名各自一份状态）；`Stop` 一开始
+就 `Shutdown()`，比注销更早一步告诉探活方"别再发流量了"。`interoptest` 里
+`TestNativeClientCallsSweetServer` 用一个**不带任何 sweet 代码**的原生健康客户端把这两件事断言住。
 
 ## 用法
 

@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/javahongxi/sweet/registry"
 )
@@ -48,6 +51,14 @@ type Server struct {
 	opts Options
 	grpc *grpc.Server
 
+	// health is the stock gRPC health service, and reflection is registered
+	// beside it. Both live inside grpc-go, so neither is a second dependency,
+	// and both are wired unconditionally: an instance that peers can resolve
+	// should also be an instance a standard tool can inspect and probe without
+	// the framework's own code on the other side.
+	health *health.Server
+	names  []string // descriptor names passed to Register, for health status
+
 	mu      sync.Mutex
 	lis     net.Listener
 	host    string
@@ -72,7 +83,25 @@ func New(opts Options) (*Server, error) {
 	if opts.Weight == 0 {
 		opts.Weight = 100
 	}
-	return &Server{opts: opts, grpc: grpc.NewServer(opts.ServerOptions...), ready: make(chan struct{}), fail: make(chan error, 1)}, nil
+	s := &Server{
+		opts:   opts,
+		grpc:   grpc.NewServer(opts.ServerOptions...),
+		health: health.NewServer(),
+		ready:  make(chan struct{}),
+		fail:   make(chan error, 1),
+	}
+	// Registered straight on the grpc.Server, never through Register: the latter
+	// adopts the descriptor name as this instance's service name when
+	// Options.ServiceName is empty, and the last thing a peer should resolve is
+	// a health probe.
+	s.grpc.RegisterService(&healthpb.Health_ServiceDesc, s.health)
+	reflection.Register(s.grpc)
+	// health.NewServer starts the overall service at SERVING (see
+	// grpc/health/server.go). Nothing is listening yet, so correct that: the
+	// status moves to SERVING only when Serve has bound the listener and
+	// exposed the instance, and back to NOT_SERVING at the start of Stop.
+	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+	return s, nil
 }
 
 // GRPCServer exposes the underlying server for service registration with
@@ -85,6 +114,7 @@ func (s *Server) Register(sd *grpc.ServiceDesc, ss any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.grpc.RegisterService(sd, ss)
+	s.names = append(s.names, sd.ServiceName)
 	if s.opts.ServiceName == "" {
 		s.opts.ServiceName = sd.ServiceName
 	}
@@ -168,14 +198,24 @@ func (s *Server) Serve() error {
 	s.mu.Lock()
 	s.unreg = unreg
 	s.started = true
+	names := append([]string(nil), s.names...)
 	s.mu.Unlock()
+
+	// Statuses move to SERVING before peers are told the instance exists, and
+	// this still happens before grpc.Serve starts accepting, so there is no
+	// window in which a probe could observe SERVING for an address that refuses
+	// connections — nor NOT_SERVING for one that is already answering.
+	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	for _, name := range names {
+		s.health.SetServingStatus(name, healthpb.HealthCheckResponse_SERVING)
+	}
 	close(s.ready)
 
 	return s.grpc.Serve(lis)
 }
 
-// Stop deregisters first, waits out the drain window, then stops the gRPC
-// server gracefully. Safe to call once.
+// Stop marks the instance unhealthy first, deregisters, waits out the drain
+// window, then stops the gRPC server gracefully. Safe to call once.
 func (s *Server) Stop() {
 	s.mu.Lock()
 	if s.stopped || !s.started {
@@ -185,6 +225,12 @@ func (s *Server) Stop() {
 	s.stopped = true
 	unreg := s.unreg
 	s.mu.Unlock()
+
+	// Shutdown flips every status — the overall one and each registered service
+	// — to NOT_SERVING and keeps them there. It comes before the deregistration
+	// so that a probe-based router is never *later* to learn about the shutdown
+	// than the registry is; both say "stop sending" in the same order.
+	s.health.Shutdown()
 
 	if unreg != nil {
 		unreg()
