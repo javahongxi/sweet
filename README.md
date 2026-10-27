@@ -82,132 +82,6 @@ unary  SayHello        → "Hello, sweet! (from jaws-wire)"
 stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
 ```
 
-## 作为依赖引入
-
-Go 的模块路径就是仓库地址，别人不用 clone 也不用 `replace`：
-
-```
-go get github.com/javahongxi/sweet
-go mod tidy
-```
-
-实测（2026-10-28，在仓库外新建的 `example.com/consumer` 模块里，Go 1.27.3，`GOPROXY=https://goproxy.cn,direct`）：
-`go get` 解析到 `v0.0.0-20261027193012-b3fc07f6887d`，`go mod tidy` 之后 `go.mod` 的直接依赖只有三行：
-
-```
-require (
-	github.com/javahongxi/sweet v0.0.0-20261027193012-b3fc07f6887d
-	google.golang.org/grpc v1.84.0
-	google.golang.org/protobuf v1.36.12
-)
-```
-
-后两条是**这个示例自己 import** 了 `grpc` 与 `wrapperspb` 才会成为直接依赖；除此之外没有别的
-库被拽进来，与上面「唯一第三方依赖」是同一条口径。
-
-`go mod tidy` 不是可选的第二步：`go get` 只把 sweet 自己写进 `go.mod`，它的传递依赖要等
-`go mod tidy` 补齐 `go.sum`。漏掉的话 `go build` 一次报回 8 条 `missing go.sum entry`（本机实测），
-点名的是 `google.golang.org/grpc`、`.../grpc/resolver`、`.../grpc/attributes`、
-`.../grpc/credentials/insecure`、`.../grpc/health`、`.../grpc/health/grpc_health_v1`、
-`.../grpc/reflection` 与 `google.golang.org/protobuf/types/known/wrapperspb`——全都在 grpc-go 与
-protobuf 之内，其中 `health` 与 `reflection` 两条正是内置反射与健康服务带进来的。照提示 tidy
-一遍即可。
-
-两点得说在前面：
-
-- **还没有语义化版本的 tag**（`git tag -l` 与 `git ls-remote --tags origin` 均为空），所以拿到的是
-  pseudo-version。要钉住就 `go get github.com/javahongxi/sweet@<commit>` 或 `@main`；`@latest`
-  目前也会解析到默认分支那个 pseudo-version。
-- 首次拉取偶发 `verifying module: ... sum.golang.google.cn ...: read: connection reset by peer`。
-  那是校验和数据库连接的抖动（本机走的是 IPv6），**重试即可**，不是仓库的问题——实测第二次就过了。
-
-能跑的最小组合，仓库外模块里的一个 `main.go`。服务直接复用 sweet 自带的 example（手写
-`grpc.ServiceDesc`），所以这一发连 protoc 都不用碰；`ping.Server` 列了四种方法形态，四个都得
-实现，两个流式的空实现就是 `return nil`：
-
-```go
-package main
-
-import (
-	"context"
-	"log"
-	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/wrapperspb"
-
-	"github.com/javahongxi/sweet/client"
-	"github.com/javahongxi/sweet/example/helloworld/ping"
-	"github.com/javahongxi/sweet/registry/direct"
-	"github.com/javahongxi/sweet/server"
-)
-
-func main() {
-	srv, err := server.New(server.Options{
-		Address:     "127.0.0.1:0",
-		ServiceName: ping.ServiceName,
-		Registry:    direct.Nope(), // 这一发只要 RPC 面，不要发现
-	})
-	if err != nil {
-		log.Fatalf("server.New: %v", err)
-	}
-	if err := srv.Register(&ping.ServiceDesc, pingImpl{}); err != nil {
-		log.Fatalf("Register: %v", err)
-	}
-	go func() { _ = srv.Serve() }() // Serve 阻塞
-	if err := srv.Listen(); err != nil {
-		log.Fatalf("Listen: %v", err)
-	}
-	defer srv.Stop()
-
-	peer, err := direct.New(srv.Addr())
-	if err != nil {
-		log.Fatalf("direct.New: %v", err)
-	}
-	conn, err := client.Dial(peer, ping.ServiceName,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("client.Dial: %v", err)
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	pong, err := ping.NewClient(conn).Ping(ctx, "from-outside")
-	if err != nil {
-		log.Fatalf("Ping: %v", err)
-	}
-	log.Printf("sweet reached from another module: served on %s, Ping=%q", srv.Addr(), pong)
-}
-
-type pingImpl struct{}
-
-func (pingImpl) Ping(context.Context, *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
-	return wrapperspb.String("pong"), nil
-}
-func (pingImpl) Events(*wrapperspb.StringValue, grpc.ServerStreamingServer[wrapperspb.StringValue]) error {
-	return nil
-}
-func (pingImpl) Echo(grpc.BidiStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
-	return nil
-}
-func (pingImpl) Ack(grpc.ClientStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
-	return nil
-}
-```
-
-`go run ./quickstart` 的原文。上面那个代码块是从本文件机械抽出的（`awk` 取 ```go 围栏），
-在 `example.com/rehearsal` 这个仓库外模块里 `go get` → `go mod tidy` → `go run` 原样跑通的：
-
-```
-2026/10/28 03:44:20 sweet reached from another module: served on 127.0.0.1:53961, Ping="pong"
-```
-
-要接真注册中心，把 `direct.Nope()` 与 `direct.New(addr)` 换成
-`nacosregistry.New(nacosregistry.Options{ServerAddr: "127.0.0.1:9848"})`，客户端此后只认服务名、
-不再需要任何地址；完整写法照 `example/greeter/cmd/{server,client}`。
-
 ## 标准工具能直接看见它
 
 `server.New` 顺手注册了 gRPC 反射与健康服务——两者都在 `grpc-go` 自己仓库里，不构成第二个
@@ -241,6 +115,13 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
 `TestNativeClientCallsSweetServer` 用一个**不带任何 sweet 代码**的原生健康客户端把这两件事断言住。
 
 ## 用法
+
+模块路径就是仓库地址，不用 clone、不用 `replace`：
+
+```
+go get github.com/javahongxi/sweet   # 尚无 tag，装的是 pseudo-version；钉住写 @main 或 @<commit>
+go mod tidy                          # 补齐 go.sum，跳过这步 build 会报 missing go.sum entry
+```
 
 ### 服务端
 
