@@ -45,37 +45,56 @@ registry=direct is a passthrough: clients should dial -endpoints 127.0.0.1:20001
 sweet server up: listen=127.0.0.1:20001 advertised=127.0.0.1:20001 service=sweet.example.v1.Greeter registry=direct
 
 # client
-resolved sweet.example.v1.Greeter through direct registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet! Hello #2, sweet! Hello #3, sweet!]
-GreetChat (bidi, 3 requests in) → [Hello, a! Hello, b! Hello, c!]
-GreetAll (client-streaming, 3 requests in) → "Hello, a, b, c!"
+resolved sweet.example.v1.Greeter through direct registry
+Greet       <= "Hello, sweet!"
+GreetStream <= 1 "Hello #1, sweet!"
+GreetStream <= 2 "Hello #2, sweet!"
+GreetStream <= 3 "Hello #3, sweet!"
+GreetStream == 3 frames, closed by server
+GreetChat   <= 1 "Hello, a!"
+GreetChat   <= 2 "Hello, b!"
+GreetChat   <= 3 "Hello, c!"
+GreetChat   == 3 frames from 3 requests, closed by server
+GreetAll    <= "Hello, a, b, c!"
+GreetAll    == 1 frame from 3 requests
 ```
 
-四个入口的入参：一元与 server-streaming 用 `-name` / `-times`，客户端流与双向流用 `-names`
-（一个名字一帧）。`-times 1` 只收到一条：
+流式方法**每收到一帧打一行**（`<=` 带帧号），`==` 那行是流被服务端正常关闭（`io.EOF`）后的收尾计数。
+把整条流收进切片再一次打印，就把"这是流"这件事从输出里抹掉了：看不出帧是陆续到的，也看不出流中途
+断掉时已经落了几帧——下面 `-names "a,,c"` 那发的 `after 1 frames` 就是这个计数在起作用。
+
+一元与服务端流的入参是 `-name` / `-times`，两种流式的入参是 `-names`（一个名字一帧）。
+`-times 1` 时流里只有一帧，收尾行也跟着变单数：
 
 ```
-resolved sweet.example.v1.Greeter through direct registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet!]
+GreetStream <= 1 "Hello #1, sweet!"
+GreetStream == 1 frame, closed by server
 ```
 
 `-names alice,bob` 发两帧，双向流答两条、客户端流合成一条：
 
 ```
-GreetChat (bidi, 2 requests in) → [Hello, alice! Hello, bob!]
-GreetAll (client-streaming, 2 requests in) → "Hello, alice, bob!"
+GreetChat   <= 1 "Hello, alice!"
+GreetChat   <= 2 "Hello, bob!"
+GreetChat   == 2 frames from 2 requests, closed by server
+GreetAll    <= "Hello, alice, bob!"
+GreetAll    == 1 frame from 2 requests
 ```
 
 `-names ""` 一帧都不发，两种语义在这里分道：双向流没收到名字就不答（不算错），客户端流
 承诺了一个回复，零帧是 `InvalidArgument`：
 
 ```
-GreetChat (bidi, 0 requests in) → []
+GreetChat   == 0 frames from 0 requests, closed by server
 GreetAll CloseAndRecv: rpc error: code = InvalidArgument desc = at least one name is required
 ```
 
-`-names "a,,c"` 的空名先被双向流撞掉，进程随即退出，这一发没轮到客户端流：
+`-names "a,,c"` 的空名先被双向流撞掉，进程随即退出，这一发没轮到客户端流。`(after 1 frame)`
+就是逐帧计数的用处——一眼看出流是在第几帧上断的：
 
 ```
-GreetChat Recv: rpc error: code = InvalidArgument desc = name is required
+GreetChat   <= 1 "Hello, a!"
+GreetChat Recv: rpc error: code = InvalidArgument desc = name is required (after 1 frame)
 ```
 
 一元的 `-name ""` 打到的是同一个 `checkName`（四个入口共用一处校验，见下文
@@ -99,12 +118,21 @@ go run ./example/greeter/cmd/client -registry=nacos -server 127.0.0.1:9848
 sweet server up: listen=127.0.0.1:20002 advertised=127.0.0.1:20002 service=sweet.example.v1.Greeter registry=nacos
 
 # client
-resolved sweet.example.v1.Greeter through nacos registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet! Hello #2, sweet! Hello #3, sweet!]
-GreetChat (bidi, 3 requests in) → [Hello, a! Hello, b! Hello, c!]
-GreetAll (client-streaming, 3 requests in) → "Hello, a, b, c!"
+resolved sweet.example.v1.Greeter through nacos registry
+Greet       <= "Hello, sweet!"
+GreetStream <= 1 "Hello #1, sweet!"
+GreetStream <= 2 "Hello #2, sweet!"
+GreetStream <= 3 "Hello #3, sweet!"
+GreetStream == 3 frames, closed by server
+GreetChat   <= 1 "Hello, a!"
+GreetChat   <= 2 "Hello, b!"
+GreetChat   <= 3 "Hello, c!"
+GreetChat   == 3 frames from 3 requests, closed by server
+GreetAll    <= "Hello, a, b, c!"
+GreetAll    == 1 frame from 3 requests
 ```
 
-客户端这一行只证明「解析到了一个地址并能调用」，不证明注册名就是生成码那个名字，所以另查一次
+客户端这几行只证明「解析到了一个地址并能调用」，不证明注册名就是生成码那个名字，所以另查一次
 Nacos 自己的管理面（HTTP 8848，与客户端走的 gRPC 9848 是两条面）：
 
 ```
@@ -159,7 +187,7 @@ func checkName(name string) error {
   满足——`GreetChat` 由内嵌件顶上。信号要到调用时才出现，服务端全程没有一句提示：
 
 ```
-GreetChat Recv: rpc error: code = Unimplemented desc = method GreetChat not implemented
+GreetChat Recv: rpc error: code = Unimplemented desc = method GreetChat not implemented (after 0 frames)
 ```
 
 - **签名写错**（多一个参数）：`var _ pb.GreeterServer = greeter{}` 让它在 build 期就炸，

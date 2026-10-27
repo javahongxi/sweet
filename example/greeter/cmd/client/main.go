@@ -15,6 +15,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,14 @@ import (
 
 	pb "github.com/javahongxi/sweet/example/greeter/greeterpb"
 )
+
+// plural counts a noun the way these lines should read: "1 frame", "3 frames".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return strconv.Itoa(n) + " " + noun + "s"
+}
 
 func main() {
 	registryKind := flag.String("registry", "nacos", "nacos | direct")
@@ -81,26 +90,31 @@ func main() {
 		log.Fatalf("Greet: %v", err)
 	}
 
+	log.Printf("resolved %s through %s registry", *service, reg.Name())
+	log.Printf("Greet       <= %q", reply.GetMessage())
+
 	stream, err := cli.GreetStream(ctx, &pb.GreetRequest{Name: *name, Times: int32(*times)})
 	if err != nil {
 		log.Fatalf("GreetStream: %v", err)
 	}
-	var hellos []string
+	// One line per received frame, printed as it arrives: collecting the whole
+	// stream into a slice and printing it once would hide that this is a stream,
+	// and would hide how many frames had landed if the stream ever broke early.
+	frames := 0
 	for {
 		// Recv returns io.EOF when the server closes the stream, which is the
 		// hand-written client's only real extra work: ping.Events hides this loop.
 		m, err := stream.Recv()
 		if err == io.EOF {
+			log.Printf("GreetStream == %s, closed by server", plural(frames, "frame"))
 			break
 		}
 		if err != nil {
-			log.Fatalf("GreetStream Recv: %v", err)
+			log.Fatalf("GreetStream Recv: %v (after %s)", err, plural(frames, "frame"))
 		}
-		hellos = append(hellos, m.GetMessage())
+		frames++
+		log.Printf("GreetStream <= %d %q", frames, m.GetMessage())
 	}
-
-	log.Printf("resolved %s through %s registry → Greet=%q GreetStream=%v",
-		*service, reg.Name(), reply.GetMessage(), hellos)
 
 	// Bidirectional: the server answers each name as it arrives. Requests are sent
 	// first and replies read afterwards here, which is safe for a handful of small
@@ -119,18 +133,20 @@ func main() {
 	if err := chat.CloseSend(); err != nil {
 		log.Fatalf("GreetChat CloseSend: %v", err)
 	}
-	var chats []string
+	frames = 0
 	for {
 		m, err := chat.Recv()
 		if err == io.EOF {
+			log.Printf("GreetChat   == %s from %s, closed by server",
+				plural(frames, "frame"), plural(len(speakers), "request"))
 			break
 		}
 		if err != nil {
-			log.Fatalf("GreetChat Recv: %v", err)
+			log.Fatalf("GreetChat Recv: %v (after %s)", err, plural(frames, "frame"))
 		}
-		chats = append(chats, m.GetMessage())
+		frames++
+		log.Printf("GreetChat   <= %d %q", frames, m.GetMessage())
 	}
-	log.Printf("GreetChat (bidi, %d requests in) → %v", len(speakers), chats)
 
 	// Client streaming: many requests in, exactly one reply out. CloseAndRecv is the
 	// half-close plus that reply; the server sees the half-close as io.EOF from Recv,
@@ -148,5 +164,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("GreetAll CloseAndRecv: %v", err)
 	}
-	log.Printf("GreetAll (client-streaming, %d requests in) → %q", len(speakers), allReply.GetMessage())
+	log.Printf("GreetAll    <= %q", allReply.GetMessage())
+	log.Printf("GreetAll    == %s from %s", plural(1, "frame"), plural(len(speakers), "request"))
 }
