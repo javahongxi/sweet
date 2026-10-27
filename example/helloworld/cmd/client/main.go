@@ -1,7 +1,8 @@
 // Command client resolves a service through a registry and calls it.
 //
-// With -registry=direct the "registry" is just the fixed endpoints passed in
-// -endpoints, which is what runs today. The nacos path is not implemented yet.
+// -registry=nacos (the default) discovers the instance by service name alone.
+// -registry=direct is a passthrough that discovers nothing, so the caller has to
+// pass the address in -endpoints.
 package main
 
 import (

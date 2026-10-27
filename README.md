@@ -82,7 +82,7 @@ srv, err := server.New(server.Options{
     DrainDelay:  200 * time.Millisecond, // Stop 在注销后、停止 accept 前额外等待
 })
 
-srv.Register(&pb.GreeterServiceDesc, impl)   // 用生成码的 ServiceDesc，不另造服务标识
+srv.Register(&pb.Greeter_ServiceDesc, impl)  // 用生成码的 ServiceDesc，不另造服务标识
 go func() { _ = srv.Serve() }()              // Serve 阻塞，直到 Stop 才返回
 if err := srv.Listen(); err != nil { ... }   // 同步点：返回 nil 后 Addr()/Port() 才可读
 defer srv.Stop()                             // 注销 → 等 drain → GracefulStop
