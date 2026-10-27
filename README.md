@@ -105,6 +105,14 @@ require (
 后两条是**这个示例自己 import** 了 `grpc` 与 `wrapperspb` 才会成为直接依赖；除此之外没有别的
 库被拽进来，与上面「唯一第三方依赖」是同一条口径。
 
+`go mod tidy` 不是可选的第二步：`go get` 只把 sweet 自己写进 `go.mod`，它的传递依赖要等
+`go mod tidy` 补齐 `go.sum`。漏掉的话 `go build` 一次报回 8 条 `missing go.sum entry`（本机实测），
+点名的是 `google.golang.org/grpc`、`.../grpc/resolver`、`.../grpc/attributes`、
+`.../grpc/credentials/insecure`、`.../grpc/health`、`.../grpc/health/grpc_health_v1`、
+`.../grpc/reflection` 与 `google.golang.org/protobuf/types/known/wrapperspb`——全都在 grpc-go 与
+protobuf 之内，其中 `health` 与 `reflection` 两条正是内置反射与健康服务带进来的。照提示 tidy
+一遍即可。
+
 两点得说在前面：
 
 - **还没有语义化版本的 tag**（`git tag -l` 与 `git ls-remote --tags origin` 均为空），所以拿到的是
