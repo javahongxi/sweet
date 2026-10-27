@@ -163,7 +163,7 @@ call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传
 | 内置 gRPC 反射与健康服务 | `TestNativeClientCallsSweetServer`、`TestReflectionListsRegisteredService` | 见下一节的 grpcurl 外部实测 |
 | 重试走 gRPC 原生 service config，sweet 不自带重试旋钮 | `TestNativeRetryAppliesThroughSweetDial` + 负对照 `TestWithoutRetryConfigTheInjectionSticks` | 配 retryPolicy 时服务端看到 3 次尝试、调用成功；不配时只看到 1 次并直接把 UNAVAILABLE 抛给调用方（grpc-go 对 UNAVAILABLE 不做透明重试） |
 | 手写 `ServiceDesc` 与生成码一样会走服务端一元拦截器 | `TestUnaryHandlerInvokesTheInterceptor` | grpc-go 把拦截器链交给 desc 的 handler 去调用；手写 desc 若丢弃第 4 个参数，服务端一元拦截器会全部静默失效 |
-| Nacos 不可达时的快照回落，**默认关** | `TestWatchFallsBackToSnapshot` + 负对照 `TestWatchWithoutSnapshotDirStillFails` | 设了 `SnapshotDir` 才在冷拨号或订阅失败时投递带 age 的旧列表并回调通知；不设时同一场景仍然报错 |
+| Nacos 不可达时的快照回落，**默认关** | `TestWatchFallsBackToSnapshot` + 负对照 `TestWatchWithoutSnapshotDirStillFails` | 设了 `SnapshotDir` 才在冷拨号或订阅失败时投递带 age 的旧列表并回调通知；不设时同一场景仍然报错。另有真停掉本机 Nacos 的冷启动端到端（见「注册中心不可达时」）|
 
 ## 标准工具能直接看见它
 
@@ -229,9 +229,39 @@ sweet 一个字节都不读也不写。
   `ConcurrentMap`（`connection_event_listener.go:33-34`），进程重启即清零；命名侧的 failover
   至今是那句 `//todo FailoverReactor`（`service_info_holder.go:110`）。
 
-已测到哪一层：上面的规则由 `registry/nacos/snapshot_test.go` 六条用例钉住，含那条负对照——同一个
-不可达的服务端，不配 `SnapshotDir` 时必须仍然失败，否则"回落生效"可能只是什么都没发生。**还没有**
-"真把 Nacos 停掉、重启消费端"的端到端验证：那条要先给 example 的消费端加一个 `-snapshot` 开关。
+已测到哪一层：`registry/nacos/snapshot_test.go` 六条用例钉住规则，含负对照——同一个不可达的服务端，
+不配 `SnapshotDir` 时必须仍然失败。另有一条**真的把本机 Nacos 停掉**的冷启动端到端（provider 全程
+在线，所以"回落后能不能调通"是实测而不是推断）。不带 `-snapshot` 的冷启动直接失败，错误链原样交给
+调用方：
+
+```
+Greet: nacos: subscribe sweet.example.v1.Greeter: nacos: handshake with 127.0.0.1:9848: nacos: server check 127.0.0.1:9848: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:9848: connect: connection refused"
+```
+
+带 `-snapshot` 的同一场景，整份输出如下（先声明陈旧，再四种形态全部调通；Nacos 在 hold 期间被拉起，
+hold 结束那一发仍走通了）：
+
+```
+serving sweet.example.v1.Greeter from snapshot: 1 instance(s), 0s old — addresses may be stale
+resolved sweet.example.v1.Greeter through nacos registry
+Greet       <= "Hello, sweet!"
+GreetStream <= 1 "Hello #1, sweet!"
+GreetStream <= 2 "Hello #2, sweet!"
+GreetStream <= 3 "Hello #3, sweet!"
+GreetStream == 3 frames, closed by server
+GreetChat   <= 1 "Hello, a!"
+GreetChat   <= 2 "Hello, b!"
+GreetChat   <= 3 "Hello, c!"
+GreetChat   == 3 frames from 3 requests, closed by server
+GreetAll    <= "Hello, a, b, c!"
+GreetAll    == 1 frame from 3 requests
+holding 80s: restart Nacos now to watch the snapshot fallback heal
+after hold  <= "Hello, sweet!"
+```
+
+恢复也不靠重启进程：那份快照的 `savedAt` 从 `2026-10-28T06:03:43.369088+08:00` 被重订阅后的新列表
+刷成 `2026-10-28T06:04:05.001761+08:00`。`0s old` 是因为这条端到端里快照是同一次脚本几十秒前刚播种
+的，真出故障时这里是分钟级。三行合一句：回落撑住的是空窗期，服务端一回来就自己回到以服务端为准。
 
 ## 深入了解更多
 
