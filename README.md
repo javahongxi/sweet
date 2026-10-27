@@ -101,7 +101,7 @@ stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
 ```go
 srv, err := server.New(server.Options{
     Address:     "127.0.0.1:0",     // ":0" 由系统分配端口，注册时上报实际端口
-    ServiceName: "greeter.Greeter", // 留空则取 Register 时 ServiceDesc 的名字
+    ServiceName: "greeter.Greeter", // 留空则取 Register 时 ServiceDesc 的名字；此时再注册第二个不同名的服务会被拒
     Weight:      100,               // 仅随实例透传给对端，本客户端不据此分流量
     Metadata:    map[string]string{"version": "1.0.0"},
     Registry:    reg,
@@ -161,6 +161,8 @@ call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传
 | 错误可分类 | `TestCauseStaysClassifiableThroughWrapping`（`nacos/errors_test.go`） | 三层包装后 Unavailable / Canceled 都取得到 |
 | 与改不了的 grpc-go 桩互通 | `TestNativeClientCallsSweetServer`、`TestNativeServerAcceptsGeneratedStreamViaSweet`、`TestSweetClientDiscoversNativeServer`（`interoptest/`） | stock `grpc.health.v1.Health` 的一元与生成式流方法都通，两个方向都测 |
 | 内置 gRPC 反射与健康服务 | `TestNativeClientCallsSweetServer`、`TestReflectionListsRegisteredService` | 见下一节的 grpcurl 外部实测 |
+| 重试走 gRPC 原生 service config，sweet 不自带重试旋钮 | `TestNativeRetryAppliesThroughSweetDial` + 负对照 `TestWithoutRetryConfigTheInjectionSticks` | 配 retryPolicy 时服务端看到 3 次尝试、调用成功；不配时只看到 1 次并直接把 UNAVAILABLE 抛给调用方（grpc-go 对 UNAVAILABLE 不做透明重试） |
+| 手写 `ServiceDesc` 与生成码一样会走服务端一元拦截器 | `TestUnaryHandlerInvokesTheInterceptor` | grpc-go 把拦截器链交给 desc 的 handler 去调用；手写 desc 若丢弃第 4 个参数，服务端一元拦截器会全部静默失效 |
 
 ## 标准工具能直接看见它
 
@@ -215,14 +217,14 @@ go test ./...                                    # 离线，用进程内协议�
 ```
 
 ```
-ok  	github.com/javahongxi/sweet/interoptest	(cached)
+ok  	github.com/javahongxi/sweet/example/helloworld/ping	0.334s
+ok  	github.com/javahongxi/sweet/interoptest	0.436s
 ok  	github.com/javahongxi/sweet/nacos	(cached)
-ok  	github.com/javahongxi/sweet/registry/nacos	(cached)
-ok  	github.com/javahongxi/sweet/sweettest	(cached)
+ok  	github.com/javahongxi/sweet/registry/nacos	0.411s
+ok  	github.com/javahongxi/sweet/sweettest	0.352s
 ```
 
-（原文照抄，包名与结果之间是制表符；最后一列是耗时，本机这次命中了测试缓存所以显示 `(cached)`，
-首次跑会是秒数。）
+（原文照抄：包名与结果之间是制表符，最后一列是耗时；命中缓存的那一项显示 `(cached)`。）
 
 连真实 Nacos 的测试用环境变量打开（不设就 skip，不会假装跑过）：
 

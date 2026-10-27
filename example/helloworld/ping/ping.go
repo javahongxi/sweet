@@ -34,12 +34,26 @@ var ServiceDesc = grpc.ServiceDesc{
 	Metadata:    "sweet/example/ping.proto",
 	Methods: []grpc.MethodDesc{{
 		MethodName: "Ping",
-		Handler: func(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+		Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 			in := new(wrapperspb.StringValue)
 			if err := dec(in); err != nil {
 				return nil, err
 			}
-			return srv.(Server).Ping(ctx, in)
+			// grpc-go hands the chained unary interceptor to the handler and the
+			// handler is the one that has to call it — this is not applied further
+			// up the stack, so a hand-written desc that drops this argument serves
+			// RPCs with every server-side unary interceptor silently skipped. Same
+			// shape protoc-gen-go-grpc emits.
+			if interceptor == nil {
+				return srv.(Server).Ping(ctx, in)
+			}
+			info := &grpc.UnaryServerInfo{
+				Server:     srv,
+				FullMethod: "/" + ServiceName + "/Ping",
+			}
+			return interceptor(ctx, in, info, func(ctx context.Context, req any) (any, error) {
+				return srv.(Server).Ping(ctx, req.(*wrapperspb.StringValue))
+			})
 		},
 	}},
 	Streams: []grpc.StreamDesc{

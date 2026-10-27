@@ -71,3 +71,20 @@ nacos 那一发除了首两行（`resolved ... through nacos registry`、服务�
 nacos 路径下 `-advertise` 不再需要：实例自己上报 ip:port，客户端只认服务名。
 direct 注册表不做发现（`Watch` 只返回给定端点一次、`Expose` 是记账 no-op），所以
 它才需要 `-advertise`。
+
+## 手写 desc 有一条生成码替你尽到的义务
+
+`grpc.ServiceDesc` 里每个 `MethodDesc.Handler` 的第 4 个参数，是 grpc-go 已经串好的服务端一元
+拦截器链。**grpc-go 不在更上层调用它，调它是 handler 的活儿**：protoc-gen-go-grpc 生成的 handler
+会 `interceptor(ctx, in, info, handler)`，而手写的人把它命名成 `_` 就漏了。后果不是报错，是静默
+——服务照常收包、照常回包，服务端所有 unary 拦截器一个都不跑，日志/metrics/注入故障的测试全部
+失效，而看起来一切正常。
+
+本包的 `Ping` handler 因此显式走这一步（`interceptor == nil` 时直接调方法，与生成码同形），由
+`ping_test.go` 钉住：`TestUnaryHandlerInvokesTheInterceptor` 断言拦截器被调用、`FullMethod` 等于
+`/sweet.example.v1.Ping/Ping`、拦截器返回的错误原样透出；另有两条断言 nil 拦截器与错误传播。
+这段测试值得抄进任何自己写 `ServiceDesc` 的代码。
+
+流式方法没有这个问题：grpc-go 在 `NewServer` 时就把 `StreamServerInterceptor` 串成一个包装、
+套在 `ServerStream` 上（grpc-go v1.84.0 `server.go:731` 与 `:1242-1257`），手写的
+`StreamDesc` 绕不过去；只有 unary 是"链已经串好，等 handler 去调"这个形状。
