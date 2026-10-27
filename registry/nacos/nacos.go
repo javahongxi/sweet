@@ -56,6 +56,17 @@ type Options struct {
 	// Logger, if set, receives connection lifecycle events. Recovery that is
 	// invisible is indistinguishable from recovery that never happens.
 	Logger *log.Logger
+	// SnapshotDir, when set, enables the disk snapshot of service lists: every
+	// list the server actually gave us is written there, and a failed cold dial or
+	// failed subscribe may fall back to the last one instead of returning nothing.
+	// Empty — the default — means no file is ever read or written: serving a list
+	// whose age nobody asked for is a liability, not a convenience. See
+	// snapshot.go for the rules that keep a fallback honest.
+	SnapshotDir string
+	// OnSnapshotFallback, when set, is called with every list handed out from
+	// disk, together with how old it is. This is the hook a caller uses to
+	// alarm or refuse; staleness must not be visible only in the log.
+	OnSnapshotFallback func(serviceName string, insts []registry.Instance, age time.Duration)
 }
 
 // intent is the redo record: what the client *wants* to be true, so a
@@ -149,34 +160,61 @@ func (r *Registry) Expose(ctx context.Context, serviceName string, in registry.I
 
 // Watch subscribes to a service and returns its current instances, then every
 // change pushed by the server.
+//
+// When the first attempt cannot reach the server, a configured snapshot may be
+// handed out instead — see snapshot.go and Options.SnapshotDir. That path keeps
+// the subscription intent live, so the reconnect loop re-subscribes and the fresh
+// list replaces the stale one; it is not a way to stop paying attention to
+// Nacos.
 func (r *Registry) Watch(ctx context.Context, serviceName string) (<-chan []registry.Instance, error) {
-	c, err := r.ensureConn(ctx)
-	if err != nil {
-		return nil, err
-	}
 	ch := make(chan []registry.Instance, 4)
 	r.mu.Lock()
 	first := len(r.watchers[serviceName]) == 0
 	r.watchers[serviceName] = append(r.watchers[serviceName], ch)
 	r.mu.Unlock()
 
-	if first {
-		snapshot, err := r.subscribe(ctx, c, serviceName, true)
-		if err != nil {
+	if !first {
+		// Still requires a live connection: handing back a channel that cannot
+		// deliver would turn a dead registry into a silently hanging resolver.
+		if _, err := r.ensureConn(ctx); err != nil {
 			r.dropWatcher(serviceName, ch)
 			return nil, fmt.Errorf("nacos: subscribe %s: %w", serviceName, err)
 		}
-		r.mu.Lock()
-		r.subscriptions[serviceName] = &intent{service: serviceName, live: true}
-		r.mu.Unlock()
-		// A subscribe response already carries the current list (§8.4), so no
-		// separate query is needed to seed the view.
-		select {
-		case ch <- snapshot:
-		default:
+		return ch, nil
+	}
+
+	snapshot, err := r.trySubscribe(ctx, serviceName)
+	if err != nil {
+		if r.snapshotEnabled() {
+			if ferr := r.serveStaleOnFailure(ctx, serviceName, ch, err); ferr != nil {
+				return nil, ferr
+			}
+			return ch, nil
 		}
+		r.dropWatcher(serviceName, ch)
+		return nil, fmt.Errorf("nacos: subscribe %s: %w", serviceName, err)
+	}
+
+	r.mu.Lock()
+	r.subscriptions[serviceName] = &intent{service: serviceName, live: true}
+	r.mu.Unlock()
+	// A subscribe response already carries the current list (§8.4), so no
+	// separate query is needed to seed the view.
+	select {
+	case ch <- snapshot:
+	default:
 	}
 	return ch, nil
+}
+
+// trySubscribe connects if needed and subscribes, returning the initial list.
+// Every failure inside it is a reason to consider a snapshot in Watch.
+func (r *Registry) trySubscribe(ctx context.Context, serviceName string) ([]registry.Instance, error) {
+	c, err := r.ensureConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.subscribe(ctx, c, serviceName, true)
 }
 
 // Unsubscribe stops pushes for a service and forgets its watchers.
@@ -422,6 +460,7 @@ func (r *Registry) consumePushes(c *naming.Conn) {
 			r.logf("ack %s: %v", push.Type, err)
 		}
 		r.deliver(name, toInstances(note.ServiceInfo.Hosts), false)
+		r.remember(name, note.ServiceInfo.Hosts)
 	}
 }
 
@@ -466,6 +505,11 @@ func (r *Registry) subscribe(ctx context.Context, c *naming.Conn, serviceName st
 	}
 	if !resp.Success {
 		return nil, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	}
+	if subscribe {
+		// Unsubscribing also answers with a list; only a subscribe is worth
+		// persisting as "what we last knew about this service".
+		r.remember(serviceName, resp.ServiceInfo.Hosts)
 	}
 	return toInstances(resp.ServiceInfo.Hosts), nil
 }

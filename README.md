@@ -163,6 +163,7 @@ call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传
 | 内置 gRPC 反射与健康服务 | `TestNativeClientCallsSweetServer`、`TestReflectionListsRegisteredService` | 见下一节的 grpcurl 外部实测 |
 | 重试走 gRPC 原生 service config，sweet 不自带重试旋钮 | `TestNativeRetryAppliesThroughSweetDial` + 负对照 `TestWithoutRetryConfigTheInjectionSticks` | 配 retryPolicy 时服务端看到 3 次尝试、调用成功；不配时只看到 1 次并直接把 UNAVAILABLE 抛给调用方（grpc-go 对 UNAVAILABLE 不做透明重试） |
 | 手写 `ServiceDesc` 与生成码一样会走服务端一元拦截器 | `TestUnaryHandlerInvokesTheInterceptor` | grpc-go 把拦截器链交给 desc 的 handler 去调用；手写 desc 若丢弃第 4 个参数，服务端一元拦截器会全部静默失效 |
+| Nacos 不可达时的快照回落，**默认关** | `TestWatchFallsBackToSnapshot` + 负对照 `TestWatchWithoutSnapshotDirStillFails` | 设了 `SnapshotDir` 才在冷拨号或订阅失败时投递带 age 的旧列表并回调通知；不设时同一场景仍然报错 |
 
 ## 标准工具能直接看见它
 
@@ -195,11 +196,23 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
 `Serve` 绑好端口并 `Expose` 成功才翻成 SERVING（注册的每个服务名各自一份状态）；`Stop` 一开始
 就 `Shutdown()`，比注销更早一步告诉探活方"别再发流量了"。
 
-## 注册中心不可达时，不保证什么
+## 注册中心不可达时
 
 进程**运行中**断连：重连后重放注册与订阅意图，这条路有测试钉（见上表）。
-进程**新启动**时 Nacos 不可达：拿不到实例列表，直接失败——sweet 不落盘快照，也没有可回放的
-"上次已知列表"。
+进程**新启动**时 Nacos 不可达：默认仍然拿不到实例列表、直接失败——`Options.SnapshotDir` 不设时，
+sweet 一个字节都不读也不写。
+
+设置 `SnapshotDir` 才开启盘上回落，规则刻意比两套官方客户端都紧：
+
+- 只在**冷拨号或订阅失败时**才用快照，正常路径永远以服务端为准；空列表一律不落盘——一次抖动的
+  空答案不该固化成"谁都不许连"。
+- 服务名放进文件名装不下（`jaws/xxx` 这种带 `/` 的名字），所以文件里带 `service/group/namespace`
+  三元组，读时对不上就拒绝——拿别人的实例列表比拿不到更糟；没有时间戳的列表也拒绝，年龄是这条路
+  的全部意义。
+- 陈旧必须显式可见：日志一行 WARN，同时回调 `OnSnapshotFallback(service, instances, age)`，另有
+  `SnapshotAge(service)` 给调用方和测试直接问。
+- 回落后订阅意图保持 live 并启动重连循环，Nacos 恢复时重放会重新订阅、用新列表替换旧列表。它撑过
+  的是空窗期，不是"绕过注册中心"。
 
 对照过 nacos 的两套官方客户端，它们并不一致，所以别把任何一套当成"Nacos 本来就这样"：
 
@@ -216,9 +229,9 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
   `ConcurrentMap`（`connection_event_listener.go:33-34`），进程重启即清零；命名侧的 failover
   至今是那句 `//todo FailoverReactor`（`service_info_holder.go:110`）。
 
-sweet 停在"两边都不做"的那部分：不做默认开启、无限陈旧的读盘回落。真要补，形状应该是 Java 那套的
-收紧版——开关默认关、只在订阅或查询失败时回落、并且把"来自快照、可能陈旧"显式暴露给调用方，而不
-是像 Go SDK 那样悄悄用一份不知道多旧的列表。
+已测到哪一层：上面的规则由 `registry/nacos/snapshot_test.go` 六条用例钉住，含那条负对照——同一个
+不可达的服务端，不配 `SnapshotDir` 时必须仍然失败，否则"回落生效"可能只是什么都没发生。**还没有**
+"真把 Nacos 停掉、重启消费端"的端到端验证：那条要先给 example 的消费端加一个 `-snapshot` 开关。
 
 ## 深入了解更多
 
