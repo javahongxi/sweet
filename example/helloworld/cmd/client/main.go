@@ -29,6 +29,9 @@ func main() {
 	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
 	service := flag.String("service", ping.ServiceName, "service name to resolve")
 	values := flag.String("values", "a,b,c", "comma-separated payloads, one per request for Echo/Ack")
+	snapshot := flag.String("snapshot", "", "directory holding the instance-list snapshot; when set, a "+
+		"cold start against an unreachable Nacos falls back to the last list it wrote, and the age is "+
+		"reported. Empty — the default — means no snapshot is read or written.")
 	flag.Parse()
 
 	requests := strings.Split(*values, ",")
@@ -36,7 +39,16 @@ func main() {
 	var reg registry.Registry
 	switch *registryKind {
 	case "nacos":
-		nr, err := nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr})
+		nr, err := nacosregistry.New(nacosregistry.Options{
+			ServerAddr:  *serverAddr,
+			SnapshotDir: *snapshot,
+			// The registry logs it too; this puts the fallback in this program's own
+			// output so -snapshot can be seen working rather than trusted.
+			OnSnapshotFallback: func(service string, insts []registry.Instance, age time.Duration) {
+				log.Printf("serving %s from snapshot: %d instance(s), %s old — addresses may be stale",
+					service, len(insts), age.Round(time.Second))
+			},
+		})
 		if err != nil {
 			log.Fatalf("registry: %v", err)
 		}
