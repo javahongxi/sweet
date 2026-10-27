@@ -1,0 +1,30 @@
+// This is sweet's own service definition, written for the Go-calls-Go example:
+// unlike ../jaws-wire/greeter.proto it is not copied from another repository.
+// It exists so that both sides of one RPC are protoc-generated stubs wired
+// through sweet's own server and client.
+
+syntax = "proto3";
+
+option go_package = "github.com/javahongxi/sweet/example/greeter/greeterpb";
+
+package sweet.example.v1;
+
+// Greeter carries exactly the two shapes example/helloworld/ping carries —
+// one unary method and one server-streaming method — so that the difference
+// between the two examples is only hand-written vs generated stubs.
+service Greeter {
+  // Greet answers one name with one greeting.
+  rpc Greet (GreetRequest) returns (GreetReply) {}
+
+  // GreetStream answers one name with `times` greetings, one per message.
+  rpc GreetStream (GreetRequest) returns (stream GreetReply) {}
+}
+
+message GreetRequest {
+  string name = 1;
+  int32 times = 2;
+}
+
+message GreetReply {
+  string message = 1;
+}
