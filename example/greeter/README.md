@@ -7,15 +7,15 @@
 片段（`srv.Register(&pb.Greeter_ServiceDesc, impl)` 与 `pb.NewGreeterClient(conn)`）到这一篇
 才有跑得通的实现。
 
-## 四种方法形态，前两种与 helloworld 逐行同形
+## 四种方法形态，与 helloworld 逐行同形
 
-`Greet`（一元）和 `GreetStream`（server-streaming）刻意跟 `example/helloworld` 一一对应，
-flags 同名同义，只有默认端口不同（这里 20001，helloworld 20000），所以这两发可以直接 diff，
-也能同时跑（两个 server 各占自己的默认端口，两个 client 各自解析成功）。`GreetAll`
-（client-streaming）与 `GreetChat`（bidi）是这一篇才有的另外两种形态：手写那一侧要为它们自己
-拼 `NewStream` 和方法名字符串，正是这一篇要避开的东西。
+四个方法跟 `example/helloworld` 的 `Ping` / `Events` / `Echo` / `Ack` 一一对应，flags
+同名同义，只有默认端口不同（这里 20001，helloworld 20000），所以两份代码可以直接 diff，也能
+同时跑（两个 server 各占自己的默认端口，两个 client 各自解析成功）。这个对应关系是刻意的：
+两个例子唯一的差别必须是**手写桩 vs 生成桩**，方法覆盖面不算变量——所以 helloworld 也备齐了
+四种形态，包括手写那两个流描述与两个 `GenericClientStream` 循环。
 
-| | helloworld | greeter |
+| | helloworld（手写） | greeter（生成） |
 | --- | --- | --- |
 | 消息 | `wrapperspb.StringValue` | `GreetRequest` / `GreetReply`（proto 里定义，`times` 是 int32）|
 | 服务端注册 | 手写 `ping.ServiceDesc` | `&pb.Greeter_ServiceDesc`（生成）|
@@ -23,8 +23,8 @@ flags 同名同义，只有默认端口不同（这里 20001，helloworld 20000�
 | 服务名 | 常量 `ping.ServiceName` | `pb.Greeter_ServiceDesc.ServiceName`，来自 proto 的 `package` + `service` |
 | 服务端流类型 | `grpc.ServerStreamingServer[wrapperspb.StringValue]` | `pb.Greeter_GreetStreamServer`（生成的别名，同一个类型）|
 | 流的收取循环 | 藏在 `ping.Events` 里（每帧回调一次给调用方）| 调用侧自己 `Recv` 到 `io.EOF` |
-| 客户端流 | 没有 | 客户端 `CloseAndRecv` 收口；服务端从 `Recv` 的 `io.EOF` 才知道输入完了 |
-| 双向流 | 没有 | 生成的是 `grpc.BidiStreamingClient/Server` 别名，每帧边到边答 |
+| 客户端流 | `ServiceDesc.Streams` 里 `ClientStreams: true` + handler 收在 `SendAndClose`；客户端 `CloseSend` 后 `Recv` 一帧 | 客户端 `CloseAndRecv` 收口；服务端同样从 `Recv` 的 `io.EOF` 才知道输入完了 |
+| 双向流 | 手写 `GenericServerStream`/`GenericClientStream` 包装，`ClientStreams` 与 `ServerStreams` 同时为真 | 生成的只是同一批接口的别名（`grpc.BidiStreamingServer[...]`），无需自己包装 |
 
 服务名只有一套：`sweet.example.v1.Greeter` 是 `greeter.proto` 的 `package sweet.example.v1`
 与 `service Greeter` 拼出来的，示例里没有第二套标识；`server.Options.ServiceName` 的默认值

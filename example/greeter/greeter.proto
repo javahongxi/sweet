@@ -9,10 +9,11 @@ option go_package = "github.com/javahongxi/sweet/example/greeter/greeterpb";
 
 package sweet.example.v1;
 
-// Greeter covers all four gRPC method shapes. Greet and GreetStream are the two
-// shapes example/helloworld/ping hand-writes, so those pair up line by line;
-// GreetAll and GreetChat add client-streaming and bidirectional streaming, which
-// the hand-written example does not attempt.
+// Greeter covers all four gRPC method shapes, one per rpc, mirroring
+// example/helloworld/ping method for method: Greet/Ping, GreetStream/Events,
+// GreetChat/Echo, GreetAll/Ack. The two examples differ in exactly one variable —
+// protoc-generated stubs vs hand-written ones — so method coverage is not a second
+// difference.
 service Greeter {
   // Greet answers one name with one greeting.
   rpc Greet (GreetRequest) returns (GreetReply) {}

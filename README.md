@@ -61,6 +61,9 @@ Events     <= 3 "c"
 Events     == 3 frames, closed by server
 ```
 
+上面两块都只贴到一元与服务端流为止（ contiguous 前缀，没删中间行）；这个例子也有双向流
+`Echo` 与客户端流 `Ack`，四形态的完整输出见 `example/helloworld/README.md`。
+
 `Ctrl-C`（或 `kill`）掉服务端后再拨一次，能看到优雅下线的结果——实例先注销、客户端随即拿不到地址：
 
 ```

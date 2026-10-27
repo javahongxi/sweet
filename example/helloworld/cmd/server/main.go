@@ -9,7 +9,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -40,6 +42,39 @@ func (pingImpl) Events(in *wrapperspb.StringValue, stream grpc.ServerStreamingSe
 		}
 	}
 	return nil
+}
+
+// Echo answers every request message as it arrives. io.EOF from Recv is the
+// client half-closing, i.e. a normal end of conversation.
+func (pingImpl) Echo(stream grpc.BidiStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
+	for {
+		in, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(wrapperspb.String("pong(" + in.GetValue() + ")")); err != nil {
+			return err
+		}
+	}
+}
+
+// Ack collects every name and answers once. The half-close is the only signal
+// that the input is complete — there is no other "that was the last one".
+func (pingImpl) Ack(stream grpc.ClientStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error {
+	var seen []string
+	for {
+		in, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return stream.SendAndClose(wrapperspb.String("pong(" + strings.Join(seen, ",") + ")"))
+		}
+		if err != nil {
+			return err
+		}
+		seen = append(seen, in.GetValue())
+	}
 }
 
 func main() {

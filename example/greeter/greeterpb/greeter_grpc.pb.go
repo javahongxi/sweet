@@ -34,10 +34,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Greeter covers all four gRPC method shapes. Greet and GreetStream are the two
-// shapes example/helloworld/ping hand-writes, so those pair up line by line;
-// GreetAll and GreetChat add client-streaming and bidirectional streaming, which
-// the hand-written example does not attempt.
+// Greeter covers all four gRPC method shapes, one per rpc, mirroring
+// example/helloworld/ping method for method: Greet/Ping, GreetStream/Events,
+// GreetChat/Echo, GreetAll/Ack. The two examples differ in exactly one variable —
+// protoc-generated stubs vs hand-written ones — so method coverage is not a second
+// difference.
 type GreeterClient interface {
 	// Greet answers one name with one greeting.
 	Greet(ctx context.Context, in *GreetRequest, opts ...grpc.CallOption) (*GreetReply, error)
@@ -117,10 +118,11 @@ type Greeter_GreetChatClient = grpc.BidiStreamingClient[GreetRequest, GreetReply
 // All implementations must embed UnimplementedGreeterServer
 // for forward compatibility.
 //
-// Greeter covers all four gRPC method shapes. Greet and GreetStream are the two
-// shapes example/helloworld/ping hand-writes, so those pair up line by line;
-// GreetAll and GreetChat add client-streaming and bidirectional streaming, which
-// the hand-written example does not attempt.
+// Greeter covers all four gRPC method shapes, one per rpc, mirroring
+// example/helloworld/ping method for method: Greet/Ping, GreetStream/Events,
+// GreetChat/Echo, GreetAll/Ack. The two examples differ in exactly one variable —
+// protoc-generated stubs vs hand-written ones — so method coverage is not a second
+// difference.
 type GreeterServer interface {
 	// Greet answers one name with one greeting.
 	Greet(context.Context, *GreetRequest) (*GreetReply, error)

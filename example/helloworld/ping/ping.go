@@ -1,6 +1,8 @@
 // Package ping is a hand-written gRPC service used by sweet's example: no
-// protoc, no generated stubs. It carries one unary method and one
-// server-streaming method over wrapperspb.StringValue.
+// protoc, no generated stubs. It carries all four gRPC method shapes over
+// wrapperspb.StringValue — Ping (unary), Events (server-streaming), Echo
+// (bidirectional) and Ack (client-streaming) — so that the only difference from
+// example/greeter is hand-written vs protoc-generated stubs.
 package ping
 
 import (
@@ -15,10 +17,14 @@ import (
 // ServiceName is the gRPC service name, i.e. "<package>.<Service>".
 const ServiceName = "sweet.example.v1.Ping"
 
-// Server is implemented by the example server.
+// Server is implemented by the example server. These are the signatures the
+// generated code would have produced: grpc-go's stream types are interfaces, so
+// writing them out here is exactly what protoc-gen-go-grpc does for you.
 type Server interface {
 	Ping(context.Context, *wrapperspb.StringValue) (*wrapperspb.StringValue, error)
 	Events(*wrapperspb.StringValue, grpc.ServerStreamingServer[wrapperspb.StringValue]) error
+	Echo(grpc.BidiStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error
+	Ack(grpc.ClientStreamingServer[wrapperspb.StringValue, wrapperspb.StringValue]) error
 }
 
 // ServiceDesc wires Server to grpc-go. Register it with sweet's server.Register.
@@ -36,18 +42,42 @@ var ServiceDesc = grpc.ServiceDesc{
 			return srv.(Server).Ping(ctx, in)
 		},
 	}},
-	Streams: []grpc.StreamDesc{{
-		StreamName:    "Events",
-		ServerStreams: true,
-		Handler: func(srv any, stream grpc.ServerStream) error {
-			in := new(wrapperspb.StringValue)
-			if err := stream.RecvMsg(in); err != nil {
-				return err
-			}
-			return srv.(Server).Events(in,
-				&grpc.GenericServerStream[wrapperspb.StringValue, wrapperspb.StringValue]{ServerStream: stream})
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Events",
+			ServerStreams: true,
+			Handler: func(srv any, stream grpc.ServerStream) error {
+				in := new(wrapperspb.StringValue)
+				if err := stream.RecvMsg(in); err != nil {
+					return err
+				}
+				return srv.(Server).Events(in,
+					&grpc.GenericServerStream[wrapperspb.StringValue, wrapperspb.StringValue]{ServerStream: stream})
+			},
 		},
-	}},
+		{
+			// Bidirectional: nothing to decode up front — both directions are
+			// message-by-message, so the handler gets the raw stream and the
+			// generic wrapper is what gives it typed Recv/Send.
+			StreamName:    "Echo",
+			ClientStreams: true,
+			ServerStreams: true,
+			Handler: func(srv any, stream grpc.ServerStream) error {
+				return srv.(Server).Echo(
+					&grpc.GenericServerStream[wrapperspb.StringValue, wrapperspb.StringValue]{ServerStream: stream})
+			},
+		},
+		{
+			// Client-streaming: one reply out, so the handler's return is the
+			// SendAndClose, not a value it hands back to grpc-go.
+			StreamName:    "Ack",
+			ClientStreams: true,
+			Handler: func(srv any, stream grpc.ServerStream) error {
+				return srv.(Server).Ack(
+					&grpc.GenericServerStream[wrapperspb.StringValue, wrapperspb.StringValue]{ServerStream: stream})
+			},
+		},
+	},
 }
 
 // Client calls the service over a grpc.ClientConn.
@@ -95,4 +125,68 @@ func (c *Client) Events(ctx context.Context, csv string, onEvent func(string)) e
 		}
 		onEvent(m.GetValue())
 	}
+}
+
+// Echo performs the bidirectional call: every value goes out as its own request
+// message and every reply is handed to onEvent as it arrives.
+//
+// The requests are all sent before any reply is read here, which is safe for a
+// handful of small messages — they fit in the flow-control window, so the send
+// loop cannot block while nothing is reading. A conversation that must truly
+// interleave needs a second goroutine for the sending side; the generated stub
+// does not spare you that either, it only spares you the stream plumbing below.
+func (c *Client) Echo(ctx context.Context, values []string, onEvent func(string)) error {
+	cs, err := c.cc.NewStream(ctx, &ServiceDesc.Streams[1], "/"+ServiceName+"/Echo")
+	if err != nil {
+		return err
+	}
+	stream := &grpc.GenericClientStream[wrapperspb.StringValue, wrapperspb.StringValue]{ClientStream: cs}
+	for _, v := range values {
+		if err := stream.Send(wrapperspb.String(v)); err != nil {
+			return err
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return err
+	}
+	for {
+		m, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		onEvent(m.GetValue())
+	}
+}
+
+// Ack performs the client-streaming call: many request messages in, one reply
+// out. CloseSend is what tells the server the input is complete, and unlike the
+// two streaming methods there is no io.EOF to wait for — the first Recv is the
+// answer, so a stream that closes without one is a failed call rather than an
+// empty result. That is the same conversion the generated stub makes, where
+// io.EOF is rewritten to io.ErrUnexpectedEOF.
+func (c *Client) Ack(ctx context.Context, values []string) (string, error) {
+	cs, err := c.cc.NewStream(ctx, &ServiceDesc.Streams[2], "/"+ServiceName+"/Ack")
+	if err != nil {
+		return "", err
+	}
+	stream := &grpc.GenericClientStream[wrapperspb.StringValue, wrapperspb.StringValue]{ClientStream: cs}
+	for _, v := range values {
+		if err := stream.Send(wrapperspb.String(v)); err != nil {
+			return "", err
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return "", err
+	}
+	m, err := stream.Recv()
+	if errors.Is(err, io.EOF) {
+		return "", errors.New("ping: " + ServiceName + "/Ack closed without a reply message")
+	}
+	if err != nil {
+		return "", err
+	}
+	return m.GetValue(), nil
 }
