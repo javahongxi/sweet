@@ -199,16 +199,26 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
 
 进程**运行中**断连：重连后重放注册与订阅意图，这条路有测试钉（见上表）。
 进程**新启动**时 Nacos 不可达：拿不到实例列表，直接失败——sweet 不落盘快照，也没有可回放的
-"上次已知列表"。这不是疏忽，是取舍：对照过 nacos-sdk-go v2.3.5，它确实把订阅结果写进
-`cacheDir/naming/<namespace>/<group>@@<service>`（`clients/cache/disk_cache.go:58-70`）并在启动时
-预载（`naming_cache/service_info_holder.go:54-56`），但那份缓存**没有 TTL、没有 checksum 校验**
-（同文件 `:60-68`，`model.ServiceInfo.Checksum` 在命名路径上根本没人读），远端恢复后照样能用几天
-前的旧列表；运行时任何 `Subscribe`/查询失败也**不回落**到它（`naming_grpc/naming_grpc_proxy.go:176-189`
-直接 `return err`）；注册意图的 redo 队列是纯内存 `ConcurrentMap`（`connection_event_listener.go:33-34`），
-进程一重启就清零；命名侧真正的 failover 至今是那句 `//todo FailoverReactor`
-（`service_info_holder.go:110`）。也就是说：官方 SDK 给出的"容灾"是**默认开启、无限陈旧的启动快照**，
-并且不承诺注册意图持久化。sweet 不补这套，只把不保证的写清楚——宁可让你看到一次失败，也不给一份
-你不知道有多旧的列表。
+"上次已知列表"。
+
+对照过 nacos 的两套官方客户端，它们并不一致，所以别把任何一套当成"Nacos 本来就这样"：
+
+- **Java `nacos-client`（3.2.3）**：`ServiceInfoHolder` 构造时可以从盘上预载实例表
+  （`client/.../naming/cache/ServiceInfoHolder.java:67-71`；`getServiceInfo` 只读这份内存 map，
+  `:105-109`），所以 server 全挂时重启仍能拿到上次落盘的列表。但预载开关
+  `NAMING_LOAD_CACHE_AT_START` **默认 false**（`:81-89`），且救的是查询类调用——
+  `doSubscribe` 只在重复订阅时用当前缓存通知（`NacosNamingService.java:739-746`），随后照旧发
+  RPC、失败照旧抛（`:546`）。运维侧另有放文件即生效的 `FailoverReactor`
+  （`backups/FailoverReactor.java` + `DiskFailoverDataSource`）。
+- **Go `nacos-sdk-go` v2.3.5**：预载默认是开的（`naming_cache/service_info_holder.go:54,60-61`），
+  但那份缓存没有 TTL、也没人校验 `Checksum`；运行时 `Subscribe`/查询失败一律 `return err`
+  不回落（`naming_grpc/naming_grpc_proxy.go:176-189`）；注册意图的 redo 队列是纯内存
+  `ConcurrentMap`（`connection_event_listener.go:33-34`），进程重启即清零；命名侧的 failover
+  至今是那句 `//todo FailoverReactor`（`service_info_holder.go:110`）。
+
+sweet 停在"两边都不做"的那部分：不做默认开启、无限陈旧的读盘回落。真要补，形状应该是 Java 那套的
+收紧版——开关默认关、只在订阅或查询失败时回落、并且把"来自快照、可能陈旧"显式暴露给调用方，而不
+是像 Go SDK 那样悄悄用一份不知道多旧的列表。
 
 ## 深入了解更多
 
