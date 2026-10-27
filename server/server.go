@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 	"time"
 
@@ -58,6 +59,10 @@ type Server struct {
 	// the framework's own code on the other side.
 	health *health.Server
 	names  []string // descriptor names passed to Register, for health status
+	// nameInferred records that Options.ServiceName came from Register rather than
+	// from the caller, which is what decides whether a second, differently named
+	// service is a conflict (see Register).
+	nameInferred bool
 
 	mu      sync.Mutex
 	lis     net.Listener
@@ -108,16 +113,46 @@ func New(opts Options) (*Server, error) {
 // protoc-gen-go-grpc generated code.
 func (s *Server) GRPCServer() *grpc.Server { return s.grpc }
 
-// Register attaches sd/ss and, when Options.ServiceName is empty, requires the
-// service to be the only one so its descriptor name can be used.
+// Register attaches sd/ss. When Options.ServiceName is empty, the first call's
+// descriptor name becomes the name this instance is exposed under, and every
+// later call has to agree with it — otherwise a second service would be served on
+// a name no peer can resolve, since only the first name goes to the registry. Set
+// Options.ServiceName explicitly to expose several services from one instance.
+//
+// Every failure is reported through the returned error instead of being left to
+// grpc-go, whose RegisterService handles a late registration, a duplicate, or a
+// handler that does not implement the descriptor by calling grpclog.Fatalf: the
+// process dies, and a caller that already wrote `if err :=` has nothing to check.
+// (grpc-go v1.84.0 server.go:778-798.)
 func (s *Server) Register(sd *grpc.ServiceDesc, ss any) error {
+	if sd == nil {
+		return errors.New("server: Register requires a non-nil ServiceDesc")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.started {
+		return fmt.Errorf("server: Register(%s) after Serve: this instance is already exposed as %s",
+			sd.ServiceName, s.opts.ServiceName)
+	}
+	name, inferred := s.opts.ServiceName, s.nameInferred
+	if name == "" {
+		name, inferred = sd.ServiceName, true
+	} else if inferred && sd.ServiceName != name {
+		return fmt.Errorf("server: Register(%s) conflicts with %s, the name inferred from the first service; "+
+			"set Options.ServiceName to serve more than one service", sd.ServiceName, name)
+	}
+	if ss != nil && sd.HandlerType != nil {
+		// The check grpc-go would run before killing the process, moved to where a
+		// caller can see it. A nil HandlerType means the descriptor carries no
+		// handler contract, so there is nothing to verify.
+		if ht := reflect.TypeOf(sd.HandlerType).Elem(); !reflect.TypeOf(ss).Implements(ht) {
+			return fmt.Errorf("server: %T does not implement %s, the handler type of service %s",
+				ss, ht, sd.ServiceName)
+		}
+	}
 	s.grpc.RegisterService(sd, ss)
 	s.names = append(s.names, sd.ServiceName)
-	if s.opts.ServiceName == "" {
-		s.opts.ServiceName = sd.ServiceName
-	}
+	s.opts.ServiceName, s.nameInferred = name, inferred
 	return nil
 }
 
