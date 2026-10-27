@@ -19,15 +19,25 @@ go run ./example/helloworld/cmd/server -registry=direct -listen 127.0.0.1:20000
 go run ./example/helloworld/cmd/client -registry=direct -endpoints 127.0.0.1:20000
 ```
 
-预期：
+实测（2026-10-28，删去每行 Go log 的 `YYYY/MM/DD HH:MM:SS ` 前缀，其余原文）：
 
 ```
 # server
+registry=direct is a passthrough: clients should dial -endpoints 127.0.0.1:20000
 sweet server up: listen=127.0.0.1:20000 advertised=127.0.0.1:20000 service=sweet.example.v1.Ping registry=direct
 
 # client
-resolved sweet.example.v1.Ping through direct registry (127.0.0.1:20000) → Ping="pong" Events=[a b c]
+resolved sweet.example.v1.Ping through direct registry
+Ping       <= "pong"
+Events     <= 1 "a"
+Events     <= 2 "b"
+Events     <= 3 "c"
+Events     == 3 frames, closed by server
 ```
+
+`Events` 逐帧打印，格式与 `example/greeter/cmd/client` 一致；收取循环仍然藏在
+`ping.Events` 里（这正是本例与生成码那份的对照点），只是交付从"收完再返回切片"改成
+"到一帧回调一次"。
 
 nacos 路径下 `-advertise` 不再需要：实例自己上报 ip:port，客户端只认服务名。
 direct 注册表不做发现（`Watch` 只返回给定端点一次、`Expose` 是记账 no-op），所以

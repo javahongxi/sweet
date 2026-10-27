@@ -34,7 +34,12 @@ go build -o /tmp/sweet-client ./example/helloworld/cmd/client
 ```
 registry=direct is a passthrough: clients should dial -endpoints 127.0.0.1:20000
 sweet server up: listen=127.0.0.1:20000 advertised=127.0.0.1:20000 service=sweet.example.v1.Ping registry=direct
-resolved sweet.example.v1.Ping through direct registry → Ping="pong" Events=[a b c]
+resolved sweet.example.v1.Ping through direct registry
+Ping       <= "pong"
+Events     <= 1 "a"
+Events     <= 2 "b"
+Events     <= 3 "c"
+Events     == 3 frames, closed by server
 ```
 
 接上 Nacos 时走 nacos（客户端不再需要地址，只认服务名）：
@@ -48,7 +53,12 @@ resolved sweet.example.v1.Ping through direct registry → Ping="pong" Events=[a
 
 ```
 sweet server up: listen=127.0.0.1:20000 advertised=127.0.0.1:20000 service=sweet.example.v1.Ping registry=nacos
-resolved sweet.example.v1.Ping through nacos registry → Ping="pong" Events=[a b c]
+resolved sweet.example.v1.Ping through nacos registry
+Ping       <= "pong"
+Events     <= 1 "a"
+Events     <= 2 "b"
+Events     <= 3 "c"
+Events     == 3 frames, closed by server
 ```
 
 `Ctrl-C`（或 `kill`）掉服务端后再拨一次，能看到优雅下线的结果——实例先注销、客户端随即拿不到地址：
@@ -119,11 +129,14 @@ go test ./...                                    # 离线，用进程内协议�
 ```
 
 ```
-ok  github.com/javahongxi/sweet/nacos
-ok  github.com/javahongxi/sweet/registry/nacos
-ok  github.com/javahongxi/sweet/sweettest
-ok  github.com/javahongxi/sweet/interoptest
+ok  	github.com/javahongxi/sweet/interoptest	(cached)
+ok  	github.com/javahongxi/sweet/nacos	(cached)
+ok  	github.com/javahongxi/sweet/registry/nacos	(cached)
+ok  	github.com/javahongxi/sweet/sweettest	(cached)
 ```
+
+（原文照抄，包名与结果之间是制表符；最后一列是耗时，本机这次命中了测试缓存所以显示 `(cached)`，
+首次跑会是秒数。）
 
 连真实 Nacos 的测试用环境变量打开（不设就 skip，不会假装跑过）：
 

@@ -22,7 +22,7 @@ flags 同名同义，只有默认端口不同（这里 20001，helloworld 20000�
 | 客户端 | 手写 `ping.NewClient`，`Invoke`/`NewStream` 里方法名是字符串拼接 | `pb.NewGreeterClient`（生成，全方法名常量在桩里）|
 | 服务名 | 常量 `ping.ServiceName` | `pb.Greeter_ServiceDesc.ServiceName`，来自 proto 的 `package` + `service` |
 | 服务端流类型 | `grpc.ServerStreamingServer[wrapperspb.StringValue]` | `pb.Greeter_GreetStreamServer`（生成的别名，同一个类型）|
-| 流的收取循环 | 藏在 `ping.Events` 里 | 调用侧自己 `Recv` 到 `io.EOF` |
+| 流的收取循环 | 藏在 `ping.Events` 里（每帧回调一次给调用方）| 调用侧自己 `Recv` 到 `io.EOF` |
 | 客户端流 | 没有 | 客户端 `CloseAndRecv` 收口；服务端从 `Recv` 的 `io.EOF` 才知道输入完了 |
 | 双向流 | 没有 | 生成的是 `grpc.BidiStreamingClient/Server` 别名，每帧边到边答 |
 

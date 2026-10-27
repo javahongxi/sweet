@@ -5,7 +5,8 @@ package ping
 
 import (
 	"context"
-	"strings"
+	"errors"
+	"io"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -64,28 +65,34 @@ func (c *Client) Ping(ctx context.Context, msg string) (string, error) {
 	return out.GetValue(), nil
 }
 
-// Events performs the server-streaming call and returns every event.
-func (c *Client) Events(ctx context.Context, csv string) ([]string, error) {
+// Events performs the server-streaming call, handing each event to onEvent as it
+// arrives. The recv loop stays inside this hand-written client — that is the point
+// of the package — but delivery is incremental, so a caller can show frames landing
+// one by one instead of printing a collected slice after the fact.
+//
+// io.EOF from Recv is the server closing the stream and is reported as a nil error;
+// errors.Is is what distinguishes that from an error that merely mentions EOF, which
+// a substring test would swallow.
+func (c *Client) Events(ctx context.Context, csv string, onEvent func(string)) error {
 	cs, err := c.cc.NewStream(ctx, &ServiceDesc.Streams[0], "/"+ServiceName+"/Events")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	stream := &grpc.GenericClientStream[wrapperspb.StringValue, wrapperspb.StringValue]{ClientStream: cs}
 	if err := stream.Send(wrapperspb.String(csv)); err != nil {
-		return nil, err
+		return err
 	}
 	if err := stream.CloseSend(); err != nil {
-		return nil, err
+		return err
 	}
-	var got []string
 	for {
 		m, err := stream.Recv()
-		if err != nil {
-			if strings.Contains(err.Error(), "EOF") {
-				return got, nil
-			}
-			return got, err
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		got = append(got, m.GetValue())
+		if err != nil {
+			return err
+		}
+		onEvent(m.GetValue())
 	}
 }

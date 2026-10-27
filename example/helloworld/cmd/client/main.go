@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -55,13 +56,31 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Same line format as example/greeter/cmd/client: one line per frame as it
+	// lands, then a closing count. The recv loop still lives inside ping.Events —
+	// that is this example's whole point — but delivery is now incremental, so the
+	// output shows a stream instead of the shape of a collected slice.
 	pong, err := ping.NewClient(conn).Ping(ctx, "hi")
 	if err != nil {
 		log.Fatalf("Ping: %v", err)
 	}
-	events, err := ping.NewClient(conn).Events(ctx, "a,b,c")
-	if err != nil {
-		log.Fatalf("Events: %v", err)
+	log.Printf("resolved %s through %s registry", *service, reg.Name())
+	log.Printf("Ping       <= %q", pong)
+
+	frames := 0
+	if err := ping.NewClient(conn).Events(ctx, "a,b,c", func(event string) {
+		frames++
+		log.Printf("Events     <= %d %q", frames, event)
+	}); err != nil {
+		log.Fatalf("Events: %v (after %s)", err, plural(frames, "frame"))
 	}
-	log.Printf("resolved %s through %s registry → Ping=%q Events=%v", *service, reg.Name(), pong, events)
+	log.Printf("Events     == %s, closed by server", plural(frames, "frame"))
+}
+
+// plural counts a noun the way these lines should read: "1 frame", "3 frames".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return strconv.Itoa(n) + " " + noun + "s"
 }
