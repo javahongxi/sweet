@@ -26,20 +26,28 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Greeter_Greet_FullMethodName       = "/sweet.example.v1.Greeter/Greet"
 	Greeter_GreetStream_FullMethodName = "/sweet.example.v1.Greeter/GreetStream"
+	Greeter_GreetAll_FullMethodName    = "/sweet.example.v1.Greeter/GreetAll"
+	Greeter_GreetChat_FullMethodName   = "/sweet.example.v1.Greeter/GreetChat"
 )
 
 // GreeterClient is the client API for Greeter service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Greeter carries exactly the two shapes example/helloworld/ping carries —
-// one unary method and one server-streaming method — so that the difference
-// between the two examples is only hand-written vs generated stubs.
+// Greeter covers all four gRPC method shapes. Greet and GreetStream are the two
+// shapes example/helloworld/ping hand-writes, so those pair up line by line;
+// GreetAll and GreetChat add client-streaming and bidirectional streaming, which
+// the hand-written example does not attempt.
 type GreeterClient interface {
 	// Greet answers one name with one greeting.
 	Greet(ctx context.Context, in *GreetRequest, opts ...grpc.CallOption) (*GreetReply, error)
 	// GreetStream answers one name with `times` greetings, one per message.
 	GreetStream(ctx context.Context, in *GreetRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GreetReply], error)
+	// GreetAll takes a stream of names and answers with a single greeting once the
+	// client half-closes.
+	GreetAll(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[GreetRequest, GreetReply], error)
+	// GreetChat answers each name as it arrives, in both directions at once.
+	GreetChat(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[GreetRequest, GreetReply], error)
 }
 
 type greeterClient struct {
@@ -79,18 +87,50 @@ func (c *greeterClient) GreetStream(ctx context.Context, in *GreetRequest, opts 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Greeter_GreetStreamClient = grpc.ServerStreamingClient[GreetReply]
 
+func (c *greeterClient) GreetAll(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[GreetRequest, GreetReply], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Greeter_ServiceDesc.Streams[1], Greeter_GreetAll_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GreetRequest, GreetReply]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Greeter_GreetAllClient = grpc.ClientStreamingClient[GreetRequest, GreetReply]
+
+func (c *greeterClient) GreetChat(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[GreetRequest, GreetReply], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Greeter_ServiceDesc.Streams[2], Greeter_GreetChat_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GreetRequest, GreetReply]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Greeter_GreetChatClient = grpc.BidiStreamingClient[GreetRequest, GreetReply]
+
 // GreeterServer is the server API for Greeter service.
 // All implementations must embed UnimplementedGreeterServer
 // for forward compatibility.
 //
-// Greeter carries exactly the two shapes example/helloworld/ping carries —
-// one unary method and one server-streaming method — so that the difference
-// between the two examples is only hand-written vs generated stubs.
+// Greeter covers all four gRPC method shapes. Greet and GreetStream are the two
+// shapes example/helloworld/ping hand-writes, so those pair up line by line;
+// GreetAll and GreetChat add client-streaming and bidirectional streaming, which
+// the hand-written example does not attempt.
 type GreeterServer interface {
 	// Greet answers one name with one greeting.
 	Greet(context.Context, *GreetRequest) (*GreetReply, error)
 	// GreetStream answers one name with `times` greetings, one per message.
 	GreetStream(*GreetRequest, grpc.ServerStreamingServer[GreetReply]) error
+	// GreetAll takes a stream of names and answers with a single greeting once the
+	// client half-closes.
+	GreetAll(grpc.ClientStreamingServer[GreetRequest, GreetReply]) error
+	// GreetChat answers each name as it arrives, in both directions at once.
+	GreetChat(grpc.BidiStreamingServer[GreetRequest, GreetReply]) error
 	mustEmbedUnimplementedGreeterServer()
 }
 
@@ -106,6 +146,12 @@ func (UnimplementedGreeterServer) Greet(context.Context, *GreetRequest) (*GreetR
 }
 func (UnimplementedGreeterServer) GreetStream(*GreetRequest, grpc.ServerStreamingServer[GreetReply]) error {
 	return status.Error(codes.Unimplemented, "method GreetStream not implemented")
+}
+func (UnimplementedGreeterServer) GreetAll(grpc.ClientStreamingServer[GreetRequest, GreetReply]) error {
+	return status.Error(codes.Unimplemented, "method GreetAll not implemented")
+}
+func (UnimplementedGreeterServer) GreetChat(grpc.BidiStreamingServer[GreetRequest, GreetReply]) error {
+	return status.Error(codes.Unimplemented, "method GreetChat not implemented")
 }
 func (UnimplementedGreeterServer) mustEmbedUnimplementedGreeterServer() {}
 func (UnimplementedGreeterServer) testEmbeddedByValue()                 {}
@@ -157,6 +203,20 @@ func _Greeter_GreetStream_Handler(srv interface{}, stream grpc.ServerStream) err
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Greeter_GreetStreamServer = grpc.ServerStreamingServer[GreetReply]
 
+func _Greeter_GreetAll_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(GreeterServer).GreetAll(&grpc.GenericServerStream[GreetRequest, GreetReply]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Greeter_GreetAllServer = grpc.ClientStreamingServer[GreetRequest, GreetReply]
+
+func _Greeter_GreetChat_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(GreeterServer).GreetChat(&grpc.GenericServerStream[GreetRequest, GreetReply]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Greeter_GreetChatServer = grpc.BidiStreamingServer[GreetRequest, GreetReply]
+
 // Greeter_ServiceDesc is the grpc.ServiceDesc for Greeter service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -174,6 +234,17 @@ var Greeter_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "GreetStream",
 			Handler:       _Greeter_GreetStream_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "GreetAll",
+			Handler:       _Greeter_GreetAll_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "GreetChat",
+			Handler:       _Greeter_GreetChat_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "greeter.proto",

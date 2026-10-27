@@ -16,6 +16,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -34,28 +35,43 @@ import (
 	pb "github.com/javahongxi/sweet/example/greeter/greeterpb"
 )
 
-// greeter implements pb.GreeterServer. UnimplementedGreeterServer is embedded by
-// value as the generated code requires (a nil pointer embed dereferences on the
-// first unimplemented method). sweet's Register never runs the generated
-// RegisterGreeterServer, so the only check on this path is grpc-go's own — and
-// RegisterService reports a handler-type mismatch by calling grpclog.Fatalf, it
-// returns nothing to check. The assertion below moves that to build time.
+// greeter implements pb.GreeterServer. UnimplementedGreeterServer must be
+// embedded by value (a nil pointer embed dereferences on the first unimplemented
+// method), and embedding it has a consequence worth knowing: the embedded type
+// already has every method, so the interface is satisfied whether or not this
+// file implements them. A missing or misnamed method therefore compiles and
+// answers codes.Unimplemented at runtime; only a wrong signature is caught at
+// build time, and only because the assertion below is what makes the compiler
+// look. sweet's Register never runs the generated RegisterGreeterServer, and
+// grpc-go's RegisterService reports a mismatch by calling grpclog.Fatalf rather
+// than returning an error, so without this line nothing checks the signature
+// until a process dies. Both halves of that sentence are measured, see README.
 type greeter struct {
 	pb.UnimplementedGreeterServer
 }
 
 var _ pb.GreeterServer = greeter{}
 
+// checkName is the only place a name is validated, so all four method shapes
+// answer the same way. Measuring it once (see README: -name "" on the unary
+// method, -names "a,,c" on the bidi one) covers every entry point that calls it.
+func checkName(name string) error {
+	if name == "" {
+		return status.Error(codes.InvalidArgument, "name is required")
+	}
+	return nil
+}
+
 func (greeter) Greet(_ context.Context, in *pb.GreetRequest) (*pb.GreetReply, error) {
-	if in.GetName() == "" {
-		return nil, status.Error(codes.InvalidArgument, "name is required")
+	if err := checkName(in.GetName()); err != nil {
+		return nil, err
 	}
 	return &pb.GreetReply{Message: fmt.Sprintf("Hello, %s!", in.GetName())}, nil
 }
 
 func (greeter) GreetStream(in *pb.GreetRequest, stream pb.Greeter_GreetStreamServer) error {
-	if in.GetName() == "" {
-		return status.Error(codes.InvalidArgument, "name is required")
+	if err := checkName(in.GetName()); err != nil {
+		return err
 	}
 	for i := int32(1); i <= in.GetTimes(); i++ {
 		if err := stream.Send(&pb.GreetReply{
@@ -65,6 +81,55 @@ func (greeter) GreetStream(in *pb.GreetRequest, stream pb.Greeter_GreetStreamSer
 		}
 	}
 	return nil
+}
+
+// GreetChat is the bidirectional method: it answers each name as it arrives, so
+// the two directions run concurrently rather than request-then-whole-response.
+// An input stream that closes without a single name is not an error here — nobody
+// said anything, so there is nothing to answer.
+func (greeter) GreetChat(stream pb.Greeter_GreetChatServer) error {
+	for {
+		in, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := checkName(in.GetName()); err != nil {
+			return err
+		}
+		if err := stream.Send(&pb.GreetReply{
+			Message: fmt.Sprintf("Hello, %s!", in.GetName()),
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+// GreetAll is the client-streaming method: many names in, one reply out. The
+// client's half-close is what tells the handler the input is complete — Recv
+// reports it as io.EOF, there is no other signal.
+func (greeter) GreetAll(stream pb.Greeter_GreetAllServer) error {
+	var names []string
+	for {
+		in, err := stream.Recv()
+		if err == io.EOF {
+			if len(names) == 0 {
+				return status.Error(codes.InvalidArgument, "at least one name is required")
+			}
+			return stream.SendAndClose(&pb.GreetReply{
+				Message: fmt.Sprintf("Hello, %s!", strings.Join(names, ", ")),
+			})
+		}
+		if err != nil {
+			return err
+		}
+		if err := checkName(in.GetName()); err != nil {
+			return err
+		}
+		names = append(names, in.GetName())
+	}
 }
 
 func main() {

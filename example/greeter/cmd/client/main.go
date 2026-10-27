@@ -15,6 +15,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -35,7 +36,16 @@ func main() {
 	service := flag.String("service", pb.Greeter_ServiceDesc.ServiceName, "service name to resolve")
 	name := flag.String("name", "sweet", "name to greet")
 	times := flag.Int("times", 3, "how many greetings to ask the stream for")
+	names := flag.String("names", "a,b,c", "comma-separated names, one request per name, used by GreetChat and GreetAll")
 	flag.Parse()
+
+	// An empty -names deliberately sends zero requests, which is the one input that
+	// tells GreetChat (nothing said → nothing answered) and GreetAll (a reply is
+	// promised, so zero names is InvalidArgument) apart.
+	var speakers []string
+	if s := strings.TrimSpace(*names); s != "" {
+		speakers = strings.Split(s, ",")
+	}
 
 	var reg registry.Registry
 	switch *registryKind {
@@ -91,4 +101,52 @@ func main() {
 
 	log.Printf("resolved %s through %s registry → Greet=%q GreetStream=%v",
 		*service, reg.Name(), reply.GetMessage(), hellos)
+
+	// Bidirectional: the server answers each name as it arrives. Requests are sent
+	// first and replies read afterwards here, which is safe for a handful of small
+	// frames — they fit inside the flow-control window, so the send loop cannot
+	// block while nothing is reading. A conversation that has to interleave needs a
+	// second goroutine for Send.
+	chat, err := cli.GreetChat(ctx)
+	if err != nil {
+		log.Fatalf("GreetChat: %v", err)
+	}
+	for _, n := range speakers {
+		if err := chat.Send(&pb.GreetRequest{Name: n}); err != nil {
+			log.Fatalf("GreetChat Send: %v", err)
+		}
+	}
+	if err := chat.CloseSend(); err != nil {
+		log.Fatalf("GreetChat CloseSend: %v", err)
+	}
+	var chats []string
+	for {
+		m, err := chat.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("GreetChat Recv: %v", err)
+		}
+		chats = append(chats, m.GetMessage())
+	}
+	log.Printf("GreetChat (bidi, %d requests in) → %v", len(speakers), chats)
+
+	// Client streaming: many requests in, exactly one reply out. CloseAndRecv is the
+	// half-close plus that reply; the server sees the half-close as io.EOF from Recv,
+	// which is the only signal that its input is complete.
+	all, err := cli.GreetAll(ctx)
+	if err != nil {
+		log.Fatalf("GreetAll: %v", err)
+	}
+	for _, n := range speakers {
+		if err := all.Send(&pb.GreetRequest{Name: n}); err != nil {
+			log.Fatalf("GreetAll Send: %v", err)
+		}
+	}
+	allReply, err := all.CloseAndRecv()
+	if err != nil {
+		log.Fatalf("GreetAll CloseAndRecv: %v", err)
+	}
+	log.Printf("GreetAll (client-streaming, %d requests in) → %q", len(speakers), allReply.GetMessage())
 }

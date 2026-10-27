@@ -26,6 +26,8 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// One request shape serves all four methods. `times` is read only by
+// GreetStream; the streaming methods take one name per message and ignore it.
 type GreetRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -132,10 +134,12 @@ const file_greeter_proto_rawDesc = "" +
 	"\x05times\x18\x02 \x01(\x05R\x05times\"&\n" +
 	"\n" +
 	"GreetReply\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage2\xa3\x01\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage2\xc2\x02\n" +
 	"\aGreeter\x12G\n" +
 	"\x05Greet\x12\x1e.sweet.example.v1.GreetRequest\x1a\x1c.sweet.example.v1.GreetReply\"\x00\x12O\n" +
-	"\vGreetStream\x12\x1e.sweet.example.v1.GreetRequest\x1a\x1c.sweet.example.v1.GreetReply\"\x000\x01B7Z5github.com/javahongxi/sweet/example/greeter/greeterpbb\x06proto3"
+	"\vGreetStream\x12\x1e.sweet.example.v1.GreetRequest\x1a\x1c.sweet.example.v1.GreetReply\"\x000\x01\x12L\n" +
+	"\bGreetAll\x12\x1e.sweet.example.v1.GreetRequest\x1a\x1c.sweet.example.v1.GreetReply\"\x00(\x01\x12O\n" +
+	"\tGreetChat\x12\x1e.sweet.example.v1.GreetRequest\x1a\x1c.sweet.example.v1.GreetReply\"\x00(\x010\x01B7Z5github.com/javahongxi/sweet/example/greeter/greeterpbb\x06proto3"
 
 var (
 	file_greeter_proto_rawDescOnce sync.Once
@@ -157,10 +161,14 @@ var file_greeter_proto_goTypes = []any{
 var file_greeter_proto_depIdxs = []int32{
 	0, // 0: sweet.example.v1.Greeter.Greet:input_type -> sweet.example.v1.GreetRequest
 	0, // 1: sweet.example.v1.Greeter.GreetStream:input_type -> sweet.example.v1.GreetRequest
-	1, // 2: sweet.example.v1.Greeter.Greet:output_type -> sweet.example.v1.GreetReply
-	1, // 3: sweet.example.v1.Greeter.GreetStream:output_type -> sweet.example.v1.GreetReply
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	0, // 2: sweet.example.v1.Greeter.GreetAll:input_type -> sweet.example.v1.GreetRequest
+	0, // 3: sweet.example.v1.Greeter.GreetChat:input_type -> sweet.example.v1.GreetRequest
+	1, // 4: sweet.example.v1.Greeter.Greet:output_type -> sweet.example.v1.GreetReply
+	1, // 5: sweet.example.v1.Greeter.GreetStream:output_type -> sweet.example.v1.GreetReply
+	1, // 6: sweet.example.v1.Greeter.GreetAll:output_type -> sweet.example.v1.GreetReply
+	1, // 7: sweet.example.v1.Greeter.GreetChat:output_type -> sweet.example.v1.GreetReply
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name

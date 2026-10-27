@@ -7,11 +7,13 @@
 片段（`srv.Register(&pb.Greeter_ServiceDesc, impl)` 与 `pb.NewGreeterClient(conn)`）到这一篇
 才有跑得通的实现。
 
-## 与 helloworld 只有一处变量
+## 四种方法形态，前两种与 helloworld 逐行同形
 
-方法形态刻意一一对应（一个一元、一个 server-streaming），flags 同名同义，只有默认端口不同
-（这里 20001，helloworld 20000），所以两份代码可以直接 diff，也可以同时跑（两个 server 各占自己
-的默认端口，两个 client 各自解析成功）：
+`Greet`（一元）和 `GreetStream`（server-streaming）刻意跟 `example/helloworld` 一一对应，
+flags 同名同义，只有默认端口不同（这里 20001，helloworld 20000），所以这两发可以直接 diff，
+也能同时跑（两个 server 各占自己的默认端口，两个 client 各自解析成功）。`GreetAll`
+（client-streaming）与 `GreetChat`（bidi）是这一篇才有的另外两种形态：手写那一侧要为它们自己
+拼 `NewStream` 和方法名字符串，正是这一篇要避开的东西。
 
 | | helloworld | greeter |
 | --- | --- | --- |
@@ -21,6 +23,8 @@
 | 服务名 | 常量 `ping.ServiceName` | `pb.Greeter_ServiceDesc.ServiceName`，来自 proto 的 `package` + `service` |
 | 服务端流类型 | `grpc.ServerStreamingServer[wrapperspb.StringValue]` | `pb.Greeter_GreetStreamServer`（生成的别名，同一个类型）|
 | 流的收取循环 | 藏在 `ping.Events` 里 | 调用侧自己 `Recv` 到 `io.EOF` |
+| 客户端流 | 没有 | 客户端 `CloseAndRecv` 收口；服务端从 `Recv` 的 `io.EOF` 才知道输入完了 |
+| 双向流 | 没有 | 生成的是 `grpc.BidiStreamingClient/Server` 别名，每帧边到边答 |
 
 服务名只有一套：`sweet.example.v1.Greeter` 是 `greeter.proto` 的 `package sweet.example.v1`
 与 `service Greeter` 拼出来的，示例里没有第二套标识；`server.Options.ServiceName` 的默认值
@@ -42,16 +46,40 @@ sweet server up: listen=127.0.0.1:20001 advertised=127.0.0.1:20001 service=sweet
 
 # client
 resolved sweet.example.v1.Greeter through direct registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet! Hello #2, sweet! Hello #3, sweet!]
+GreetChat (bidi, 3 requests in) → [Hello, a! Hello, b! Hello, c!]
+GreetAll (client-streaming, 3 requests in) → "Hello, a, b, c!"
 ```
 
-一元与流的入参不同（`-name` / `-times`），`-times 1` 就只收到一条：
+四个入口的入参：一元与 server-streaming 用 `-name` / `-times`，客户端流与双向流用 `-names`
+（一个名字一帧）。`-times 1` 只收到一条：
 
 ```
 resolved sweet.example.v1.Greeter through direct registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet!]
 ```
 
-服务端返回类型化状态码也是生成码那套接口的一部分——`-name ""` 撞进实现里的
-`status.Error(codes.InvalidArgument, "name is required")`：
+`-names alice,bob` 发两帧，双向流答两条、客户端流合成一条：
+
+```
+GreetChat (bidi, 2 requests in) → [Hello, alice! Hello, bob!]
+GreetAll (client-streaming, 2 requests in) → "Hello, alice, bob!"
+```
+
+`-names ""` 一帧都不发，两种语义在这里分道：双向流没收到名字就不答（不算错），客户端流
+承诺了一个回复，零帧是 `InvalidArgument`：
+
+```
+GreetChat (bidi, 0 requests in) → []
+GreetAll CloseAndRecv: rpc error: code = InvalidArgument desc = at least one name is required
+```
+
+`-names "a,,c"` 的空名先被双向流撞掉，进程随即退出，这一发没轮到客户端流：
+
+```
+GreetChat Recv: rpc error: code = InvalidArgument desc = name is required
+```
+
+一元的 `-name ""` 打到的是同一个 `checkName`（四个入口共用一处校验，见下文
+「每帧校验只有一处」）：
 
 ```
 Greet: rpc error: code = InvalidArgument desc = name is required
@@ -72,6 +100,8 @@ sweet server up: listen=127.0.0.1:20002 advertised=127.0.0.1:20002 service=sweet
 
 # client
 resolved sweet.example.v1.Greeter through nacos registry → Greet="Hello, sweet!" GreetStream=[Hello #1, sweet! Hello #2, sweet! Hello #3, sweet!]
+GreetChat (bidi, 3 requests in) → [Hello, a! Hello, b! Hello, c!]
+GreetAll (client-streaming, 3 requests in) → "Hello, a, b, c!"
 ```
 
 客户端这一行只证明「解析到了一个地址并能调用」，不证明注册名就是生成码那个名字，所以另查一次
@@ -100,6 +130,55 @@ stopped: deregistered then drained
 ```
 Greet: rpc error: code = Unavailable desc = name resolver error: produced zero addresses
 ```
+
+## 每帧校验只有一处
+
+四个入口的「名字不能为空」是同一段代码（`cmd/server/main.go`）：
+
+```go
+func checkName(name string) error {
+	if name == "" {
+		return status.Error(codes.InvalidArgument, "name is required")
+	}
+	return nil
+}
+```
+
+`Greet`、`GreetStream`、`GreetChat`、`GreetAll` 各自在入口调它，所以上面 `-name ""`（一元）与
+`-names "a,,c"`（双向流）打到的是同一条分支，只是从两个入口进去。客户端流另有一条只属于它的
+规则：它承诺了一个回复，所以零帧是 `at least one name is required`；双向流没有这个承诺，
+零帧就是零答，不算错。
+
+## 漏写一个方法会怎样
+
+`pb.GreeterServer` 接口里有一个不可导出的 `mustEmbedUnimplementedGreeterServer()`，只能靠内嵌
+`pb.UnimplementedGreeterServer` 满足；而那个内嵌件**自带全部四个方法**。代价实测如下（每次都是
+把 `cmd/server/main.go` 临时改坏、产物写到仓库外、跑完逐字节恢复并 `cmp` 确认）：
+
+- **方法名写错**（等价于忘了实现这个流式方法）：`go build` 退出码 0、stderr 零字节，接口照样
+  满足——`GreetChat` 由内嵌件顶上。信号要到调用时才出现，服务端全程没有一句提示：
+
+```
+GreetChat Recv: rpc error: code = Unimplemented desc = method GreetChat not implemented
+```
+
+- **签名写错**（多一个参数）：`var _ pb.GreeterServer = greeter{}` 让它在 build 期就炸，
+  并且点名是哪个方法：
+
+```
+example/greeter/cmd/server/main.go:53:26: cannot use greeter{} (value of struct type greeter) as greeterpb.GreeterServer value in variable declaration: greeter does not implement greeterpb.GreeterServer (wrong type for method GreetChat)
+		have GreetChat(greeterpb.Greeter_GreetChatServer, int) error
+		want GreetChat(grpc.BidiStreamingServer[greeterpb.GreetRequest, greeterpb.GreetReply]) error
+```
+
+这段 have/want 顺带证明了 `pb.Greeter_GreetChatServer` 与
+`grpc.BidiStreamingServer[GreetRequest, GreetReply]` 是同一个类型，只是生成出来的别名。
+
+那行断言为什么值得写：sweet 的 `Register` 收的是 `*grpc.ServiceDesc` 加 `any`，不经过生成的
+`RegisterGreeterServer`（`server/server.go:87`）；而 grpc-go v1.84.0 的 `Server.RegisterService`
+对 handler 类型不匹配是直接 `grpclog.Fatalf`，且它没有返回值可检查
+（`grpc-go@v1.84.0/server.go:778-787`——这一条是读源码得到的依据，不是这一篇实测的）。少了断言，
+签名错误要到进程被终止才看得见。
 
 ## 重新生成
 
