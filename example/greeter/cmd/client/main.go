@@ -49,6 +49,8 @@ func main() {
 	name := flag.String("name", "sweet", "name to greet")
 	times := flag.Int("times", 3, "how many greetings to ask the stream for")
 	names := flag.String("names", "a,b,c", "comma-separated names, one request per name, used by GreetChat and GreetAll")
+	hold := flag.Int("hold", 0, "seconds to stay alive after the first round, then call once more; "+
+		"used to watch a snapshot fallback heal itself when Nacos comes back")
 	flag.Parse()
 
 	// An empty -names deliberately sends zero requests, which is the one input that
@@ -179,4 +181,21 @@ func main() {
 	}
 	log.Printf("GreetAll    <= %q", allReply.GetMessage())
 	log.Printf("GreetAll    == %s from %s", plural(1, "frame"), plural(len(speakers), "request"))
+
+	// Staying alive is the point: a process that exits cannot show that a
+	// fallback healed. With Nacos restarted during the hold, the reconnect loop
+	// re-subscribes, and this second call runs on the server-confirmed list.
+	if *hold > 0 {
+		log.Printf("holding %ds: restart Nacos now to watch the snapshot fallback heal", *hold)
+		time.Sleep(time.Duration(*hold) * time.Second)
+		// A fresh context: the round above had a 5s budget, and reusing it after a
+		// hold measures the sleep, not the healing.
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer hcancel()
+		healed, err := cli.Greet(hctx, &pb.GreetRequest{Name: *name})
+		if err != nil {
+			log.Fatalf("Greet after hold: %v", err)
+		}
+		log.Printf("after hold  <= %q", healed.GetMessage())
+	}
 }

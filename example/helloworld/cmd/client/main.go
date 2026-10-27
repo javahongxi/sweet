@@ -32,6 +32,8 @@ func main() {
 	snapshot := flag.String("snapshot", "", "directory holding the instance-list snapshot; when set, a "+
 		"cold start against an unreachable Nacos falls back to the last list it wrote, and the age is "+
 		"reported. Empty — the default — means no snapshot is read or written.")
+	hold := flag.Int("hold", 0, "seconds to stay alive after the first round, then call once more; "+
+		"used to watch a snapshot fallback heal itself when Nacos comes back")
 	flag.Parse()
 
 	requests := strings.Split(*values, ",")
@@ -116,6 +118,23 @@ func main() {
 	}
 	log.Printf("Ack        <= %q", ack)
 	log.Printf("Ack        == %s from %s", plural(1, "frame"), plural(len(requests), "request"))
+
+	// Staying alive is the point: a process that has already exited cannot show
+	// that a fallback healed. Same device as example/greeter's client, so the two
+	// examples still differ in exactly one variable.
+	if *hold > 0 {
+		log.Printf("holding %ds: restart Nacos now to watch the snapshot fallback heal", *hold)
+		time.Sleep(time.Duration(*hold) * time.Second)
+		// A fresh context: the round above had a 5s budget, and reusing it after a
+		// hold would measure the sleep rather than the recovery.
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer hcancel()
+		pong, err = cli.Ping(hctx, "after-hold")
+		if err != nil {
+			log.Fatalf("Ping after hold: %v", err)
+		}
+		log.Printf("after hold  <= %q", pong)
+	}
 }
 
 // plural counts a noun the way these lines should read: "1 frame", "3 frames".
