@@ -4,9 +4,14 @@
 
 传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。
 
-## 状态
+## 是什么 / 不是什么
 
-已完成：注册 / 注销 / 查询 / 订阅 + 推送 + ACK、优雅上下线、连接断开后的重连与重放、保活探针与死流检测、内置 gRPC 反射与健康服务。
+- **是**：Go 侧的服务发现 + 调用面。你写的仍然是标准 gRPC 桩，sweet 负责"按服务名找到对端"
+  和"上下线真的生效"这两件事。
+- **面向**：要接 Nacos 3.x 的 Go 服务；以及想知道"手写命名协议客户端到底要处理什么"的人
+  （协议层与适配层的取舍写在 `registry/nacos/nacos.go` 与 `nacos/conn.go` 的注释里）。
+- **不做**：HTTP/REST 传输、配置中心、鉴权与 TLS 配置面、持久实例（只支持 ephemeral）、
+  加权负载均衡（`Weight` 只随实例透传给对端，本客户端不据此分流量）。
 
 ## 要求与兼容
 
@@ -20,7 +25,15 @@
 
 ## 五分钟跑通
 
-不需要 Nacos 时走 direct（纯直通，不做发现，客户端自己给地址）：
+在自己的模块里引入。模块路径就是仓库地址，不用 clone、不用 `replace`：
+
+```
+go get github.com/javahongxi/sweet   # 尚无 tag，装的是 pseudo-version；钉住写 @main 或 @<commit>
+go mod tidy                          # 补齐 go.sum，跳过这步 build 会报 missing go.sum entry
+```
+
+只想试一把，就在本仓库里直接编两个命令出来（不需要 Nacos 时走 direct：纯直通、不做发现，
+客户端自己给地址）：
 
 ```
 go build -o /tmp/sweet-server ./example/helloworld/cmd/server
@@ -82,46 +95,7 @@ unary  SayHello        → "Hello, sweet! (from jaws-wire)"
 stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
 ```
 
-## 标准工具能直接看见它
-
-`server.New` 顺手注册了 gRPC 反射与健康服务——两者都在 `grpc-go` 自己仓库里，不构成第二个
-依赖。意义不在"多了两个服务"，而在**对端不需要知道 sweet 存在**：`grpcurl` 这类标准工具能自己
-列出实例上有什么服务、读出 schema、直接调一刀。实测（2026-10-28，`grpcurl 1.9.4`，对端
-`go run ./example/greeter/cmd/server -registry=direct -listen 127.0.0.1:20001`）：
-
-```
-$ grpcurl -plaintext localhost:20001 list
-grpc.health.v1.Health
-grpc.reflection.v1.ServerReflection
-grpc.reflection.v1alpha.ServerReflection
-sweet.example.v1.Greeter
-
-$ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.example.v1.Greeter/GreetStream
-{
-  "message": "Hello #1, grpcurl!"
-}
-{
-  "message": "Hello #2, grpcurl!"
-}
-```
-
-`describe sweet.example.v1.Greeter` 会把四个 rpc 的完整 schema 打出来（含 `stream` 标注），
-说明列出来的不只是名字。
-
-健康状态跟着 sweet 的生命周期走，而不是恒为 `SERVING`：`grpc-go` 的 `health.NewServer()` 一
-开始就把总体服务标成 SERVING，而那时还没监听，所以 `New` 里显式改成 `NOT_SERVING`，直到
-`Serve` 绑好端口并 `Expose` 成功才翻成 SERVING（注册的每个服务名各自一份状态）；`Stop` 一开始
-就 `Shutdown()`，比注销更早一步告诉探活方"别再发流量了"。`interoptest` 里
-`TestNativeClientCallsSweetServer` 用一个**不带任何 sweet 代码**的原生健康客户端把这两件事断言住。
-
 ## 用法
-
-模块路径就是仓库地址，不用 clone、不用 `replace`：
-
-```
-go get github.com/javahongxi/sweet   # 尚无 tag，装的是 pseudo-version；钉住写 @main 或 @<commit>
-go mod tidy                          # 补齐 go.sum，跳过这步 build 会报 missing go.sum entry
-```
 
 ### 服务端
 
@@ -165,6 +139,76 @@ type Registry interface {
 
 两个实现：`registry/nacos`（把下面那套手写协议包成 `Registry`）与 `registry/direct`（直通，兼测试替身）。协议本身在 `nacos` 包里（信封、握手、保活探针、重连钩子、推送与 ACK），`registry/nacos` 只做适配与重放。`Expose` 返回注销闭包；`Watch` 首次调用即订阅，返回的第一个快照来自订阅响应本身（Nacos 的 subscribe 会带回当前实例列表，不需要额外查一次）。
 
+### 超时、取消与错误
+
+deadline 与取消走 `context`，sweet 不发明自己的超时字段；其余 grpc 惯用法（dial option、
+call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传。框架自己包过的错误
+（连接、探针、订阅）保持可分类——`%w` 一路包上去之后调用方仍能用 `errors.As` 取到 gRPC 状态码，
+这条由 `TestCauseStaysClassifiableThroughWrapping` 钉住。
+
+## 能力与边界
+
+每条主张都指出是谁在看着它，没有测试钉着的不写。
+
+| 主张 | 钉住它的测试 | 实测读数 |
+|---|---|---|
+| 注册 / 注销 / 查询 / 订阅 + 推送 + ACK | `TestBackendsContract`（`registry/nacos/harbor_test.go`） | 同一份客户端代码对 Nacos 与 harbor 两个服务端都成立，无 harbor 分支 |
+| 建连：先一元 `ServerCheckRequest` 拿 connectionId，再开 bidi | `TestLiveSetupHandshakeIsAcknowledged`（`nacos/integration_test.go`） | 拿回服务端能力表 |
+| 保活探针与死流检测 | `TestLiveProbeChannelFacts`（`nacos/detect_test.go`） | 一元通道有应答、bidi 流上无人应答，两条都断言 |
+| ephemeral 实例的活性＝那条 bidi 连接 | `TestIdleRegistrationSurvives`（`registry/nacos/persist_probe_test.go`） | 空载 3 分钟 12 次探测，实例始终在 |
+| 服务端重启后重连并重放注册与订阅 | `TestReconnectAfterServerRestart`（同上文件） | 手动跑：要 `SWEET_RESTART_DRILL=1` 并由人重启 Nacos，否则 skip——它不在自动跑的那轮里 |
+| 优雅上下线：先注销、再 drain、再停止 accept | `TestRollingRestartDrill`（`registry/nacos/restart_drill_test.go`） | `calls=180 failures=0`，收敛 559.5ms / 611.1ms |
+| 长命 goroutine 里的 panic 不拖垮进程 | `TestGuardConvertsPanicToStreamLoss`（`nacos/panic_guard_test.go`） | panic→hook 收到原因，`Ready()` 转 false，重握手后 `Epoch()≥2` |
+| 错误可分类 | `TestCauseStaysClassifiableThroughWrapping`（`nacos/errors_test.go`） | 三层包装后 Unavailable / Canceled 都取得到 |
+| 与改不了的 grpc-go 桩互通 | `TestNativeClientCallsSweetServer`、`TestNativeServerAcceptsGeneratedStreamViaSweet`、`TestSweetClientDiscoversNativeServer`（`interoptest/`） | stock `grpc.health.v1.Health` 的一元与生成式流方法都通，两个方向都测 |
+| 内置 gRPC 反射与健康服务 | `TestNativeClientCallsSweetServer`、`TestReflectionListsRegisteredService` | 见下一节的 grpcurl 外部实测 |
+
+## 标准工具能直接看见它
+
+`server.New` 顺手注册了 gRPC 反射与健康服务——两者都在 `grpc-go` 自己仓库里，不构成第二个
+依赖。意义不在"多了两个服务"，而在**对端不需要知道 sweet 存在**：`grpcurl` 这类标准工具能自己
+列出实例上有什么服务、读出 schema、直接调一刀。实测（2026-10-28，`grpcurl 1.9.4`，对端
+`go run ./example/greeter/cmd/server -registry=direct -listen 127.0.0.1:20001`）：
+
+```
+$ grpcurl -plaintext localhost:20001 list
+grpc.health.v1.Health
+grpc.reflection.v1.ServerReflection
+grpc.reflection.v1alpha.ServerReflection
+sweet.example.v1.Greeter
+
+$ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.example.v1.Greeter/GreetStream
+{
+  "message": "Hello #1, grpcurl!"
+}
+{
+  "message": "Hello #2, grpcurl!"
+}
+```
+
+`describe sweet.example.v1.Greeter` 会把四个 rpc 的完整 schema 打出来（含 `stream` 标注），
+说明列出来的不只是名字。
+
+健康状态跟着 sweet 的生命周期走，而不是恒为 `SERVING`：`grpc-go` 的 `health.NewServer()` 一
+开始就把总体服务标成 SERVING，而那时还没监听，所以 `New` 里显式改成 `NOT_SERVING`，直到
+`Serve` 绑好端口并 `Expose` 成功才翻成 SERVING（注册的每个服务名各自一份状态）；`Stop` 一开始
+就 `Shutdown()`，比注销更早一步告诉探活方"别再发流量了"。
+
+## 深入了解更多
+
+- `example/helloworld/README.md`——手写 `grpc.ServiceDesc` 跑通四种形态，不碰 protoc。
+- `example/greeter/README.md`——proto 生成码的 Go 调 Go，四种形态；末尾有它和 helloworld 的
+  逐项对照表，两份代码的差别只有"手写 vs 生成"。
+- `example/jaws-wire/README.md`——Go 客户端调 Java 服务端（jaws 的 wire provider），跨语言实测。
+- 反方向的样例在 jaws 仓库：`jaws-samples/jaws-sample-wire-sweet`，jaws 的 wire 客户端经 Nacos
+  发现并调用 sweet 起的 grpc-go 服务。
+- 取舍写在代码注释里，两处最值钱：`registry/nacos/nacos.go` 的文件头（ephemeral 这一条路径的
+  范围、"活性＝那条 bidi 连接、没有 beat"、§8.6 的"注销优先"与重放次序：实例先、订阅后）；
+  `nacos/conn.go`（对 nacos-client 契约的超时取值、推送必须回同一个 `requestId` 否则服务端重推、
+  "丢流不等于丢通道"的重连语义）。`nacos/envelope.go` 与 `nacos/naming.go` 记的是信封和
+  `Metadata.type` 到 Java 类名的映射。
+- vendored proto 与重生成的规矩在 `gen/doc.go`（重生成后 `cmp` 逐字节一致才算数）。
+
 ## 测试
 
 ```
@@ -187,18 +231,11 @@ ok  	github.com/javahongxi/sweet/sweettest	(cached)
 NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos ./interoptest -count=1
 ```
 
-几条值得单独看的：
+## 版本
 
-| 测试 | 验的东西 | 实测 |
-|---|---|---|
-| `TestLiveSetupHandshakeIsAcknowledged` | 真机建连握手能完成 | 拿回服务端能力表 |
-| `TestLiveProbeChannelFacts` | 保活探针在一元通道有应答、在 bidi 流上无人应答 | 两条都断言 |
-| `TestIdleRegistrationSurvives` | 空载时注册是否一直存在（ephemeral 活性＝那条连接） | 3 分钟 12 次探测，实例始终在 |
-| `TestRollingRestartDrill` | provider 重启时消费端不中断；失败按 gRPC 状态码分桶，不按字符串 | `calls=180 failures=0`，收敛 559.5ms / 611.1ms |
-| `TestGuardConvertsPanicToStreamLoss` | 长命 goroutine 里的 panic 变成一次流丢失（可重连），既不拖垮进程也不留下 `Ready()==true` 的死连接 | panic→hook 收到原因，`Ready()` 转 false，重握手后 `Epoch()≥2` |
-| `TestCauseStaysClassifiableThroughWrapping` | `%w` 一路包上去之后，调用方仍能用 `errors.As` 取到 gRPC 状态码；目标必须是指向接口的指针（`*status.Status` 不实现 `error`，那种写法编译不过） | 三层包装后 Unavailable / Canceled 都取得到 |
-| `TestBackendsContract/{nacos,harbor}` | 同一份客户端代码对两个不同实现的服务端都成立（表驱动子测试，缺哪个环境变量就 skip 哪个） | 两端全绿，无 harbor 分支 |
-| `TestNativeClientCallsSweetServer` / `TestSweetClientDiscoversNativeServer` | 与**改不了的**原生 grpc-go 桩（stock `grpc.health.v1.Health`）互通 | 一元与生成式流方法都通 |
-
+没有语义化 tag，`go get` 拿到的是 pseudo-version，例如
+`v0.0.0-20261027193012-b3fc07f6887d`；`@latest` 也解析到默认分支的这个 pseudo-version（实测）。
+要长期钉住就写 `@<commit>`。升级 `grpc-go` 之后把上面两条命令都跑一遍——离那条表里的主张近，
+别只跑离线的那条。
 
 &copy; [hongxi.org](http://hongxi.org)
