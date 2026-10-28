@@ -24,22 +24,26 @@ proto 一行未动。
 
 ## 跑客户端
 
-直连（默认）：
+默认就是经 Nacos 发现，什么 flag 都不用给（provider 得先起来）：
 
 ```
 go run ./example/jaws-wire -name sweet
 ```
 
-经 Nacos 发现——注意查找名与 gRPC 服务名是两串不同的字符串，`-resolve` 给前者：
+只要线格式互通、不想掺进发现这一层时，显式走直连：
 
 ```
-go run ./example/jaws-wire -registry=nacos -group default_rpc -resolve jaws/org.hongxi.jaws.sample.wire.proto.GreeterService -name sweet
+go run ./example/jaws-wire -registry=direct -name sweet
 ```
 
-实测输出（2026-10-28，两次都 rc=0；nacos 那发多一行解析记录，其余逐字相同）：
+两种模式的默认值是一对：nacos 模式下查找名取 jaws 注册用的那个（`jaws/<接口全名>`），
+direct 模式忽略这个名字、日志里就回落到 gRPC 服务名。要连的是别的服务时用 `-resolve`
+覆盖，别和 `-service`（stub 调用的 `/greeter.Greeter/…`）混为一谈。
+
+实测（2026-10-28，两次都 rc=0）。默认 nacos 那发：
 
 ```
-resolved jaws/org.hongxi.jaws.sample.wire.proto.GreeterService in group default_rpc from nacos: [{10.62.19.145 50051 1 map[application:sample-wire-boot-provider compression:gzip endpointType:service path:org.hongxi.jaws.sample.wire.proto.GreeterService protocol:wire serialization:fastjson2 timestamp:1793160935967]}]
+resolved jaws/org.hongxi.jaws.sample.wire.proto.GreeterService in group default_rpc from nacos: [{10.62.19.145 50051 1 map[application:sample-wire-boot-provider compression:gzip endpointType:service path:org.hongxi.jaws.sample.wire.proto.GreeterService protocol:wire serialization:fastjson2 timestamp:1793161452839]}]
 calling /greeter.Greeter/SayHello against nacos found as "jaws/org.hongxi.jaws.sample.wire.proto.GreeterService"
 unary  SayHello        → "Hello, sweet! (from jaws-wire-boot)"
 stream SayHelloStream → "Hello #1, sweet! (from jaws-wire-boot stream)"
@@ -47,8 +51,24 @@ stream SayHelloStream → "Hello #2, sweet! (from jaws-wire-boot stream)"
 stream SayHelloStream → "Hello #3, sweet! (from jaws-wire-boot stream)"
 ```
 
-第一行是这条链的关键证据：地址、组、以及 jaws 自己写的元数据都来自注册中心，不是命令行给的。
+`-registry=direct` 那发除了没有解析记录、`found as` 后面是 gRPC 服务名之外，逐字相同：
+
+```
+calling /greeter.Greeter/SayHello against direct found as "greeter.Greeter"
+unary  SayHello        → "Hello, sweet! (from jaws-wire-boot)"
+stream SayHelloStream → "Hello #1, sweet! (from jaws-wire-boot stream)"
+stream SayHelloStream → "Hello #2, sweet! (from jaws-wire-boot stream)"
+stream SayHelloStream → "Hello #3, sweet! (from jaws-wire-boot stream)"
+```
+
+解析那一行是这条链的关键证据：地址、组、以及 jaws 自己写的元数据都来自注册中心，不是命令行给的。
 它能被忽略也没关系——`toInstances` 只取 host/port/weight，metadata 原样带过来不做判断。
+
+拿到空列表时它会直接停下来说话，而不是拖到后面变成一句 `produced zero addresses`：
+
+```
+no instance of greeter.Greeter in group default_rpc: is the provider running, and is -resolve its registry name rather than the gRPC service name? (jaws registers as jaws/<interface FQN>)
+```
 
 ## 顺手记一个互通坑
 

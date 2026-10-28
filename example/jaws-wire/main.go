@@ -44,18 +44,26 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "jaws wire provider address, used by -registry=direct")
-	registryKind := flag.String("registry", "direct", "direct | nacos")
+	registryKind := flag.String("registry", "nacos", "direct | nacos")
 	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
 	group := flag.String("group", "default_rpc", "Nacos group the provider registered under")
-	resolve := flag.String("resolve", "greeter.Greeter",
-		"service name to look up; jaws publishes under jaws/<interface FQN>, which is not "+
-			"the gRPC service name the stub calls — that stays greeter.Greeter")
+	resolve := flag.String("resolve", "",
+		"service name to look up in the registry; empty picks per mode: nacos needs the name "+
+			"jaws registered under (jaws/<interface FQN>), direct ignores it")
 	name := flag.String("name", "sweet", "name to greet")
 	flag.Parse()
 
 	// The gRPC service name the stub calls is fixed by greeter.proto (see the
-	// generated *_FullMethodName constants below); discovery is the separate
-	// question, and -resolve answers it.
+	// generated *_FullMethodName constants below); the lookup name is a separate
+	// string, and defaulting it per mode is what makes a bare `go run` work in
+	// either mode instead of only with the flags spelled out.
+	if *resolve == "" {
+		if *registryKind == "nacos" {
+			*resolve = "jaws/org.hongxi.jaws.sample.wire.proto.GreeterService"
+		} else {
+			*resolve = "greeter.Greeter"
+		}
+	}
 	var (
 		reg registry.Registry
 		nr  *nacosregistry.Registry
@@ -92,6 +100,14 @@ func main() {
 		}
 		select {
 		case insts := <-ch:
+			if len(insts) == 0 {
+				// Better than letting it die later as "produced zero addresses":
+				// an empty list means either the lookup name/group is not what the
+				// provider registered under, or nothing is published at all.
+				log.Fatalf("no instance of %s in group %s: is the provider running, "+
+					"and is -resolve its registry name rather than the gRPC service name? "+
+					"(jaws registers as jaws/<interface FQN>)", *resolve, *group)
+			}
 			log.Printf("resolved %s in group %s from nacos: %v", *resolve, *group, insts)
 		case <-time.After(10 * time.Second):
 			log.Fatalf("nacos gave no instance list for %s (group %s) within 10s", *resolve, *group)
