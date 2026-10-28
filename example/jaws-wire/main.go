@@ -1,16 +1,28 @@
-// Command jaws-wire-client calls jaws' wire provider — a Java gRPC server we
-// do not control — through sweet's own dial path.
+// Command jaws-wire-client calls jaws' wire provider — a Java gRPC server we do
+// not control — through sweet's own dial path.
 //
-// The provider sample registers with no registry (jaws' WireProvider direct
-// exports), so the default here is the direct registry: discovery is exercised
-// separately in example/helloworld. Everything past the address is the stock
-// generated stub, which is the point: a caller written the normal way gets
-// sweet's resolver, its graceful lifecycle and its connection semantics without
-// changing a line of the call site.
+// Both modes aim at the same provider, jaws' Spring Boot one, and the flag picks
+// only how its address is obtained:
+//
+//   - -registry=direct (default): host:port from the command line. This isolates
+//     the wire-format interoperability claim — nothing else is in play.
+//   - -registry=nacos: the address comes from Nacos, where that provider published
+//     itself. Two names then differ and both matter: jaws registers under
+//     "jaws/<interface FQN>" in group default_rpc, while the stub calls
+//     /greeter.Greeter/… — -resolve picks the lookup name. That the call still
+//     lands is jaws indexing both names server-side, not luck.
+//
+// Everything past the address is the stock generated stub, which is the other half
+// of the point: a caller written the normal way gets sweet's resolver, its
+// graceful lifecycle and its connection semantics without changing a line of the
+// call site.
 //
 // Start the provider first, from /Users/hongxi/dev/jaws:
 //
-//	./run-sample.sh wire        # one-shot pair, or run WireProvider standalone on 50051
+//	mvn -pl jaws-samples/jaws-sample-wire-boot-provider spring-boot:run
+//
+// It listens on 50051 and registers into Nacos on 127.0.0.1:8848, so Nacos has to
+// be up for -registry=nacos.
 package main
 
 import (
@@ -25,36 +37,84 @@ import (
 
 	"github.com/javahongxi/sweet/client"
 	"github.com/javahongxi/sweet/example/jaws-wire/greeterpb"
+	"github.com/javahongxi/sweet/registry"
 	"github.com/javahongxi/sweet/registry/direct"
+	nacosregistry "github.com/javahongxi/sweet/registry/nacos"
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:50051", "jaws wire provider address")
+	addr := flag.String("addr", "127.0.0.1:50051", "jaws wire provider address, used by -registry=direct")
+	registryKind := flag.String("registry", "direct", "direct | nacos")
+	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
+	group := flag.String("group", "default_rpc", "Nacos group the provider registered under")
+	resolve := flag.String("resolve", "greeter.Greeter",
+		"service name to look up; jaws publishes under jaws/<interface FQN>, which is not "+
+			"the gRPC service name the stub calls — that stays greeter.Greeter")
 	name := flag.String("name", "sweet", "name to greet")
 	flag.Parse()
 
-	// The gRPC service name comes from greeter.proto's package + service, i.e.
-	// the same string jaws serves; no second identifier is introduced.
-	const service = "greeter.Greeter"
-
-	reg, err := direct.New(*addr)
-	if err != nil {
-		log.Fatalf("registry: %v", err)
+	// The gRPC service name the stub calls is fixed by greeter.proto (see the
+	// generated *_FullMethodName constants below); discovery is the separate
+	// question, and -resolve answers it.
+	var (
+		reg registry.Registry
+		nr  *nacosregistry.Registry
+	)
+	switch *registryKind {
+	case "direct":
+		dr, err := direct.New(*addr)
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = dr
+	case "nacos":
+		var err error
+		nr, err = nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr, GroupName: *group})
+		if err != nil {
+			log.Fatalf("registry: %v", err)
+		}
+		reg = nr
+	default:
+		log.Fatalf("unknown -registry %q", *registryKind)
 	}
-	conn, err := client.Dial(reg, service,
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if nr != nil {
+		// Ask the registry, so the address the call is about to use is printed
+		// rather than assumed. Watch, not Query: the connection is lazy, and Query
+		// only reports what an existing connection can see. The first snapshot is
+		// what the subscribe response itself carries.
+		ch, err := nr.Watch(ctx, *resolve)
+		if err != nil {
+			log.Fatalf("watch %s (group %s): %v", *resolve, *group, err)
+		}
+		select {
+		case insts := <-ch:
+			log.Printf("resolved %s in group %s from nacos: %v", *resolve, *group, insts)
+		case <-time.After(10 * time.Second):
+			log.Fatalf("nacos gave no instance list for %s (group %s) within 10s", *resolve, *group)
+		}
+	}
+
+	conn, err := client.Dial(reg, *resolve,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
 	cli := greeterpb.NewGreeterClient(conn)
+
+	// The path the stub puts on the wire, read from the generated constant rather
+	// than retyped here — if the proto ever renames, this line says so.
+	log.Printf("calling %s against %s found as %q", greeterpb.Greeter_SayHello_FullMethodName,
+		*registryKind, *resolve)
 
 	reply, err := cli.SayHello(ctx, &greeterpb.HelloRequest{Name: *name})
 	if err != nil {
-		log.Fatalf("SayHello (is the provider up on %s?): %v", *addr, err)
+		log.Fatalf("SayHello (provider up? -registry=%s reached %s?): %v", *registryKind, *resolve, err)
 	}
 	log.Printf("unary  SayHello        → %q", reply.GetMessage())
 

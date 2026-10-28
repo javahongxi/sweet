@@ -85,13 +85,18 @@ Ping: rpc error: code = Unavailable desc = name resolver error: produced zero ad
 
 ### 跨语言：调 jaws 的 Java gRPC 服务端
 
-对端是 jaws 的 `WireProvider`，调用侧是 `greeter.proto` 生成的标准 Go 桩，
-只把 `conn` 换成 `client.Dial` 给的。跑法与实测输出见 `example/jaws-wire/README.md`：
+对端是 jaws 的 Spring Boot wire provider（`WireBootProvider`），调用侧是 `greeter.proto`
+生成的标准 Go 桩，只把 `conn` 换成 `client.Dial` 给的。地址可以从命令行给，也可以从 Nacos 解析
+出来——jaws 把它自己注册成 `jaws/<接口全名>`，所以查找名与 gRPC 服务名是两串字符串，这一点在
+`example/jaws-wire/README.md` 里写清了。直连那发的实测（2026-10-28）：
 
 ```
 go run ./example/jaws-wire -name sweet
-unary  SayHello        → "Hello, sweet! (from jaws-wire)"
-stream SayHelloStream → "Hello #1, sweet! (from jaws-wire stream)"
+calling /greeter.Greeter/SayHello against direct found as "greeter.Greeter"
+unary  SayHello        → "Hello, sweet! (from jaws-wire-boot)"
+stream SayHelloStream → "Hello #1, sweet! (from jaws-wire-boot stream)"
+stream SayHelloStream → "Hello #2, sweet! (from jaws-wire-boot stream)"
+stream SayHelloStream → "Hello #3, sweet! (from jaws-wire-boot stream)"
 ```
 
 ## 用法
