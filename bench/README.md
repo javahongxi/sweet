@@ -1,0 +1,85 @@
+# bench —— sweet 的吞吐基准
+
+## 这个基准能证明什么，不能证明什么
+
+能证明：sweet 相对裸 grpc-go 的**每调用开销**（同一台机器、同一形状、交错跑）。
+
+不能证明：协议优劣。和 jaws 的表并排时，一次比较同时换了语言运行时、网络库、协议实现与序列化，
+差值只能记成**栈 vs 栈**。谁把它说成"gRPC 比 wire 快/慢"，就是没控制变量。
+
+口径与 jaws 的 `doc/benchmark.md` 对齐：闭环、固定并发、预热丢弃、延迟合并取分位、
+provider 与 consumer 分进程（对应 jaws 的 `ROLE=provider` / `ROLE=consumer`）、loopback TCP。
+payload 同为 `HelloRequest{name="benchmark"}`，回复文本等长。并发 20、预热 5s、测量 15s 或 40s，
+与 jaws 表里 `THREADS=20 WARMUP=5 DURATION=40` 同形。
+
+## 跑法
+
+```
+# 终端 1
+go run ./bench -mode provider -server sweet -port 50051
+
+# 终端 2
+go run ./bench -mode consumer -client sweet -addr 127.0.0.1:50051 -threads 20 -warmup 5 -duration 40
+```
+
+`-server` / `-client` 各取 `native`（裸 grpc-go）或 `sweet`，四组组合都在下面。跨语言那格把
+provider 换成 jaws 的：
+
+```
+cd /path/to/jaws && ROLE=provider SERVER=wire PORT=50051 ./run-sample.sh bench-grpc
+```
+
+## 环境
+
+Apple M2（8 核）、go1.27.3 darwin/arm64、grpc-go v1.84.0、loopback、单条客户端连接上 20 个并发
+调用。测量日期 2026-10-29。jaws 侧数字取自其 `doc/benchmark.md`（2026-09-25 记录，同为 macOS
+aarch64 8 核），**未重跑**。
+
+## 先说方法学结论：不交错就是假的
+
+同一台机器持续负载下会漂。首回合吃到冷启动红利，之后落到稳定值：
+
+| 轮次 | native↔native | sweet↔sweet |
+| --- | --- | --- |
+| 1 | 102,146 | 89,021 |
+| 2 | 85,596 | 82,584 |
+| 3 | 87,290 | 87,632 |
+| 4 | 87,763 | 88,606 |
+
+单次 40s 各跑一遍会得出 `105,502 vs 105,793`，看着"完全持平"；不交错连跑三次则 native 一路
+105,496 → 101,066 → 99,715、sweet 一路 89,957 → 83,925 → 83,864，会误判成"sweet 慢 15%"。
+只有 A/B/A/B 交错之后差异才塌缩：**稳定态两臂都在 83k–89k 区间重叠，sweet 的每调用开销落在
+噪声里**——符合预期，`Register`/`Dial` 只作用于建连与订阅，不在每调用路径上。
+
+结论：**任何单次数字都不要引用**；要引用就引交错后的中位数，并写明时长。
+
+## 跨语言那一格
+
+Go 客户端 → jaws 的 wire benchmark provider（静默实现），交错两轮：
+
+| 轮次 | native client | sweet client |
+| --- | --- | --- |
+| 1 | 95,147 | 96,942 |
+| 2 | 97,866 | 97,478 |
+
+全部 0 错误。对照 jaws 表里同一服务端的 `grpc-java → wire = 104,967`：**同一 Java 服务端，
+Go 客户端与 Java 客户端在同一量级**，差值在跨天、跨机况的范围内，不构成结论。
+
+一个必须记的反例：把 provider 换成 `jaws-sample-wire-boot-provider`，同一客户端只跑到
+**约 39.3k–39.8k**。原因是它的 `sayHello` 每次调用都 `log.info` 一行（
+`GreeterServiceImpl.java:35`）。这不是协议差异，是被测服务端自己加了 IO——跨语言比吞吐时
+必须确认两端 handler 都是静默的。
+
+## 与 jaws 整表并排（栈 vs 栈）
+
+| 组合 | QPS | 来源 |
+| --- | --- | --- |
+| grpc-go ↔ grpc-go（sweet 路径） | 稳定态 83k–89k | 本文，2026-10-29，交错 |
+| grpc-go → jaws wire | 95k–98k | 本文，2026-10-29，交错 |
+| grpc-java → grpc-java | 70,334 | jaws `doc/benchmark.md`，2026-09-25 |
+| grpc-java → jaws wire | 104,967 | 同上 |
+| jaws wire → jaws wire | 89,945 / 92,423(direct) | 同上 |
+| jaws TCP → jaws TCP | 峰值 142,876 / 均值 140,692 | 同上 |
+
+读法：Go↔Go 与 Java↔Java 不在同一天、不共享校准，只能看量级不能作差；唯一在同一进程外可控的
+对比是"同一 Java 服务端、Go 客户端 vs Java 客户端"那一行。
