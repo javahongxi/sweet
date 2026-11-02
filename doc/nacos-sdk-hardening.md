@@ -1,0 +1,90 @@
+# nacos 包 SDK 化 · 第一步（加固）
+
+目标：让 `nacos/` 从"sweet 内部能用"变成"外人读了也敢用"。**不改定位**——仍是
+sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据先落此文件再动代码。
+
+## 前提纠正（两条，都影响做法）
+
+1. **鉴权必须每请求携带，不能只在建连时给。** 服务端对 `ServerCheckRequest` 是特判直接
+   return（`GrpcRequestAcceptor.java:106-115`），根本不进 handler、不进 filter 链；校验点在
+   每次派发的 filter 上（`RequestHandler.handleRequest:45-56` + `RemoteRequestAuthFilter:110`
+   读 `request.getHeaders()`）。且 token 有 TTL（默认 18000s），连接活得比它久，
+   403 的恢复路径（`ClientWorker.java:1397-1398` reLogin）也要求每次都能贴新值。
+   官方每个域都这么写：`ClientWorker.java:1377`、`NamingGrpcClientProxy.java:512`、
+   `LockGrpcClient.java:119`。
+   → 所以 `accessGetter` 挂在 **Conn**（transport 层），两个域一次拿到，不必等 naming 生命周期下沉。
+   "获取"只一次（缓存 + 到期/403 刷新），"携带"每请求。
+2. **failover 是连接级，不是请求级。** 官方重试环跑完仍失败就把异常抛给调用方
+   （`RpcClient.java:721-723`），只有状态从 RUNNING 翻到 UNHEALTHY 才
+   `switchServerAsyncOnRequestFail()`（:717-718）——换节点影响下一次连接。
+
+## 本步做
+
+| # | 事项 | 落点 |
+| --- | --- | --- |
+| A | `Metadata.headers` 线级支持 + `accessGetter`（缓存、到期、403 作废重取、每请求注入） | `envelope.go`、`conn.go` |
+| B | 响应基类统一为 `{resultCode,errorCode,message,requestId,success}`；命名域 `errorMsg`/`result` 是**死字段**（服务端不发，`Response.java` 只有那四个 getter + isSuccess），改成 `message` | `naming.go`、`config_types.go` |
+| C | 稳定错误面：`ErrNotFound` / `ErrDenied` / `ErrUnavailable` / `ErrRefused`，全部 `%w` 包装，`errors.Is` 契约写进注释 | 新 `errors.go` |
+| D | 日志注入：`Options.Logger *slog.Logger`，nil = 不记 | `conn.go`、`config.go` |
+| E | 推送缓冲满不再静默丢：`OnPushDropped func(Push)` + 计数（配置的 notify 被丢 = 表一直旧到下次变更，对配置域不成立"可恢复"） | `conn.go` |
+| F | 重连改指数退避 + 抖动（固定间隔在集群同时重启时会打配置中心） | `config.go` |
+| G | config 域 serverlist：多地址、失败标记、异步换节点重连；机制写成两域共用，naming 第二步再接 | 新 `serverlist.go`、`config.go` |
+| H | config 域构造形状：`New` 只在配置非法时失败；`WaitReady(ctx)` 表达"连上了"；去掉"返回可用客户端 + 非 nil error"这个陷阱 | `config.go` |
+
+## 本步不做
+
+1. 不拆独立 module、不发版、不写 CHANGELOG/semver（那是第二步之后的承诺）。
+2. **不收敛导出面**：`SetStreamLostHook`/`CloseStream`/`ProbeFatal`/`Epoch`/`Unary`/`Call`
+   仍公开。它们被 `registry/nacos` 的重连环直接用着——收敛就等于把 naming 的生命周期一起搬下来，
+   那是第二步的事，混进来会让两批 drill 测试同时暴露。
+3. 不做请求级 failover（在飞 unary 改投另一台）。理由见上，语义代价远大于收益。
+4. 不自动 `+1000` 端口。全仓约定是把 9848 写在明面上（`-server`、README、测试），
+   库内藏偏移会让抓包排查对不上号。
+5. 不引 `nacos-sdk-go`、不引任何新依赖（`slog` 是标准库；鉴权取 token 走 `accessGetter`
+   接口，HTTP 登录由调用方实现或本包内用 `net/http` 写默认实现——只用标准库）。
+6. 不做 fuzzy watch、灰度(beta)、`encryptedDataKey` 解密、`ConfigPublish`/`ConfigRemove` 写路径。
+7. naming 域的 serverlist 不在本步（机制先建好）。
+
+## 验收判据
+
+1. `gofmt -l` 无输出；`go build ./... && go vet ./... && go test -race -count=1 ./...` 全绿。
+2. **`registry/nacos` 的既有测试一行不改就通过**——这是"没碰 naming 生命周期"的证据。
+3. `TestRequestCarriesAuthHeaders`：桩服务端断言每个请求的 `Metadata.headers` 都带
+   `accessToken`，且 `ConfigQueryRequest` 的 body JSON 里**没有** headers 键
+   （`GrpcUtils.java:108-113` 的清空纪律）。
+4. `TestTokenRefreshedOn403`：桩第一次回 `errorCode=403`，断言 accessGetter 被再次调用、
+   第二次带新 token 重发、调用方最终拿到内容。
+5. `TestTokenCachedNotRefetched`：10 次请求只登录 1 次（getter 计数 == 1）。
+6. `TestNamingRefusalKeepsServerMessage`：桩回 `{success:false,message:"no right"}`，
+   断言错误串里出现 `no right`（修 B 之前这里是空的）。
+7. `TestPushDroppedIsReported`：灌爆缓冲，断言回调收到被丢的 Push 且计数对得上。
+8. `TestConfigServerListRotatesOnFailure`：两台桩，第一台握手即失败，断言客户端换到第二台
+   并进入 ready；`TestConfigServerListSkipsUnhealthy`：运行中 kill 第一台的流，重连落在第二台。
+9. `TestWaitReadyBlocksUntilHandshake`：`New` 不报错（服务端还没起），`WaitReady` 超时返回
+   `ErrUnavailable`；服务端起来后 `WaitReady` 立即返回 nil，且**没人重新 New/Watch**。
+10. 真机：本地 Nacos 开鉴权重跑一次网关路由热更新（发布→2s 生效），日志块取自同一次运行。
+
+判据 10 是唯一需要改本地 Nacos 配置的，做完把鉴权关回去。
+
+## 本轮状态（2026-11-02）
+
+已落并通过：A 鉴权（`nacos/auth.go` + `Conn` 每请求注入 + 403 作废重取一次）、
+C 错误面（`nacos/errors.go`，两域共用 `Response` 基类）、D 日志注入、E 丢弃可见化、
+F 指数退避 + 抖动。判据 1–7 全绿（`go test -race -count=1 ./...` 六包通过，
+`registry/nacos` 的既有测试一行未改）。
+
+其中判据 6 顺手证实了一处实况：命名域此前解的是 `errorMsg`，而
+`Response.java` 只有 `resultCode/errorCode/message/requestId` 四个 getter 加
+`isSuccess()`，所以**每条命名拒绝的理由都是空的**。
+
+未落，留作本步第二轮：G config 域 serverlist、H `New` 不再"可用但报错"
+（改成 `New` 只对非法配置失败 + `WaitReady(ctx)`）。这两条互相咬住（都动
+ConfigClient 的构造与状态），且判据 8、9、10 依赖它们，本轮不硬凑。
+
+## 一条环境事实，影响测试写法
+
+往文件里写凭据字面量时，`Password: "secret"` 会被替换成代理值 `***`，于是"断言里比
+较口令字符串"的测试必然失败（本轮第一版就死在这）。结论不是想办法把口令写进去，而是
+**测试应该断言请求形状**——两个 form 字段都送到了、token 被缓存了、403 后重新取了一次。
+这本来也是更该测的东西。
+

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
@@ -48,6 +50,7 @@ type ConfigClient struct {
 	onError   func(configKey, error)
 	lastErr   error
 	reconnect time.Duration
+	attempt   int
 }
 
 type watcher struct {
@@ -85,7 +88,21 @@ type ConfigOptions struct {
 	KeepAlive          time.Duration
 	CallTimeout        time.Duration
 
-	// ReconnectBackoff is the wait between re-handshake attempts.
+	// Access supplies credentials for every request. Nil means the server does not
+	// require auth. See AccessGetter for why this cannot be a one-time handshake
+	// detail.
+	Access AccessGetter
+
+	// Logger receives connection lifecycle events; nil means silent.
+	Logger *slog.Logger
+
+	// OnPushDropped is called when a server push is discarded because the consumer
+	// stalled. For a config watcher this is not a cosmetic event: a dropped notify
+	// leaves the cached value stale until something else changes.
+	OnPushDropped func(Push)
+
+	// ReconnectBackoff is the *first* wait between re-handshake attempts; retries
+	// then grow exponentially with jitter up to 30s.
 	ReconnectBackoff time.Duration
 }
 
@@ -109,6 +126,9 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 		return nil, err
 	}
 	conn.ProbeFatal = true
+	conn.Access = opts.Access
+	conn.Logger = opts.Logger
+	conn.OnPushDropped = opts.OnPushDropped
 	if opts.ServerCheckTimeout > 0 {
 		conn.ServerCheckTimeout = opts.ServerCheckTimeout
 	}
@@ -200,7 +220,7 @@ type Config struct {
 	LastModified int64
 }
 
-// Query pulls one config. A missing config yields ErrConfigNotFound, not an
+// Query pulls one config. A missing config yields an ErrNotFound-wrapped error, not an
 // empty Config: "absent" and "empty" are different facts and a caller that
 // conflates them will publish an empty table over a working one.
 func (c *ConfigClient) Query(ctx context.Context, key ConfigKey) (Config, error) {
@@ -245,7 +265,7 @@ func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)
 		return errors.New("nacos: Watch needs a callback")
 	}
 	seed, seedErr := c.Query(ctx, key)
-	notFound := errors.As(seedErr, &ErrConfigNotFound{})
+	notFound := errors.Is(seedErr, ErrNotFound)
 
 	c.mu.Lock()
 	w, existed := c.watchers[key]
@@ -283,6 +303,27 @@ func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)
 	}
 	fn(seed)
 	return nil
+}
+
+// nextBackoff grows exponentially from ReconnectBackoff, capped at 30s, with up
+// to a quarter of the delay as jitter. A fixed interval makes a fleet retry in
+// lockstep: after a config centre restarts, every client knocks at the same
+// instant, which is how the recovery becomes the next outage.
+func (c *ConfigClient) nextBackoff() time.Duration {
+	c.mu.Lock()
+	c.attempt++
+	n := c.attempt
+	c.mu.Unlock()
+
+	d := c.reconnect << min(n-1, 5) // reconnect · 2^(n-1), capped at 32×
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	if d <= 0 {
+		return c.reconnect
+	}
+	// jitter in [d, d+d/4)
+	return d + time.Duration(rand.Int64N(int64(d/4)+1))
 }
 
 func (c *ConfigClient) noteErr(err error) {
@@ -465,7 +506,7 @@ func (c *ConfigClient) supervise(onError func(configKey, error)) {
 			select {
 			case <-c.ctx.Done():
 				return
-			case <-time.After(c.reconnect):
+			case <-time.After(c.nextBackoff()):
 			}
 			c.conn.CloseStream() // resets the setup latch; Setup would otherwise
 			// return against the *previous* handshake
@@ -473,8 +514,10 @@ func (c *ConfigClient) supervise(onError func(configKey, error)) {
 			err := c.conn.Setup(ctx, c.tenant, c.labels)
 			cancel()
 			if err == nil {
+				c.attempt = 0
 				break
 			}
+			c.noteErr(err)
 		}
 		_ = c.listen(c.watchedKeys())
 	}

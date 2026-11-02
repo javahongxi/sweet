@@ -82,14 +82,8 @@ type SubscribeServiceRequest struct {
 
 func (SubscribeServiceRequest) typeName() string { return typeSubscribeServiceRequest }
 
-// Response is the shared shape of every naming response: the JSON of
-// api/.../remote/response/Response.java.
-type Response struct {
-	ErrorCode int    `json:"errorCode"`
-	ErrorMsg  string `json:"errorMsg,omitempty"`
-	Result    string `json:"result,omitempty"`
-	Success   bool   `json:"success"`
-}
+// Response — the shared base of every Nacos response — lives in errors.go,
+// because config and naming answer with the same four fields.
 
 // QueryServiceResponse wraps the instance list (response class name carries it).
 type QueryServiceResponse struct {
@@ -146,10 +140,7 @@ func (n *NamingClient) RegisterInstance(ctx context.Context, serviceName, action
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
 	}
-	if !resp.Success {
-		return fmt.Errorf("nacos: %s refused (%d): %s", req.Type, resp.ErrorCode, resp.ErrorMsg)
-	}
-	return nil
+	return resp.classify("register "+req.Type, serviceName)
 }
 
 // Subscribe turns pushes for one service on or off and returns the list the
@@ -168,8 +159,8 @@ func (n *NamingClient) Subscribe(ctx context.Context, serviceName string, subscr
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return ServiceInfo{}, err
 	}
-	if !resp.Success {
-		return ServiceInfo{}, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	if err := resp.classify("subscribe", serviceName); err != nil {
+		return ServiceInfo{}, err
 	}
 	return resp.ServiceInfo, nil
 }
@@ -190,8 +181,8 @@ func (n *NamingClient) Query(ctx context.Context, serviceName string) (ServiceIn
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return ServiceInfo{}, err
 	}
-	if !resp.Success {
-		return ServiceInfo{}, fmt.Errorf("nacos: query refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	if err := resp.classify("query", serviceName); err != nil {
+		return ServiceInfo{}, err
 	}
 	return resp.ServiceInfo, nil
 }

@@ -18,61 +18,19 @@ package nacos
 //     into errorCode, so success is resultCode==200 and "not found" is
 //     errorCode==300 (ConfigQueryResponse.java:31).
 
-import (
-	"fmt"
-)
-
 // Exported push class names, so a caller can dispatch on Push.Type.
 const (
 	TypeConfigChangeNotifyRequest = "ConfigChangeNotifyRequest"
 )
 
-// Response codes and config error codes
-// (api/.../remote/ResponseCode.java, ConfigQueryResponse.java:31-33).
-const (
-	resultSuccess = 200
-	resultFail    = 500
+// ConfigResponse is the shared Response base; kept as a name because the config
+// structs embed it by name and the wire docs refer to it.
+type ConfigResponse = Response
 
-	errConfigNotFound = 300
-	errNoRight        = 403
-)
-
-// ErrConfigNotFound reports that the dataId/group(/tenant) does not exist.
-// It is a normal answer, not a transport failure: the server says so with
-// errorCode 300 rather than an empty body.
-type ErrConfigNotFound struct {
-	DataID string
-	Group  string
-	Tenant string
-}
-
-func (e ErrConfigNotFound) Error() string {
-	return fmt.Sprintf("nacos: config %s/%s (tenant %q) not found", e.Group, e.DataID, e.Tenant)
-}
-
-// ConfigResponse mirrors api/.../remote/response/Response.java.
-type ConfigResponse struct {
-	ResultCode int    `json:"resultCode"`
-	ErrorCode  int    `json:"errorCode"`
-	Message    string `json:"message,omitempty"`
-	RequestID  string `json:"requestId,omitempty"`
-}
-
-// check turns a non-success response into an error, keeping the not-found case
-// distinguishable with errors.As.
+// check turns a non-success config response into one of the sentinels in
+// errors.go. subject is only for the message.
 func (r ConfigResponse) check(what string, key configKey) error {
-	switch {
-	case r.ResultCode == resultSuccess:
-		return nil
-	case r.ErrorCode == errConfigNotFound:
-		return ErrConfigNotFound{DataID: key.DataID, Group: key.Group, Tenant: key.Tenant}
-	case r.ErrorCode == errNoRight:
-		return fmt.Errorf("nacos: %s %s/%s denied (auth enabled but no credentials): %s",
-			what, key.Group, key.DataID, r.Message)
-	default:
-		return fmt.Errorf("nacos: %s %s/%s failed (resultCode=%d errorCode=%d): %s",
-			what, key.Group, key.DataID, r.ResultCode, r.ErrorCode, r.Message)
-	}
+	return r.classify(what, key.Group+"/"+key.DataID)
 }
 
 // ConfigQueryRequest pulls one config's content.

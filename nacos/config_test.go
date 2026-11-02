@@ -33,17 +33,38 @@ type configStub struct {
 	// real server does that when the client's md5 is not current.
 	staleOnListen bool
 
+	// denyFirst answers this many ConfigQueryRequests with errorCode 403, the way
+	// a server with auth enabled rejects a stale token.
+	denyFirst int
+	// instanceMessage is what an InstanceRequest refusal carries back.
+	instanceMessage string
+
+	headersSeen map[string]map[string]string
+
 	push chan ConfigChangeNotifyRequest
 	kill chan struct{}
 }
 
 func newConfigStub(content, md5 string) *configStub {
 	return &configStub{
-		content: content,
-		md5:     md5,
-		push:    make(chan ConfigChangeNotifyRequest, 4),
-		kill:    make(chan struct{}),
+		content:     content,
+		md5:         md5,
+		push:        make(chan ConfigChangeNotifyRequest, 4),
+		kill:        make(chan struct{}),
+		headersSeen: map[string]map[string]string{},
 	}
+}
+
+// headersFor reports the Metadata.headers the stub saw on the first request of a
+// given type — the credential rides there, not in the body (GrpcUtils.java:108-113).
+func (s *configStub) headersFor(t string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range s.headersSeen[t] {
+		out[k] = v
+	}
+	return out
 }
 
 func (s *configStub) setContent(content, md5 string) {
@@ -100,12 +121,31 @@ func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 		})
 	case "ConfigQueryRequest":
 		s.queries = append(s.queries, in)
+		s.noteHeaders(t, in)
+		if s.denyFirst > 0 {
+			s.denyFirst--
+			s.mu.Unlock()
+			return frame("ConfigQueryResponse", map[string]any{
+				"resultCode": 500, "success": false, "errorCode": 403,
+				"message": "token expired",
+			})
+		}
 		content, md5 := s.content, s.md5
 		s.mu.Unlock()
 		return frame("ConfigQueryResponse", map[string]any{
 			"resultCode": 200, "success": true, "content": content, "md5": md5,
 			"contentType": "application/json", "lastModified": 1730000000000,
 		})
+	case "InstanceRequest":
+		s.noteHeaders(t, in)
+		msg := s.instanceMessage
+		s.mu.Unlock()
+		if msg != "" {
+			return frame("InstanceResponse", map[string]any{
+				"resultCode": 500, "success": false, "errorCode": 403, "message": msg,
+			})
+		}
+		return frame("InstanceResponse", map[string]any{"resultCode": 200, "success": true})
 	case "ConfigBatchListenRequest":
 		s.listens = append(s.listens, in)
 		var req ConfigBatchListenRequest
@@ -127,6 +167,14 @@ func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 	}
 	s.mu.Unlock()
 	return frame(typeEmptyResponse, map[string]any{"success": true})
+}
+
+func (s *configStub) noteHeaders(t string, p *gen.Payload) {
+	if h := p.GetMetadata().GetHeaders(); len(h) > 0 {
+		if _, seen := s.headersSeen[t]; !seen {
+			s.headersSeen[t] = h
+		}
+	}
 }
 
 func (s *configStub) bidi(stream grpc.BidiStreamingServer[gen.Payload, gen.Payload]) error {

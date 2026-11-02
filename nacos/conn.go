@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -93,8 +94,29 @@ type Conn struct {
 	pushMu sync.Mutex
 	pushes chan Push
 
+	pushDropped atomic.Int64
+
 	closed   bool
 	closedMu sync.Mutex
+
+	// Access supplies the credential headers merged into Metadata.headers of
+	// every request. Nil means "this deployment needs no credentials".
+	//
+	// Per request rather than per handshake, because the server never looks at
+	// identity during the handshake at all (GrpcRequestAcceptor.java:106-115
+	// returns for ServerCheckRequest before any filter runs).
+	Access AccessGetter
+
+	// Logger receives connection lifecycle events. Nil means silent, which is the
+	// right default for a library: the host application decides.
+	Logger *slog.Logger
+
+	// OnPushDropped, when set, is called for each server push discarded because
+	// the consumer had stalled. Dropping is recoverable for naming (the next
+	// change re-pushes) and NOT recoverable for config (a lost notify leaves the
+	// cached value stale until something else changes), so a caller that watches
+	// configs must be able to see it happen.
+	OnPushDropped func(Push)
 
 	// ProbeFatal decides whether an unanswered probe tears the connection down.
 	// Verified against a live 3.2.3 server: the unary HealthCheckRequest is
@@ -455,9 +477,31 @@ func (c *Conn) offer(p Push) {
 	case c.pushes <- p:
 	default:
 		// A full buffer means the consumer stalled. Dropping one push is
-		// recoverable (the next change re-pushes); blocking would stall the
-		// read loop and therefore keepalive too.
+		// recoverable for naming (the next change re-pushes); blocking would
+		// stall the read loop and therefore keepalive too. Counted and reported
+		// because for config a dropped notify means a value that stays stale in
+		// silence.
+		c.pushDropped.Add(1)
+		if c.OnPushDropped != nil {
+			go c.OnPushDropped(p)
+		}
 	}
+}
+
+// PushDropped counts pushes discarded because the consumer had stalled. A number
+// that only ever grows is the signal that the consumer is too slow, not that the
+// server is chatty.
+func (c *Conn) PushDropped() int64 { return c.pushDropped.Load() }
+
+// log writes to Logger if one was set. Lifecycle events are debug-level on
+// purpose: a library that defaults to noise gets its logs switched off entirely,
+// and the interesting events then go missing with the rest.
+func (c *Conn) log(msg string, kv ...any) {
+	l := c.Logger
+	if l == nil {
+		return
+	}
+	l.Log(c.ctx, slog.LevelDebug, "nacos: "+msg, append([]any{"addr", c.addr}, kv...)...)
 }
 
 func (c *Conn) send(p *gen.Payload) error {
@@ -503,11 +547,65 @@ func (c *Conn) CallNoResponse(ctx context.Context, req envelope) error {
 // Unary performs one request and returns the raw reply. Naming calls dispatch on
 // the returned class name themselves because Nacos answers a subscribe with
 // SubscribeServiceResponse and a query with QueryServiceResponse.
+//
+// A denial (errorCode 403) invalidates the cached credential and re-sends once.
+// That mirrors ClientWorker.java:1397-1398 — the client re-logins rather than
+// surfacing a stale-token failure to the application — and it is the only way a
+// token that expired mid-connection recovers without a reconnect.
 func (c *Conn) Unary(ctx context.Context, req envelope) (string, []byte, error) {
+	var lastType string
+	var lastBody []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		p, err := c.marshalSigned(req)
+		if err != nil {
+			return "", nil, err
+		}
+		t, body, err := c.invoke(ctx, p, req)
+		if err == nil && !responseDenied(body) {
+			return t, body, nil
+		}
+		lastType, lastBody = t, body
+		if err != nil || c.Access == nil || attempt == 1 {
+			return t, body, err
+		}
+		c.Access.Invalidate()
+		c.log("request denied, refreshing credentials and retrying once", "type", req.typeName())
+	}
+	return lastType, lastBody, nil
+}
+
+// marshalSigned renders the request and attaches the credential headers.
+func (c *Conn) marshalSigned(req envelope) (*gen.Payload, error) {
 	p, err := marshalRequest(req, c.localIP())
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
+	if c.Access == nil {
+		return p, nil
+	}
+	headers, err := c.Access.Access(c.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nacos: credentials for %s: %w", req.typeName(), err)
+	}
+	if len(headers) == 0 {
+		return p, nil
+	}
+	// Headers ride in Metadata only: GrpcUtils.java:108-113 clears the request's
+	// header map before serialising the body, and the server puts them back
+	// (GrpcUtils.java:130), so a header inside the JSON body would be ignored.
+	if p.Metadata == nil {
+		p.Metadata = &gen.Metadata{}
+	}
+	if p.Metadata.Headers == nil {
+		p.Metadata.Headers = map[string]string{}
+	}
+	for k, v := range headers {
+		p.Metadata.Headers[k] = v
+	}
+	return p, nil
+}
+
+func (c *Conn) invoke(ctx context.Context, p *gen.Payload, req envelope) (string, []byte, error) {
 	var out gen.Payload
 	timeout := c.CallTimeout
 	if timeout <= 0 {
@@ -524,6 +622,19 @@ func (c *Conn) Unary(ctx context.Context, req envelope) (string, []byte, error) 
 		return t, nil, err
 	}
 	return t, append([]byte(nil), out.GetBody().GetValue()...), nil
+}
+
+// responseDenied peeks at a raw reply for errorCode 403 without knowing the
+// concrete response class.
+func responseDenied(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var peek Response
+	if err := json.Unmarshal(body, &peek); err != nil {
+		return false
+	}
+	return peek.denied()
 }
 
 // localIP is the address reported in Metadata.clientIp: the *peer* address of
