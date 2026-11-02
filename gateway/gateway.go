@@ -15,11 +15,13 @@
 //     in band when 200 is already committed — see serveStream. Client streaming
 //     and bidi need a duplex transport (WebSocket, or SSE plus a second POST)
 //     and are not half-implemented here.
-//   - No protoc plugin, no generated proxy. Every route is declared in Go
-//     together with the message types it uses, so each mapping rule is
-//     assertable from this package's own tests instead of living in generated
-//     code nobody reads. It is the same trade sweet makes in gen/: generate
-//     messages, keep the method table in Go.
+//   - No protoc plugin, no generated proxy. Message types are always Go: either
+//     a route carries its own constructors (Handle) or it names a service and
+//     method that Options.Services resolves (ApplyRoutes). A route table can
+//     therefore be data — published from a config centre — while every type
+//     behind it stays compiled and assertable from this package's own tests,
+//     instead of living in generated code nobody reads. It is the same trade
+//     sweet makes in gen/: generate messages, keep the method table in Go.
 //   - No new dependency. JSON to protobuf goes through protojson, and
 //     google.golang.org/protobuf is already required by the generated stubs.
 //   - Routing is a table lookup, not http.ServeMux. ServeMux answers an
@@ -106,6 +108,15 @@ func (r Route) validate() error {
 type Options struct {
 	// Registry resolves Route.Service. Required.
 	Registry registry.Registry
+
+	// Services maps a gRPC service name — the part of RouteSpec.FullMethod
+	// before the method, e.g. "sweet.example.v1.Greeter" — to the Go message
+	// types of its methods. Only ApplyRoutes consults it; routes declared with
+	// Handle carry their own constructors.
+	//
+	// This is what lets a route table live in a config centre: the mapping is
+	// data, the types stay compiled.
+	Services map[string]ServiceTypes
 
 	// DialOptions are applied to every connection the gateway opens.
 	//

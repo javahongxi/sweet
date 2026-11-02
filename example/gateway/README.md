@@ -28,13 +28,88 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 入参：`-listen`、`-registry`（`nacos` | `direct`）、`-server`（Nacos gRPC 口）、
 `-endpoints`（只在 `direct` 时用）、`-service`（注册中心里的查找名）、`-timeout`（调用方没给
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
-`-print-status-table`（打印 gRPC→HTTP 映射表后退出）。
+`-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
+`-routes.dataId`、`-routes.group`、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant）。
 
 `direct` 那一档是给你只想验线格式、不掺进发现时用的：
 
 ```
 go run ./example/gateway -registry=direct -endpoints 127.0.0.1:20001
 ```
+
+## 路由表来自配置中心（`-routes=nacos`）
+
+默认 `embedded`：两条路由写在 Go 里，开箱可跑。加上 `-routes=nacos` 之后，路由表变成一个
+Nacos 配置项——**映射是数据，消息类型仍然是编译期的 Go**（`gateway.Options.Services` 那张表）。
+格式与契约的来由见 `doc/nacos-config-routes.md`。
+
+发布表（Nacos 3.x 的管理口是 v3，参数名是 `groupName`，不是 v1 那套 `group`）：
+
+```
+curl -s -X POST 'http://127.0.0.1:8848/nacos/v3/admin/cs/config' \
+  --data-urlencode dataId=sweet-gateway-routes.json \
+  --data-urlencode groupName=DEFAULT_GROUP \
+  --data-urlencode 'content={"routes":[{"method":"POST","path":"/v1/greeter/greet",
+    "service":"sweet.example.v1.Greeter","fullMethod":"/sweet.example.v1.Greeter/Greet"}]}'
+
+go run ./example/gateway -routes=nacos -listen 127.0.0.1:20112
+```
+
+实测（2026-11-02，本地 Nacos 3.2.3，同一次运行、同一端口 20112，全程没重启网关）。
+先只发一条一元路由：
+
+```
+2026-11-02 20:46:41 config: connected to 127.0.0.1:9848 as 1793623601388_127.0.0.1_58453 (its own SDK connection; the nacos registry keeps a separate one)
+2026-11-02 20:46:41 routes: applied 1 route(s) from DEFAULT_GROUP/sweet-gateway-routes.json (md5 fe8fdd267ca343d4b34eeced92392192)
+2026-11-02 20:46:41   POST /v1/greeter/greet -> /sweet.example.v1.Greeter/Greet via sweet.example.v1.Greeter
+```
+
+```
+$ curl -s localhost:20112/v1/greeter/greet -d '{"name":"web"}'
+{"message":"Hello, web!"}
+```
+
+那个 md5 与 `curl` 读回配置时服务端报的 md5 逐字相同，说明客户端解出的是服务端的值而不是自己算的。
+
+再发第二条（加服务端流路由），两秒后日志与响应：
+
+```
+2026-11-02 20:46:56 routes: applied 2 route(s) from DEFAULT_GROUP/sweet-gateway-routes.json (md5 de769ee53183bb45ee641a98b91a1645)
+2026-11-02 20:46:56   POST /v1/greeter/greet -> /sweet.example.v1.Greeter/Greet via sweet.example.v1.Greeter
+2026-11-02 20:46:56   POST /v1/greeter/greet-stream -> /sweet.example.v1.Greeter/GreetStream via sweet.example.v1.Greeter
+
+$ curl -sN localhost:20112/v1/greeter/greet-stream -d '{"name":"web","times":3}'
+{"message":"Hello #1, web!"}
+{"message":"Hello #2, web!"}
+{"message":"Hello #3, web!"}
+```
+
+第三发是这一节真正要验的那件事——**坏表不能把线上表带走**。故意发一条指向未注册方法的路由：
+
+```
+2026-11-02 20:46:58 routes: apply failed: gateway: route POST /v1/greeter/greet: method "Nope" of service "sweet.example.v1.Greeter" is not registered (known: Greet, GreetStream) — live table untouched
+```
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:20112/v1/greeter/greet -d '{"name":"after-bad"}'
+200
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:20112/v1/greeter/greet-stream -d '{"name":"x","times":1}'
+200
+```
+
+错误消息里带着 `known: Greet, GreetStream`，因为运维在改一张四十条的表时需要的不是"错了"，
+而是"这个名字该写成什么"。两条旧路由在坏表之后仍然 200，就是 `ApplyRoutes` 全有或全无的兑现。
+
+三个刻意的形状：
+
+- **配置域自己一条连接**。Nacos 按 `module` 标签认连接，命名模块对非 `naming` 的连接直接忽略
+  （`ConnectionBasedClientManager.java:60-64`），所以 config 不能搭注册中心那条车的便车；
+  日志第一行把这件事写在脸上。域内倒是复用：query 与 listen 走同一条 SDK 连接。
+- **只注册网关真能服务的两个方法**。客户端流与双向流没进这张表，所以配置里写 `GreetAll` 会在
+  apply 阶段被拒，而不是被当成一元调用半路走歪。
+- **空表被拒**。删掉配置和"不路由任何请求"是两种意图，让边缘因为一个 dataId 被删而全 404 是更贵
+  的那种错。要真清空，Go 侧改默认值，别指望配置。
+
 
 ## 实测：一元（2026-10-30 那一跑，`-timeout 1s`）
 
@@ -241,6 +316,11 @@ http: superfluous response.WriteHeader call from github.com/javahongxi/sweet/gat
 | 未知字段默认响亮地失败，开关生效后放行 | `TestUnknownJSONField` |
 | 空 body = 全默认请求 | `TestEmptyBodyMeansDefaults` |
 | 路由表在注册时就拒绝畸形条目、重复条目 | `TestRouteValidation` |
+| 配置里的表能解析成路由、类型按服务名绑定 | `TestApplyRoutesResolvesTypesAndServes` |
+| 一条坏路由让整张表被拒，线上表一字不动 | `TestApplyRoutesRejectsBadTableAndKeepsTheLiveOne` |
+| 真实服务器上换表立即生效：旧路径 404、新路径 200 | `TestApplyRoutesSwapsLiveOnRealServer` |
+| 表里 `"post"` 也能匹配真实请求；重复条目被拒 | `TestApplyRoutesNormalizesMethodCase`、`TestApplyRoutesRejectsDuplicateWithinOneTable` |
+| 配置里拼错的键不会被静默丢掉，空表不会被装上 | `TestParseRouteSpecsRejectsUnknownKey`、`TestParseRouteSpecsRefusesEmptyTable` |
 | 404 / 405 的形状与 `Allow` 头 | `TestRoutingErrors` |
 | 调用方的 deadline 优先于网关的兜底 | `TestDeadlinePropagation` |
 | 没有可用实例 → 503 | `TestNoInstancesIs503` |

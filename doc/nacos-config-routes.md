@@ -1,0 +1,141 @@
+# 网关路由外置：Nacos 配置域客户端（手写）
+
+范围说明与验收判据。做完即冻结，不加东西。
+
+## 目标
+
+sweet 的 HTTP→gRPC 网关今天每条路由都在 Go 里声明（`gateway/gateway.go` 的 `Route`
+带 `NewRequest`/`NewReply` 两个闭包）。本改动把**策略**（HTTP 方法/路径 → 注册中心查找名
+→ gRPC 方法、是否服务端流）外置到 Nacos 配置，**类型**仍留在 Go：按 gRPC 服务名注册一张
+消息工厂表。效果是「给已接入的服务加一条 HTTP 映射」变成改配置、不重编网关。
+
+reflection / descriptor 那条路（连类型也不用编译）**不在本轮**，见「不做」。
+
+## 契约锚点（nacos @3.2.3，本地 checkout，`git describe` = 3.2.3）
+
+- 线格式：`Payload{metadata, body=Any}`，`Metadata.type` = Java 类**简单名**，body = 该对象
+  的 JSON 且**不含 headers**（`GrpcUtils.java:53-113`）。sweet 已实现（`nacos/envelope.go`）。
+- config 域请求/响应：`ConfigQueryRequest{dataId,group,tenant,tag}` /
+  `ConfigQueryResponse{content,md5,contentType,encryptedDataKey,lastModified,tag,beta}` /
+  `ConfigBatchListenRequest{listen,configListenContexts[{dataId,group,tenant,md5}]}` /
+  `ConfigChangeBatchListenResponse{changedConfigs[{dataId,group,tenant}]}` /
+  `ConfigChangeNotifyRequest{dataId,group,tenant}` → ACK `ConfigChangeNotifyResponse`。
+  基类 `Response{resultCode=200,errorCode,message,requestId}`。
+- **监听立即返回，没有 30s 挂起**：`ConfigChangeBatchListenRequestHandler.java:60-96`
+  同步返回「哪些 md5 已过期」，gRPC 模式用推送替代长轮询。
+- **推送只带 key，正文永远由客户端拉**（`jaws/doc/nacos-config.md:79`）：收到
+  `ConfigChangeNotifyRequest` → 回 ACK → 发 `ConfigQueryRequest` → 更新本地 md5 →
+  用新 md5 重发 batch listen（服务端按 connectionId 记 md5，见 :80 `addListen`）。
+- **ACK 必须回填 requestId**：`GrpcClient.java:282-285` + `RpcAckCallbackSynchronizer`，
+  否则服务端按 `tryTimes*2` 秒重推、超限 unregister 本连接。
+- **naming 与 config 是两条连接，不共用**：`NamingGrpcClientProxy.java:116` 打
+  `module=naming`、`ClientWorker.java:752-755` 打 `module=config`、
+  `RpcClientFactory.java:126` 按 clientName 各建一个 `GrpcSdkClient`，且服务端
+  `ConnectionBasedClientManager.java:60-64` 对 `module != naming` 的连接**直接 return**。
+  「与 listen 复用同一条 SDK 面连接」（`jaws/doc/nacos-config.md:31`）说的是 config **域内**。
+- 鉴权：config 的 handler 带 `@Secured(signType=CONFIG)`，凭据走 `Metadata.headers`
+  的 `accessToken`（或 `username`/`password`），**每请求校验**；未开鉴权时跳过
+  （`RemoteRequestAuthFilter.java:84-86`）。
+
+## 不做
+
+1. 不引 `nacos-sdk-go`；不引 YAML/TOML——配置格式用 JSON + `encoding/json`。
+2. 不做 reflection / descriptor 动态消息（那是第二步，且优先 descriptor 文件）。
+3. 不实现写回：`ConfigPublishRequest` / `ConfigRemoveRequest` 不做，只读。
+4. 不做 fuzzy watch、灰度(beta) 配置、`encryptedDataKey` 解密、多 dataId 聚合。
+5. 不改路由匹配语义：仍是精确路径 + 单方法，通配/前缀匹配不做。
+6. 不动 naming 侧任何行为；不给 config 与 naming 共用连接（官方即两条）。
+7. 新增文档不挂门面 README。
+
+## 配置格式
+
+dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间走 `-namespace`：
+
+```json
+{"routes":[{"method":"POST","path":"/v1/greeter/greet","service":"greeter-provider",
+  "fullMethod":"/sweet.example.v1.Greeter/Greet","serverStream":false}]}
+```
+
+`service` 是注册中心查找名（与 gRPC 服务名可以不同，jaws 服务就是 `jaws/<FQN>`）；
+消息类型由 `gateway.RegisterService("sweet.example.v1.Greeter", …)` 的表按
+`fullMethod` 解析出来。
+
+## 关键语义决定
+
+- **坏表整批拒**：任一条路由解析不出类型或校验失败 → `ApplyRoutes` 返回 error，
+  线上表**一字不动**（不出现半套路由）。
+- 拉取失败/解析失败 → 保留上一次好表，错误返回给调用方记日志。
+- 热更新只换「匹配表」，已建立的 gRPC 连接按查找名继续复用，不因换表而断开。
+- 断连重连后必须用**当前 md5** 重放 batch listen（服务端订阅表按 connectionId 存，
+  旧 connectionId 的订阅随断连失效）。
+
+## 验收判据（可当场跑）
+
+1. `go build ./... && go vet ./... && go test ./...` 全部 rc=0。
+2. `TestConfigQueryRoundTrip`：桩服务端收到 `ConfigQueryRequest`，断言 type 串与
+   body 字段名逐字对齐（`dataId`/`group`/`tenant`），响应 md5/content 被解出。
+3. `TestConfigWatchPullsAfterNotify`：桩推 `ConfigChangeNotifyRequest{requestId:"7"}` →
+   断言同一条 bidi 上出现 `ConfigChangeNotifyResponse` 且 `requestId=="7"`；随后出现
+   `ConfigQueryRequest`；回调拿到新 content；**且**用新 md5 重发了一次 listen。
+4. `TestConfigReplayAfterReconnect`：桩在握手后丢流 → 重连成功 → 断言桩收到第二次
+   listen，其 `md5` 等于重连前拉到的值（不是初始空串）。
+5. `TestApplyRoutesRejectsBadTable`：表里塞一条未知 `fullMethod` → 返回 error，且
+   `Routes()` 与改前逐字相同。
+6. `TestApplyRoutesSwapsLive`：挂在真 HTTP server 上（非 ResponseRecorder），换表后
+   旧 path 404、新 path 200。
+7. 真机：本地 Nacos 3.2.x 起 example/gateway `-routes=nacos`，**不重启网关**改配置，
+   新 path 立刻可调用；输出块取自同一次运行、同一端口。
+
+## 验收结果（2026-11-02，全部达成）
+
+1–6 在 `go test -race ./nacos/ ./gateway/` 下全绿；模块全量 `go build ./... && go vet ./... &&
+go test ./...` 亦全绿。测试名与判据一一对应：`TestConfigQueryRoundTrip`、
+`TestConfigWatchPullsAfterNotify`、`TestConfigReplayAfterReconnect`、
+`TestListenResponseStaleSubsetIsPulled`、`TestConfigClientIsLabelledAsConfig`、
+`TestAckClassIsARegisteredPayload`、以及 `gateway` 侧五条 `TestApplyRoutes*` /
+`TestParseRouteSpecs*`。
+
+7 真机（本地 Nacos 3.2.3，`127.0.0.1:9848`，一次运行、端口 20112、全程未重启）：
+
+| 动作 | 观测 |
+| --- | --- |
+| 发布 1 条路由 | `applied 1 route(s) … (md5 fe8fdd267ca343d4b34eeced92392192)`，与 v3 管理口读回的 md5 逐字相同 |
+| `curl /v1/greeter/greet` | `{"message":"Hello, web!"}` |
+| 发布 2 条（加流式） | 2s 后 `applied 2 route(s)`，`curl -N` 逐帧三行 |
+| 发布坏表（方法未注册） | `apply failed: … not registered (known: Greet, GreetStream) — live table untouched`，两条旧路由仍 200 |
+
+补跑（同日 21:02，端口 20113，仍未重启）验的是**删除**方向，前一次只验了新增：
+
+| 动作 | 观测 |
+| --- | --- |
+| 启动时配置不存在 | `no route table yet … the edge answers 404 until one is published`，进程照常起来 |
+| 发布表 A（只有 greet） | 2s 后 `applied 1 route(s) (md5 fe8fdd…)`；greet 200、greet-stream 404 |
+| 换成表 C（只有 greet-stream） | 再 2s，`applied 1 route(s) (md5 165d7d…)`；**greet 404、greet-stream 200** |
+
+这一跑顺带钉住另一件事：配置从"不存在"到"首次发布"也能被收到——Watch 在 not-found 时以空 md5
+登记订阅，发布触发 notify → 回拉 → 装上，不需要重启或重试。
+
+补记一条实现约束：Nacos 3.x 的 v1 HTTP 口已移除（`No endpoint POST /nacos/v1/cs/configs`），
+发布走 `/nacos/v3/admin/cs/config`，参数名是 `groupName` 而非 `group`。
+
+## 顺手修掉的一个真 bug：Ack 的类名
+
+`nacos/conn.go` 的 `Ack` 原本用 `p.Type + "Response"` 拼应答类名，对
+`NotifySubscriberRequest` 拼出 `NotifySubscriberRequestResponse` —— 官方类是
+`NotifySubscriberResponse`。服务端 `GrpcUtils.parse`（:132-133）对未注册类型是 **throw**，
+所以这个 ACK 从来没进 `RpcAckCallbackSynchronizer`，等价于没 ACK。
+
+不是推断，服务端日志有账：`ai-infra/nacos/standalone/nacos-3.2.3/logs/remote-digest.log*` 里
+`Unknown payload type:NotifySubscriberRequestResponse` 共 **5743** 条（10-26 起累积，当天 5682 条）；
+本轮改用显式映射后，20:46 之后新条目 **0** 条，且 `Unknown payload type:Config*` 始终 **0** 条。
+
+为什么之前没被发现：现有 naming 测试只断言"投递发生了"，没断言"服务端收到了什么"——
+观测通道上根本没有读数，绿灯就照常交了。所以本轮把类名单独钉成一张表
+（`TestAckClassIsARegisteredPayload`），并把 `ConnectResetRequest → EmptyResponse` 这种
+字符串规则推不出来的情形写进注释。
+
+## 冻结
+
+以上七条达成即冻结：不加 fuzzy watch、不加写回、不加 descriptor/reflection、不把 config 与
+naming 合并成一条连接。第二步（类型也不用编译）另开，且优先 descriptor 文件。
+

@@ -389,8 +389,16 @@ func (c *Conn) nextRequestID() string {
 }
 
 // Ack answers a pushed request, which is what stops the server's re-push loop.
-// The reply class is the request class with "Response" appended
-// (NotifySubscriberRequest → NotifySubscriberResponse, §8.4).
+//
+// The reply class is NOT "request class + Response": the server parses the frame
+// through PayloadRegistry and *throws* on an unregistered type
+// (GrpcUtils.java:132-133 "Unknown payload type"), so a guessed class name is
+// the same as not answering at all — NotifySubscriberRequest is answered by
+// NotifySubscriberResponse, and ConnectResetRequest by EmptyResponse, which no
+// string rule can derive. Unknown types therefore get EmptyResponse, a
+// registered Response: the server's ack correlation only reads requestId and
+// resultCode (GrpcBiStreamRequestAcceptor.java:217-225,
+// RpcAckCallbackSynchronizer.ackNotify), so an empty one still closes the push.
 func (c *Conn) Ack(p Push) error {
 	if p.RequestID == "" {
 		return nil // nothing measured to echo back
@@ -400,7 +408,7 @@ func (c *Conn) Ack(p Push) error {
 		return err
 	}
 	frame := &gen.Payload{
-		Metadata: &gen.Metadata{Type: p.Type + "Response"},
+		Metadata: &gen.Metadata{Type: ackClassFor(p.Type)},
 		Body:     &anypb.Any{Value: body},
 	}
 	if err := c.send(frame); err != nil {
@@ -408,6 +416,24 @@ func (c *Conn) Ack(p Push) error {
 	}
 	c.touch()
 	return nil
+}
+
+// ackClassFor maps a pushed ServerRequest class to the Response class Nacos
+// registers for it (api/src/main/resources/META-INF/services/
+// com.alibaba.nacos.api.remote.Payload).
+func ackClassFor(pushType string) string {
+	switch pushType {
+	case typeNotifySubscriberRequest:
+		return "NotifySubscriberResponse"
+	case TypeConfigChangeNotifyRequest:
+		return "ConfigChangeNotifyResponse"
+	case "ClientDetectionRequest":
+		return "ClientDetectionResponse"
+	case typeHealthCheckRequest:
+		return "HealthCheckResponse"
+	default:
+		return typeEmptyResponse
+	}
 }
 
 type ackBody struct {
