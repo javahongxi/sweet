@@ -34,8 +34,8 @@ import (
 //     reconnect racing the caller cannot resurrect an instance that was asked to
 //     go away (注销优先).
 type NamingClient struct {
-	servers *serverList
-	opts    NamingOptions
+	serversList *serverList
+	opts        NamingOptions
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -136,7 +136,7 @@ func NewNamingClient(opts NamingOptions) (*NamingClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &NamingClient{
-		servers:       newServerList(addrs, 0),
+		serversList:   newServerList(addrs, 0),
 		opts:          opts,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -468,7 +468,7 @@ func (n *NamingClient) budget() time.Duration {
 }
 
 func (n *NamingClient) addrs() string {
-	all, bad := n.servers.Addrs()
+	all, bad := n.serversList.Addrs()
 	if len(bad) == 0 {
 		return fmt.Sprint(all)
 	}
@@ -478,7 +478,7 @@ func (n *NamingClient) addrs() string {
 // reconnectOnce tries once: the same address while it is still considered
 // healthy, otherwise the next one from the list.
 func (n *NamingClient) reconnectOnce(ctx context.Context) error {
-	addr := n.servers.Pick()
+	addr := n.serversList.Pick()
 	if addr == "" {
 		return errors.New("nacos: no server address to try")
 	}
@@ -495,13 +495,13 @@ func (n *NamingClient) reconnectOnce(ctx context.Context) error {
 			n.publish(conn, addr)
 			return nil
 		}
-		n.servers.MarkFailed(addr)
+		n.serversList.MarkFailed(addr)
 		_ = conn.Close()
 	}
 
 	next, err := n.dialFor(ctx, addr)
 	if err != nil {
-		n.servers.MarkFailed(addr)
+		n.serversList.MarkFailed(addr)
 		return err
 	}
 	n.publish(next, addr)
@@ -535,7 +535,7 @@ func (n *NamingClient) dialFor(ctx context.Context, addr string) (*sdkConn, erro
 	if opts.CallTimeout > 0 {
 		conn.CallTimeout = opts.CallTimeout
 	}
-	conn.SetStreamLostHook(func(error) { n.signalLost() })
+	conn.SetStreamLostHook(func(error) { n.streamLost(conn) })
 
 	hctx, cancel := context.WithTimeout(ctx, n.budget())
 	defer cancel()
@@ -562,7 +562,7 @@ func (n *NamingClient) publish(conn *sdkConn, addr string) {
 	n.broadcastLocked()
 	n.mu.Unlock()
 
-	n.servers.MarkHealthy(addr)
+	n.serversList.MarkHealthy(addr)
 	if old != nil && old != conn {
 		_ = old.Close()
 	}
@@ -625,7 +625,7 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 	defer func() {
 		if v := recover(); v != nil {
 			n.log("push consumer panicked, dropping the connection", "err", fmt.Sprint(v))
-			n.signalLost()
+			n.streamLost(conn)
 		}
 	}()
 	for push := range conn.Pushes() {
@@ -635,8 +635,16 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 		if !current {
 			return
 		}
+		if push.Type == TypeConnectResetRequest {
+			// Acked inside, on this stream, before the switch.
+			handleConnectReset(n, push)
+			continue
+		}
 		if push.Type != TypeNotifySubscriberRequest {
-			_ = conn.Ack(push) // ClientDetectionRequest & friends still need the echo
+			// ClientDetectionRequest and friends: acked only when we know the
+			// response class. An unknown type is left un-acked, matching the
+			// official "no handler → no response" (GrpcClient.java:286-290).
+			_ = conn.Ack(push)
 			continue
 		}
 		note, err := DecodeNotify(push)
@@ -645,7 +653,7 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 			continue
 		}
 		if err := conn.Ack(push); err != nil {
-			n.signalLost()
+			n.streamLost(conn)
 			continue
 		}
 		info := note.ServiceInfo
@@ -660,24 +668,67 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 	}
 }
 
-// signalLost retires the connection and wakes the supervisor. The address is not
-// marked failed here — a stream the server ended is retried in place first.
-func (n *NamingClient) signalLost() {
+// streamLost retires `dead` and wakes the supervisor — but only when `dead` is
+// still the current connection. A planned switch closes a connection it has
+// already replaced, and honouring that callback would reconnect twice for one
+// event; this is the job GrpcClient's abandon flag does (GrpcClient.java:310-322
+// only switches when the connection is not abandoned).
+//
+// The address is not marked failed here — a stream the server ended is retried in
+// place first.
+func (n *NamingClient) streamLost(dead *sdkConn) {
 	n.mu.Lock()
-	conn := n.conn
+	if n.conn != dead {
+		n.mu.Unlock()
+		return
+	}
 	n.conn, n.addr = nil, ""
 	n.generation++
 	n.broadcastLocked()
 	n.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.Close()
+	if dead != nil {
+		_ = dead.Close()
 	}
 	select {
 	case n.lost <- struct{}{}:
 	default:
 	}
 }
+
+// --- resetTarget: the hooks handleConnectReset needs ---
+
+func (n *NamingClient) currentConn() (*sdkConn, string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.conn, n.addr
+}
+
+// switchTo moves to a specific address now, which is what ConnectResetRequest
+// asks for. The new connection is published before the old one is closed (publish
+// retires it), so there is never a window with no live connection — the same order
+// RpcClient.java:522-544 keeps.
+func (n *NamingClient) switchTo(ctx context.Context, addr string) error {
+	conn, err := n.dialFor(ctx, addr)
+	if err != nil {
+		return err
+	}
+	n.publish(conn, addr)
+	// Replaying here is not optional. Ephemeral instances live and die with the
+	// connection (harbor-vs-nacos.md §8.5), so arriving on the new node without
+	// re-registering means the service is simply gone for every consumer — and
+	// unlike the supervisor path, nothing else will retry it, because the
+	// connection is healthy.
+	if err := n.replay(); err != nil {
+		n.log("replay after ConnectReset failed; supervisor will retry", "err", err)
+		n.streamLost(conn)
+	}
+	return nil
+}
+
+func (n *NamingClient) backgroundCtx() context.Context { return n.ctx }
+
+func (n *NamingClient) servers() *serverList { return n.serversList }
 
 func (n *NamingClient) supervise() {
 	defer func() {

@@ -418,21 +418,33 @@ func (c *sdkConn) nextRequestID() string {
 // through PayloadRegistry and *throws* on an unregistered type
 // (GrpcUtils.java:132-133 "Unknown payload type"), so a guessed class name is
 // the same as not answering at all — NotifySubscriberRequest is answered by
-// NotifySubscriberResponse, and ConnectResetRequest by EmptyResponse, which no
-// string rule can derive. Unknown types therefore get EmptyResponse, a
-// registered Response: the server's ack correlation only reads requestId and
-// resultCode (GrpcBiStreamRequestAcceptor.java:217-225,
-// RpcAckCallbackSynchronizer.ackNotify), so an empty one still closes the push.
+// NotifySubscriberResponse and ConnectResetRequest by ConnectResetResponse, and
+// no string rule derives either.
+//
+// An unrecognised push is answered with *nothing*, which is what the official
+// client does: every handler returns null, handleServerRequest returns null, and
+// GrpcClient only logs (RpcClient.java:851-878, GrpcClient.java:282-290). There
+// is no EmptyResponse class in Nacos 3.2.3 at all (no such file, not in the
+// Payload SPI list), so inventing one would fail exactly like the bug this
+// mapping replaced.
 func (c *sdkConn) Ack(p Push) error {
 	if p.RequestID == "" {
 		return nil // nothing measured to echo back
+	}
+	class := ackClassFor(p.Type)
+	if class == "" {
+		// Official behaviour for a push this client does not know: log and stay
+		// silent. Sending anything here would be a payload type the server
+		// cannot resolve.
+		c.log("unrecognised server push left un-acked", "type", p.Type)
+		return nil
 	}
 	body, err := json.Marshal(ackBody{Headers: map[string]string{}, RequestID: p.RequestID})
 	if err != nil {
 		return err
 	}
 	frame := &gen.Payload{
-		Metadata: &gen.Metadata{Type: ackClassFor(p.Type)},
+		Metadata: &gen.Metadata{Type: class},
 		Body:     &anypb.Any{Value: body},
 	}
 	if err := c.send(frame); err != nil {
@@ -455,8 +467,10 @@ func ackClassFor(pushType string) string {
 		return "ClientDetectionResponse"
 	case typeHealthCheckRequest:
 		return "HealthCheckResponse"
+	case TypeConnectResetRequest:
+		return typeConnectResetResponse
 	default:
-		return typeEmptyResponse
+		return "" // unknown push: do not answer at all
 	}
 }
 

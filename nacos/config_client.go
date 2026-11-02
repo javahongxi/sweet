@@ -33,14 +33,15 @@ import (
 // md5 per (groupKey, connectionId) when listening
 // (ConfigChangeBatchListenRequestHandler.java:80).
 type ConfigClient struct {
-	servers *serverList
-	opts    ConfigOptions
+	serversList *serverList
+	opts        ConfigOptions
 
 	conn *sdkConn // current connection; nil while a reconnect is in flight
 	addr string
 	// generation counts connection swaps; a push consumer stops when the number it
 	// was started with no longer matches.
 	generation int64
+	handshakes int64
 	tenant     string
 	labels     map[string]string
 
@@ -157,17 +158,17 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ConfigClient{
-		servers:   newServerList(addrs, 0),
-		opts:      opts,
-		tenant:    opts.Tenant,
-		labels:    labels,
-		ctx:       ctx,
-		cancel:    cancel,
-		lost:      make(chan struct{}, 1),
-		watchers:  map[configKey]*watcher{},
-		onError:   opts.OnError,
-		reconnect: opts.ReconnectBackoff,
-		signal:    make(chan struct{}),
+		serversList: newServerList(addrs, 0),
+		opts:        opts,
+		tenant:      opts.Tenant,
+		labels:      labels,
+		ctx:         ctx,
+		cancel:      cancel,
+		lost:        make(chan struct{}, 1),
+		watchers:    map[configKey]*watcher{},
+		onError:     opts.OnError,
+		reconnect:   opts.ReconnectBackoff,
+		signal:      make(chan struct{}),
 	}
 	if c.reconnect <= 0 {
 		c.reconnect = time.Second
@@ -220,7 +221,7 @@ func (c *ConfigClient) dialFor(ctx context.Context, addr string) (*sdkConn, erro
 		conn.CallTimeout = opts.CallTimeout
 	}
 	// Installed before Setup so even the first stream loss is caught.
-	conn.SetStreamLostHook(func(error) { c.signalLost() })
+	conn.SetStreamLostHook(func(error) { c.streamLost(conn) })
 
 	hctx, cancel := context.WithTimeout(ctx, c.budget())
 	defer cancel()
@@ -234,7 +235,7 @@ func (c *ConfigClient) dialFor(ctx context.Context, addr string) (*sdkConn, erro
 // reconnectOnce tries once: the same address while it is still considered healthy,
 // otherwise the next one from the list.
 func (c *ConfigClient) reconnectOnce(ctx context.Context) error {
-	addr := c.servers.Pick()
+	addr := c.serversList.Pick()
 	if addr == "" {
 		return errors.New("nacos: no server address to try")
 	}
@@ -253,13 +254,13 @@ func (c *ConfigClient) reconnectOnce(ctx context.Context) error {
 			c.publish(conn, addr)
 			return nil
 		}
-		c.servers.MarkFailed(addr)
+		c.serversList.MarkFailed(addr)
 		_ = conn.Close()
 	}
 
 	next, err := c.dialFor(ctx, addr)
 	if err != nil {
-		c.servers.MarkFailed(addr)
+		c.serversList.MarkFailed(addr)
 		return err
 	}
 	c.publish(next, addr)
@@ -274,13 +275,14 @@ func (c *ConfigClient) publish(conn *sdkConn, addr string) {
 	old := c.conn
 	c.conn, c.addr = conn, addr
 	c.generation++
+	c.handshakes++
 	gen := c.generation
 	c.lastErr = nil
 	c.attempt = 0
 	c.broadcastLocked()
 	c.mu.Unlock()
 
-	c.servers.MarkHealthy(addr)
+	c.serversList.MarkHealthy(addr)
 	if old != nil && old != conn {
 		_ = old.Close()
 	}
@@ -322,6 +324,15 @@ func (c *ConfigClient) PushDropped() int64 {
 	return conn.PushDropped()
 }
 
+// Handshakes counts completed handshakes. A test that expects a replay must first
+// prove a new handshake happened, otherwise "nothing was replayed" and "nothing
+// was needed" look identical.
+func (c *ConfigClient) Handshakes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handshakes
+}
+
 // CurrentAddr is the SDK address in use, "" while a reconnect is in flight.
 func (c *ConfigClient) CurrentAddr() string {
 	c.mu.Lock()
@@ -331,7 +342,7 @@ func (c *ConfigClient) CurrentAddr() string {
 
 // addrs renders the list and who is on cooldown, for error text and logs.
 func (c *ConfigClient) addrs() string {
-	all, bad := c.servers.Addrs()
+	all, bad := c.serversList.Addrs()
 	if len(bad) == 0 {
 		return fmt.Sprint(all)
 	}
@@ -355,25 +366,63 @@ func (c *ConfigClient) broadcastLocked() {
 	c.signal = make(chan struct{})
 }
 
-// signalLost retires the current connection and nudges the supervisor. The address
-// is not marked failed here: a stream the server ended is retried against the same
-// node first, and only a failed handshake puts it on cooldown.
-func (c *ConfigClient) signalLost() {
+// streamLost retires `dead` and nudges the supervisor, but only when `dead` is
+// still the current connection: a planned switch closes a connection it already
+// replaced, and honouring that callback would reconnect twice for one event (the
+// job GrpcClient's abandon flag does, GrpcClient.java:310-322).
+//
+// The address is not marked failed here — a stream the server ended is retried
+// against the same node first, and only a failed handshake puts it on cooldown.
+func (c *ConfigClient) streamLost(dead *sdkConn) {
 	c.mu.Lock()
-	conn := c.conn
+	if c.conn != dead {
+		c.mu.Unlock()
+		return
+	}
 	c.conn, c.addr = nil, ""
 	c.generation++
 	c.broadcastLocked()
 	c.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.Close()
+	if dead != nil {
+		_ = dead.Close()
 	}
 	select {
 	case c.lost <- struct{}{}:
 	default:
 	}
 }
+
+// --- resetTarget: the hooks handleConnectReset needs ---
+
+func (c *ConfigClient) currentConn() (*sdkConn, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn, c.addr
+}
+
+// switchTo moves to a specific address now, which is what ConnectResetRequest
+// asks for. publish retires the previous connection only once the new one has
+// handshaked, so there is no window with no live connection.
+func (c *ConfigClient) switchTo(ctx context.Context, addr string) error {
+	conn, err := c.dialFor(ctx, addr)
+	if err != nil {
+		return err
+	}
+	c.publish(conn, addr)
+	// The server keys its listen table by connectionId, so a new connection has
+	// to re-listen or the watches go dead. Nothing else will retry it here: the
+	// connection is healthy, so the supervisor stays asleep.
+	if err := c.listen(c.watchedKeys()); err != nil {
+		c.log("replay after ConnectReset failed; supervisor will retry", "err", err)
+		c.streamLost(conn)
+	}
+	return nil
+}
+
+func (c *ConfigClient) backgroundCtx() context.Context { return c.ctx }
+
+func (c *ConfigClient) servers() *serverList { return c.serversList }
 
 // LastErr is the most recent handshake or refresh failure, for a caller that
 // wants to report a degraded start without owning the retry loop.
@@ -727,7 +776,7 @@ func (c *ConfigClient) consumePushes(conn *sdkConn, gen int64) {
 			// look like "config stopped updating" on a live connection. Turning it
 			// into a reconnect is the honest response.
 			c.log("push consumer panicked", "err", fmt.Sprint(v))
-			c.signalLost()
+			c.streamLost(conn)
 		}
 	}()
 	for push := range conn.Pushes() {
@@ -737,6 +786,11 @@ func (c *ConfigClient) consumePushes(conn *sdkConn, gen int64) {
 		if !current {
 			return
 		}
+		if push.Type == TypeConnectResetRequest {
+			// Acked inside, on this stream, before the switch.
+			handleConnectReset(c, push)
+			continue
+		}
 		switch push.Type {
 		case TypeConfigChangeNotifyRequest:
 			var note ConfigChangeNotifyRequest
@@ -745,7 +799,7 @@ func (c *ConfigClient) consumePushes(conn *sdkConn, gen int64) {
 				continue
 			}
 			if err := conn.Ack(push); err != nil {
-				c.signalLost()
+				c.streamLost(conn)
 				continue
 			}
 			c.refresh(ConfigKey{DataID: note.DataID, Group: note.Group, Tenant: note.Tenant})

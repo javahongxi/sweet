@@ -23,6 +23,12 @@ const (
 	typeSetupAckResponse       = "SetupAckResponse"
 	typeServerCheckRequest     = "ServerCheckRequest"
 	typeHealthCheckRequest     = "HealthCheckRequest"
+	typeConnectResetResponse   = "ConnectResetResponse"
+
+	// TypeConnectResetRequest is a server push asking the client to move to
+	// another node (load shedding or an operator reload); exported because a
+	// caller may want to recognise it in its own push handling.
+	TypeConnectResetRequest = "ConnectResetRequest"
 
 	typeInstanceRequest          = "InstanceRequest"
 	typeQueryServiceResponse     = "QueryServiceResponse"

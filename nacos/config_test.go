@@ -43,7 +43,10 @@ type configStub struct {
 	headersSeen map[string]map[string]string
 
 	push chan ConfigChangeNotifyRequest
-	kill chan struct{}
+	// pushRaw carries frames the stub has no first-class support for, so a test
+	// can deliver any server push (ConnectResetRequest, an unknown type).
+	pushRaw chan *gen.Payload
+	kill    chan struct{}
 
 	grpcSrv *grpc.Server
 }
@@ -61,6 +64,7 @@ func newConfigStub(content, md5 string) *configStub {
 		content:     content,
 		md5:         md5,
 		push:        make(chan ConfigChangeNotifyRequest, 4),
+		pushRaw:     make(chan *gen.Payload, 8),
 		kill:        make(chan struct{}),
 		headersSeen: map[string]map[string]string{},
 	}
@@ -180,6 +184,27 @@ func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 	return frame(typeEmptyResponse, map[string]any{"success": true})
 }
 
+// PushRaw queues an arbitrary server frame onto the current stream.
+func (s *configStub) PushRaw(typeName string, body any) error {
+	select {
+	case s.pushRaw <- frame(typeName, body):
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("nacos: no live stream to push on")
+	}
+}
+
+// ackTypes lists the Metadata.type of every frame a client wrote on a stream.
+func (s *configStub) ackTypes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.clientFra))
+	for _, p := range s.clientFra {
+		out = append(out, p.GetMetadata().GetType())
+	}
+	return out
+}
+
 func (s *configStub) noteHeaders(t string, p *gen.Payload) {
 	if h := p.GetMetadata().GetHeaders(); len(h) > 0 {
 		if _, seen := s.headersSeen[t]; !seen {
@@ -190,7 +215,7 @@ func (s *configStub) noteHeaders(t string, p *gen.Payload) {
 
 func (s *configStub) bidi(stream grpc.BidiStreamingServer[gen.Payload, gen.Payload]) error {
 	s.mu.Lock()
-	kill := s.kill
+	kill, pending := s.kill, s.pushRaw
 	s.mu.Unlock()
 
 	recv := make(chan *gen.Payload, 64)
@@ -238,6 +263,10 @@ func (s *configStub) bidi(stream grpc.BidiStreamingServer[gen.Payload, gen.Paylo
 			}
 		case note := <-s.push:
 			if err := stream.Send(frame(TypeConfigChangeNotifyRequest, note)); err != nil {
+				return err
+			}
+		case raw := <-pending:
+			if err := stream.Send(raw); err != nil {
 				return err
 			}
 		}
@@ -534,8 +563,18 @@ func TestAckClassIsARegisteredPayload(t *testing.T) {
 		"ConfigChangeNotifyRequest": "ConfigChangeNotifyResponse",
 		"ClientDetectionRequest":    "ClientDetectionResponse",
 		"HealthCheckRequest":        "HealthCheckResponse",
-		"ConnectResetRequest":       typeEmptyResponse, // no ConnectResetResponse exists
-		"SomeFutureThingRequest":    typeEmptyResponse,
+		// ConnectResetResponse is the official ack class for ConnectResetRequest:
+		// it exists at api/.../remote/response/ConnectResetResponse.java and is
+		// registered in the Payload SPI list. An earlier version of this table
+		// mapped it to EmptyResponse — a class Nacos 3.2.3 does not have at all
+		// (no such file, absent from the SPI list) — which the server would reject
+		// as "Unknown payload type" (GrpcUtils.java:132-133), i.e. exactly like
+		// not answering.
+		"ConnectResetRequest": "ConnectResetResponse",
+		// An unknown push gets no answer at all, matching the official client:
+		// handlers return null, handleServerRequest returns null, GrpcClient only
+		// logs (RpcClient.java:851-878, GrpcClient.java:286-290).
+		"SomeFutureThingRequest": "",
 	} {
 		if got := ackClassFor(push); got != want {
 			t.Errorf("ackClassFor(%q) = %q, want %q", push, got, want)

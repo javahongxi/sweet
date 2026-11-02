@@ -1,6 +1,7 @@
 package nacos
 
 import (
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -132,4 +133,74 @@ func (l *serverList) Addrs() (all []string, unhealthy []string) {
 	}
 	sort.Strings(unhealthy)
 	return out, unhealthy
+}
+
+// pickPreferred validates a server-recommended address against the list, the way
+// RpcClient.java:319-339 does: the recommendation is honoured only if that host
+// is already one of ours, and when it is, the LIST's port wins — a recommendation
+// may carry a port that is not the one this client dials. Returns "" when the
+// recommendation is not ours, which tells the caller to fall back to the next
+// entry rather than to dial a stranger.
+func (l *serverList) pickPreferred(ip, port string) string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	hostOf := func(a string) string {
+		if h, _, err := net.SplitHostPort(a); err == nil {
+			return h
+		}
+		return a
+	}
+	// Exact host:port first. The official comparison is host-only
+	// (RpcClient.java:324) which is unambiguous in a cluster where nodes differ
+	// by address, but two entries on one host (local testing, sidecars) would
+	// otherwise resolve to whichever appears first in the list.
+	if port != "" {
+		want := net.JoinHostPort(ip, port)
+		for _, a := range l.addrs {
+			if a == want {
+				return a
+			}
+		}
+	}
+	for _, a := range l.addrs {
+		if hostOf(a) == ip {
+			return a // the list's own entry, port included
+		}
+	}
+	return ""
+}
+
+// nextExcluding returns an address other than current, honouring the same
+// preference order as Pick. "" means the list has nothing else to offer.
+func (l *serverList) nextExcluding(current string) string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.addrs) < 2 {
+		return ""
+	}
+	now := time.Now()
+	// healthy candidates first, in list order
+	for i := range l.addrs {
+		idx := (l.cursor + i) % len(l.addrs)
+		a := l.addrs[idx]
+		if a == current {
+			continue
+		}
+		if t, bad := l.failed[a]; !bad || now.Sub(t) >= l.cooldown {
+			l.cursor = idx
+			return a
+		}
+	}
+	for _, a := range l.addrs {
+		if a != current {
+			return a
+		}
+	}
+	return ""
 }

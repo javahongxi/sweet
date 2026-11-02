@@ -2,6 +2,7 @@ package nacos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -54,6 +55,19 @@ func (s *namingStub) snapshot() (regs, subs int, acks []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.regs), len(s.subs), append([]string(nil), s.acks...)
+}
+
+// PushRaw queues an arbitrary server frame onto the current stream.
+func (s *namingStub) PushRaw(typeName string, body any) error {
+	s.mu.Lock()
+	pending := s.pending
+	s.mu.Unlock()
+	select {
+	case pending <- frame(typeName, body):
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("nacos: no live stream to push on")
+	}
 }
 
 // Kill ends the current bidi stream. The next one the client opens behaves

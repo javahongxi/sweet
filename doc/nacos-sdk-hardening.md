@@ -231,7 +231,51 @@ registry 不再需要自己剥 `GROUP@@`）。逐个改几十个方法是无收�
    2248 条配置无损，服务列表为 0 是因为那些都是临时实例）。多实例环境下要么按 pid 文件关，
    要么别用这个脚本。
 
+### ConnectResetRequest 已补语义（2026-11-03）
+
+服务端用它把连接赶到别的节点上（过载甩连接、运维 `reloadClient`：
+`ConnectionManager.java:286-319`）。官方语义是 **ack 在旧流上、然后换节点**
+（`RpcClient.java:397-428`：`switchServerAsync` 只是入队，response 仍从当前连接发出），
+不是原地重连——这条推送的目的就是"离开"。实现落在 `nacos/reset.go`：
+ack → 选目标（推荐地址须在自己列表内才采纳，且以列表端口为准，`RpcClient.java:319-339`；
+无推荐则取下一个；单节点列表就原地重建）→ **先连上新节点再关旧的**（`RpcClient.java:522-544`）
+→ **必须重放**（`switchTo` 里显式 replay / re-listen：新连接是健康的，supervisor 不会出手，
+不重放就是静默丢注册）。
+
+配套改动：`streamLost(dead)` 加了连接身份判断——计划内切换会关掉一个已被替换的连接，
+若照旧回调就会一次事件重连两遍（官方用 abandon 标志做同一件事，`GrpcClient.java:310-322`）。
+
+### 顺手抓出的第二个 ack 类名错误（比 ConnectReset 本身更要紧）
+
+`ackClassFor` 的 `ConnectResetRequest` 分支和 `default` 分支都回 `EmptyResponse`，而
+**3.2.3 根本没有 `EmptyResponse` 这个类**（无同名文件、不在 Payload SPI 清单里）。服务端
+对未注册类型是 throw（`GrpcUtils.java:132-133`），所以那等于"回了但没被收到"——和上一批
+刚修掉的 5743 条 `Unknown payload type` 是同一类错误，只是藏在兜底分支里没被触发过。
+正确做法对齐官方：未知推送**不回任何包**（`RpcClient.java:851-878` → `GrpcClient.java:286-290`
+只打 warn）。`ConnectResetRequest` 则改回它真正的应答类 `ConnectResetResponse`
+（`api/.../remote/response/ConnectResetResponse.java`，SPI 清单第 28 行）。
+`TestAckClassIsARegisteredPayload` 里那条"no ConnectResetResponse exists"的注释是错的，已改。
+
+### 一条观测通道的教训
+
+真机验证第一次"看不出结果"：`publish()` 的重连日志是 **debug 级**，而探针的 slog handler
+默认 Info 级，于是客户端侧一行都没有——只有服务端 `remote-digest.log` 的
+`transportTerminated` 证明事情发生过。放开到 Debug 之后读数完整：
+
+```
+03:58:29.562 nacos: config connected  connectionId=1793649509559_127.0.0.1_50571
+03:58:33.009 server asked this connection to reset; moving to another node  recommended=:
+03:58:33.012 nacos: config connected  connectionId=1793649513010_127.0.0.1_50574
+```
+
+即：真 Nacos 3.2.3 发出 `ConnectResetRequest`（无推荐地址分支）→ 客户端 ack → 3ms 后用新
+connectionId 重建。测试侧另加六条（`nacos/reset_test.go`）：换节点并重放 listen、旧流上 ack
+且 requestId 回显、采纳推荐地址、忽略列表外地址、单节点原地重建、未知推送不 ack、以及
+naming 侧注册重放。
+
 ### 第二步之外还剩什么
 
-判据 1–10 全绿。可选方向：`nacos/wire` 子包（DTO 彻底分层，发独立 module 时做）、
-`ConnectResetRequest` 的语义处理（目前 naming/config 两边都只 ack 不用）。
+判据 1–10 全绿，ConnectReset 已补。可选方向：`nacos/wire` 子包（DTO 彻底分层，发独立
+module 时做）；以及 config/naming 两个客户端仍各自重复一份 supervise/退避/发布骨架
+（约 150 行），值得抽成共用的生命周期类型——这次是把 reset 逻辑写进共用的 `reset.go`
+以避免第三份拷贝，但骨架本身的重复还在。
