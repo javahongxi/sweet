@@ -203,7 +203,7 @@ func TestHandshakeCompletesThreeFrames(t *testing.T) {
 	f := &fakeNacos{}
 	addr := startFakeNacos(t, f)
 
-	c, err := Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c, err := dialConn(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestHandshakeCompletesThreeFrames(t *testing.T) {
 	setup := f.setupsSeen[0]
 	meta := strings.Join(f.metaTypes, ",")
 	f.mu.Unlock()
-	if setup.ClientVersion != ClientVersion {
+	if setup.ClientVersion != clientVersion {
 		t.Fatalf("clientVersion = %q", setup.ClientVersion)
 	}
 	if setup.Tenant != "public" {
@@ -253,7 +253,7 @@ func TestUnaryCarriesTypeAndClientIp(t *testing.T) {
 	f := &fakeNacos{}
 	addr := startFakeNacos(t, f)
 
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestPushSurfacesOnChannel(t *testing.T) {
 	f := &fakeNacos{pushAfterACK: true}
 	addr := startFakeNacos(t, f)
 
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestSetupSendsNonNullAbilityTable(t *testing.T) {
 	f := &fakeNacos{}
 	addr := startFakeNacos(t, f)
 
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

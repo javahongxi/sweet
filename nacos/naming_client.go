@@ -33,7 +33,7 @@ import (
 //     reconnect racing the caller cannot resurrect an instance that was asked to
 //     go away (注销优先).
 type NamingClient struct {
-	servers *ServerList
+	servers *serverList
 	opts    NamingOptions
 
 	ctx    context.Context
@@ -41,8 +41,8 @@ type NamingClient struct {
 	lost   chan struct{}
 
 	mu            sync.Mutex
-	conn          *Conn
-	caller        *NamingCaller
+	conn          *sdkConn
+	caller        *namingCaller
 	addr          string
 	generation    int64
 	handshakes    int64
@@ -78,7 +78,7 @@ type NamingOptions struct {
 	Addr string
 
 	// Servers enables failover: a node whose handshake fails goes on cooldown and
-	// the next attempt uses another address. Connection-level only; see ServerList.
+	// the next attempt uses another address. Connection-level only; see serverList.
 	Servers []string
 
 	// Namespace and GroupName are the identity fields every naming request carries
@@ -136,7 +136,7 @@ func NewNamingClient(opts NamingOptions) (*NamingClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &NamingClient{
-		servers:       NewServerList(addrs, 0),
+		servers:       newServerList(addrs, 0),
 		opts:          opts,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -240,6 +240,10 @@ func (n *NamingClient) Subscribe(ctx context.Context, service string) (ServiceIn
 	if err != nil {
 		return ServiceInfo{}, err
 	}
+	// Names come back qualified ("GROUP@@service"); normalising here means no
+	// caller has to know the peeling rule, and the push path already does the
+	// same thing in consumePushes.
+	info.Name = trimGroup(info.Name, info.GroupName)
 	return info, nil
 }
 
@@ -373,7 +377,7 @@ func (n *NamingClient) Close() error {
 
 // --- lifecycle internals ---------------------------------------------------
 
-func (n *NamingClient) currentCaller() (*NamingCaller, error) {
+func (n *NamingClient) currentCaller() (*namingCaller, error) {
 	n.mu.Lock()
 	caller, msg := n.caller, n.lastErr
 	n.mu.Unlock()
@@ -431,8 +435,8 @@ func (n *NamingClient) reconnectOnce(ctx context.Context) error {
 	return nil
 }
 
-func (n *NamingClient) dialFor(ctx context.Context, addr string) (*Conn, error) {
-	conn, err := Dial(addr)
+func (n *NamingClient) dialFor(ctx context.Context, addr string) (*sdkConn, error) {
+	conn, err := dialConn(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -473,11 +477,11 @@ func (n *NamingClient) dialFor(ctx context.Context, addr string) (*Conn, error) 
 // is what stops a previous connection's consumer from acking or delivering after
 // it was superseded — registry/nacos learned that an untagged consumer logs
 // "ack …: stream not open" forever and can overwrite newer state.
-func (n *NamingClient) publish(conn *Conn, addr string) {
+func (n *NamingClient) publish(conn *sdkConn, addr string) {
 	n.mu.Lock()
 	old := n.conn
 	n.conn, n.addr = conn, addr
-	n.caller = NewNamingCaller(conn, n.opts.Namespace, n.opts.GroupName, n.opts.HealthyOnly)
+	n.caller = newNamingCaller(conn, n.opts.Namespace, n.opts.GroupName, n.opts.HealthyOnly)
 	n.generation++
 	gen := n.generation
 	n.handshakes++
@@ -545,7 +549,7 @@ func (n *NamingClient) replay() error {
 }
 
 // consumePushes serves one connection until it is superseded.
-func (n *NamingClient) consumePushes(conn *Conn, gen int64) {
+func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 	defer func() {
 		if v := recover(); v != nil {
 			n.log("push consumer panicked, dropping the connection", "err", fmt.Sprint(v))
@@ -578,7 +582,7 @@ func (n *NamingClient) consumePushes(conn *Conn, gen int64) {
 		case n.updates <- info:
 		default:
 			// A stalled consumer must not block the ack path, but it must not be
-			// invisible either: the drop is counted on the Conn and logged here.
+			// invisible either: the drop is counted on the sdkConn and logged here.
 			n.log("update channel full; dropping a push", "service", info.Name)
 		}
 	}

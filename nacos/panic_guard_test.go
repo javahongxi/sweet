@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// TestGuardConvertsPanicToStreamLoss proves the contract of Conn.guard, which
+// TestGuardConvertsPanicToStreamLoss proves the contract of sdkConn.guard, which
 // readLoop and keepAlive both defer: a panic in one of the connection's
 // long-lived goroutines must surface as a stream loss (the event the owner
 // already turns into a reconnect), not as a dead goroutine behind a
@@ -20,7 +20,7 @@ import (
 // with a nil map.
 func TestGuardConvertsPanicToStreamLoss(t *testing.T) {
 	addr := startProbeStub(t, &probeStub{})
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestGuardConvertsPanicToStreamLoss(t *testing.T) {
 // return through the guard must not touch the connection.
 func TestGuardIsNoOpWithoutPanic(t *testing.T) {
 	addr := startProbeStub(t, &probeStub{})
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

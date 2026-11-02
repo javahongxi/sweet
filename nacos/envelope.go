@@ -1,6 +1,5 @@
-// Package conn implements Nacos' client transport by hand: one bidi stream
-// carries the connection handshake and server pushes, one unary RPC carries
-// naming requests. The wire format is Nacos' own Payload/Metadata envelope.
+// The Payload/Metadata envelope: how a Nacos request becomes a gRPC message.
+// The package-level API tour is in doc.go.
 //
 // Facts this file encodes (local nacos checkout @ tag 3.2.3, commit c843da5be):
 //

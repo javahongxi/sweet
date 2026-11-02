@@ -23,7 +23,7 @@ func TestProbeDetectsSilentlyEndedStream(t *testing.T) {
 	f := &probeStub{dropAfterSetup: true}
 	addr := startProbeStub(t, f)
 
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestProbeDetectsSilentlyEndedStream(t *testing.T) {
 		if c.ConnectionID() != "" {
 			t.Fatal("stale connectionId retained after loss")
 		}
-		// Recovery on the same Conn/channel: new stream, new handshake, epoch+.1
+		// Recovery on the same sdkConn/channel: new stream, new handshake, epoch+.1
 		c.CloseStream()
 		if err := c.Setup(ctx, "public", nil); err != nil {
 			t.Fatalf("re-Setup after loss: %v", err)
@@ -82,7 +82,7 @@ func TestProbeDetectsSilentlyEndedStream(t *testing.T) {
 func TestProbeIsAnsweredByServer(t *testing.T) {
 	f := &probeStub{}
 	addr := startProbeStub(t, f)
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestLiveProbeChannelFacts(t *testing.T) {
 	if addr == "" {
 		t.Skip("set NACOS_GRPC_ADDR=127.0.0.1:9848")
 	}
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

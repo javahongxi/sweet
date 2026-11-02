@@ -61,11 +61,11 @@ type serverRequestMeta struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 
-// Conn is one logical connection to a Nacos server: the unary RPC and the
+// sdkConn is one logical connection to a Nacos server: the unary RPC and the
 // long-lived bidi stream that carries the handshake and pushes. Both live on one
 // grpc.ClientConn, which is itself long-lived — losing the stream does not lose
 // the channel, so recovery means opening a new stream and re-handshaking.
-type Conn struct {
+type sdkConn struct {
 	addr string
 	ip   string
 
@@ -135,7 +135,7 @@ type Conn struct {
 
 // Dial prepares the transport. No I/O happens here: grpc.NewClient connects
 // lazily; Setup performs the handshake described in §8.3.
-func Dial(addr string, opts ...grpc.DialOption) (*Conn, error) {
+func dialConn(addr string, opts ...grpc.DialOption) (*sdkConn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("nacos: server addr %q wants host:port", addr)
@@ -146,7 +146,7 @@ func Dial(addr string, opts ...grpc.DialOption) (*Conn, error) {
 		return nil, fmt.Errorf("nacos: dial %s: %w", addr, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Conn{
+	c := &sdkConn{
 		addr:               addr,
 		ip:                 host,
 		cc:                 cc,
@@ -166,7 +166,7 @@ func Dial(addr string, opts ...grpc.DialOption) (*Conn, error) {
 
 // currentStream exposes the live stream for tests that need to observe raw
 // transport behaviour.
-func (c *Conn) currentStream() grpc.ClientStream {
+func (c *sdkConn) currentStream() grpc.ClientStream {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return c.stream
@@ -176,7 +176,7 @@ func (c *Conn) currentStream() grpc.ClientStream {
 // hook is what turns "the stream died" into "reconnect and replay", and a
 // connection without it degrades to exactly the silent-death failure mode the
 // first version had.
-func (c *Conn) SetStreamLostHook(fn func(error)) { c.onStreamLost = fn }
+func (c *sdkConn) SetStreamLostHook(fn func(error)) { c.onStreamLost = fn }
 
 // Setup performs the two-part handshake:
 //
@@ -187,7 +187,7 @@ func (c *Conn) SetStreamLostHook(fn func(error)) { c.onStreamLost = fn }
 // (harbor-vs-nacos.md §8.3), and it is also what warms the channel so the
 // stream is not the first thing on a cold connection. abilityTable must be
 // non-null or the server answers nothing at all — see ConnectionSetupRequest.
-func (c *Conn) Setup(ctx context.Context, tenant string, labels map[string]string) error {
+func (c *sdkConn) Setup(ctx context.Context, tenant string, labels map[string]string) error {
 	if labels == nil {
 		// RemoteConstants.java:32,40 — the values Nacos itself uses.
 		labels = map[string]string{"source": "sdk", "module": "naming"}
@@ -202,7 +202,7 @@ func (c *Conn) Setup(ctx context.Context, tenant string, labels map[string]strin
 		return err
 	}
 	setup := ConnectionSetupRequest{
-		ClientVersion: ClientVersion,
+		ClientVersion: clientVersion,
 		Tenant:        tenant,
 		Labels:        labels,
 		AbilityTable:  map[string]bool{}, // non-null: see the field comment
@@ -231,7 +231,7 @@ func (c *Conn) Setup(ctx context.Context, tenant string, labels map[string]strin
 }
 
 // serverCheck issues the unary probe and returns the connectionId it carries.
-func (c *Conn) serverCheck(ctx context.Context) (string, error) {
+func (c *sdkConn) serverCheck(ctx context.Context) (string, error) {
 	timeout := c.ServerCheckTimeout
 	if timeout <= 0 {
 		timeout = DefaultServerCheckTimeout
@@ -260,7 +260,7 @@ func (c *Conn) serverCheck(ctx context.Context) (string, error) {
 	return resp.ConnectionID, nil
 }
 
-func (c *Conn) openStream() error {
+func (c *sdkConn) openStream() error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	if c.stream != nil {
@@ -286,7 +286,7 @@ func (c *Conn) openStream() error {
 // take the whole process down — and leaving the goroutine dead while the
 // connection still reports Ready() is precisely the silent-death failure mode
 // this package exists to avoid.
-func (c *Conn) guard(where string) {
+func (c *sdkConn) guard(where string) {
 	if v := recover(); v != nil {
 		c.failStream(fmt.Errorf("nacos: panic in %s: %v", where, v))
 	}
@@ -294,7 +294,7 @@ func (c *Conn) guard(where string) {
 
 // readLoop owns receives on the bidi stream. Handshake frames are consumed here;
 // everything else is offered to the consumer, which is responsible for acking.
-func (c *Conn) readLoop(cs grpc.ClientStream) {
+func (c *sdkConn) readLoop(cs grpc.ClientStream) {
 	defer c.guard("readLoop")
 	for {
 		var p gen.Payload
@@ -334,7 +334,7 @@ func (c *Conn) readLoop(cs grpc.ClientStream) {
 // instance vanishes from the registry while the process looks perfectly alive.
 // failStream is idempotent: it is called from the read loop and from senders,
 // and a send error on an already-reaped stream must not fire recovery twice.
-func (c *Conn) failStream(err error) {
+func (c *sdkConn) failStream(err error) {
 	c.sendMu.Lock()
 	if c.stream == nil {
 		c.sendMu.Unlock()
@@ -372,7 +372,7 @@ func (c *Conn) failStream(err error) {
 //     So an unanswered probe is the only reliable way to notice a stream the
 //     server already walked away from; without it a client keeps holding a
 //     registration the server removed.
-func (c *Conn) keepAlive() {
+func (c *sdkConn) keepAlive() {
 	interval := c.KeepAlive
 	if interval <= 0 {
 		interval = DefaultKeepAlive
@@ -408,7 +408,7 @@ func (c *Conn) keepAlive() {
 }
 
 // nextRequestID mirrors PushAckIdGenerator: a per-connection increasing id.
-func (c *Conn) nextRequestID() string {
+func (c *sdkConn) nextRequestID() string {
 	return strconv.FormatInt(c.requestSeq.Add(1), 10)
 }
 
@@ -423,7 +423,7 @@ func (c *Conn) nextRequestID() string {
 // registered Response: the server's ack correlation only reads requestId and
 // resultCode (GrpcBiStreamRequestAcceptor.java:217-225,
 // RpcAckCallbackSynchronizer.ackNotify), so an empty one still closes the push.
-func (c *Conn) Ack(p Push) error {
+func (c *sdkConn) Ack(p Push) error {
 	if p.RequestID == "" {
 		return nil // nothing measured to echo back
 	}
@@ -466,9 +466,9 @@ type ackBody struct {
 }
 
 // Pushes exposes server-initiated frames.
-func (c *Conn) Pushes() <-chan Push { return c.pushes }
+func (c *sdkConn) Pushes() <-chan Push { return c.pushes }
 
-func (c *Conn) offer(p Push) {
+func (c *sdkConn) offer(p Push) {
 	c.pushMu.Lock()
 	ready := !c.closed.Load()
 	c.pushMu.Unlock()
@@ -493,12 +493,12 @@ func (c *Conn) offer(p Push) {
 // PushDropped counts pushes discarded because the consumer had stalled. A number
 // that only ever grows is the signal that the consumer is too slow, not that the
 // server is chatty.
-func (c *Conn) PushDropped() int64 { return c.pushDropped.Load() }
+func (c *sdkConn) PushDropped() int64 { return c.pushDropped.Load() }
 
 // log writes to Logger if one was set. Lifecycle events are debug-level on
 // purpose: a library that defaults to noise gets its logs switched off entirely,
 // and the interesting events then go missing with the rest.
-func (c *Conn) log(msg string, kv ...any) {
+func (c *sdkConn) log(msg string, kv ...any) {
 	l := c.Logger
 	if l == nil {
 		return
@@ -506,7 +506,7 @@ func (c *Conn) log(msg string, kv ...any) {
 	l.Log(c.ctx, slog.LevelDebug, "nacos: "+msg, append([]any{"addr", c.addr}, kv...)...)
 }
 
-func (c *Conn) send(p *gen.Payload) error {
+func (c *sdkConn) send(p *gen.Payload) error {
 	c.sendMu.Lock()
 	cs := c.stream
 	c.sendMu.Unlock()
@@ -525,7 +525,7 @@ func (c *Conn) send(p *gen.Payload) error {
 
 // Call performs one unary request and decodes the reply into resp, asserting
 // the response class name.
-func (c *Conn) Call(ctx context.Context, req envelope, resp envelope) error {
+func (c *sdkConn) Call(ctx context.Context, req envelope, resp envelope) error {
 	t, body, err := c.Unary(ctx, req)
 	if err != nil {
 		return err
@@ -541,7 +541,7 @@ func (c *Conn) Call(ctx context.Context, req envelope, resp envelope) error {
 
 // CallNoResponse sends a unary request and discards the reply body; for probes
 // where only transport-level success matters.
-func (c *Conn) CallNoResponse(ctx context.Context, req envelope) error {
+func (c *sdkConn) CallNoResponse(ctx context.Context, req envelope) error {
 	_, _, err := c.Unary(ctx, req)
 	return err
 }
@@ -554,7 +554,7 @@ func (c *Conn) CallNoResponse(ctx context.Context, req envelope) error {
 // That mirrors ClientWorker.java:1397-1398 — the client re-logins rather than
 // surfacing a stale-token failure to the application — and it is the only way a
 // token that expired mid-connection recovers without a reconnect.
-func (c *Conn) Unary(ctx context.Context, req envelope) (string, []byte, error) {
+func (c *sdkConn) Unary(ctx context.Context, req envelope) (string, []byte, error) {
 	var lastType string
 	var lastBody []byte
 	for attempt := 0; attempt < 2; attempt++ {
@@ -577,7 +577,7 @@ func (c *Conn) Unary(ctx context.Context, req envelope) (string, []byte, error) 
 }
 
 // marshalSigned renders the request and attaches the credential headers.
-func (c *Conn) marshalSigned(req envelope) (*gen.Payload, error) {
+func (c *sdkConn) marshalSigned(req envelope) (*gen.Payload, error) {
 	p, err := marshalRequest(req, c.localIP())
 	if err != nil {
 		return nil, err
@@ -607,7 +607,7 @@ func (c *Conn) marshalSigned(req envelope) (*gen.Payload, error) {
 	return p, nil
 }
 
-func (c *Conn) invoke(ctx context.Context, p *gen.Payload, req envelope) (string, []byte, error) {
+func (c *sdkConn) invoke(ctx context.Context, p *gen.Payload, req envelope) (string, []byte, error) {
 	var out gen.Payload
 	timeout := c.CallTimeout
 	if timeout <= 0 {
@@ -641,19 +641,19 @@ func responseDenied(body []byte) bool {
 
 // localIP is the address reported in Metadata.clientIp: the *peer* address of
 // the channel when known, else the dial host. Nacos fills NetUtils.localIp().
-func (c *Conn) localIP() string {
+func (c *sdkConn) localIP() string {
 	return c.ip
 }
 
 // ConnectionID is the id the server assigned at serverCheck time. Empty means no
 // live connection.
-func (c *Conn) ConnectionID() string { v, _ := c.connectionID.Load().(string); return v }
+func (c *sdkConn) ConnectionID() string { v, _ := c.connectionID.Load().(string); return v }
 
 // Addr is the server address this connection points at.
-func (c *Conn) Addr() string { return c.addr }
+func (c *sdkConn) Addr() string { return c.addr }
 
 // Abilities reports the table the server acknowledged during setup.
-func (c *Conn) Abilities() map[string]bool {
+func (c *sdkConn) Abilities() map[string]bool {
 	c.setupMu.Lock()
 	defer c.setupMu.Unlock()
 	return c.abilities
@@ -661,12 +661,12 @@ func (c *Conn) Abilities() map[string]bool {
 
 // Epoch counts successful handshakes. Owners compare it across calls to decide
 // when to replay registrations and subscriptions after a reconnect.
-func (c *Conn) Epoch() int64 { return c.epoch.Load() }
+func (c *sdkConn) Epoch() int64 { return c.epoch.Load() }
 
 // Ready reports a live stream *and* a completed handshake. The earlier version
 // returned true forever once the handshake latch was closed, which is how a
 // silently dead connection looked healthy while its instances disappeared.
-func (c *Conn) Ready() bool {
+func (c *sdkConn) Ready() bool {
 	c.setupMu.Lock()
 	done := c.setupDone
 	c.setupMu.Unlock()
@@ -682,13 +682,13 @@ func (c *Conn) Ready() bool {
 
 // awaitSetup returns the latch for the *current* handshake attempt. Re-handshake
 // replaces it, so callers must never hold on to a stale channel.
-func (c *Conn) awaitSetup() chan struct{} {
+func (c *sdkConn) awaitSetup() chan struct{} {
 	c.setupMu.Lock()
 	defer c.setupMu.Unlock()
 	return c.setupDone
 }
 
-func (c *Conn) markSetupDone() {
+func (c *sdkConn) markSetupDone() {
 	c.setupMu.Lock()
 	defer c.setupMu.Unlock()
 	if c.handshaked {
@@ -699,15 +699,15 @@ func (c *Conn) markSetupDone() {
 }
 
 // StreamErr reports why the stream last died, if it has.
-func (c *Conn) StreamErr() error {
+func (c *sdkConn) StreamErr() error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return c.streamErr
 }
 
-func (c *Conn) touch() { c.lastActive.Store(time.Now().UnixNano()) }
+func (c *sdkConn) touch() { c.lastActive.Store(time.Now().UnixNano()) }
 
-func (c *Conn) idleFor() time.Duration {
+func (c *sdkConn) idleFor() time.Duration {
 	last := c.lastActive.Load()
 	if last == 0 {
 		return time.Hour
@@ -717,7 +717,7 @@ func (c *Conn) idleFor() time.Duration {
 
 // CloseStream releases the current stream without closing the channel, so the
 // owner can hand us a new one after recovery. Safe to call twice.
-func (c *Conn) CloseStream() {
+func (c *sdkConn) CloseStream() {
 	c.sendMu.Lock()
 	c.stream = nil
 	c.sendMu.Unlock()
@@ -732,7 +732,7 @@ func (c *Conn) CloseStream() {
 }
 
 // Close tears the connection down. Safe to call more than once.
-func (c *Conn) Close() error {
+func (c *sdkConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}

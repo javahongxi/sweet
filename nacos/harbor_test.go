@@ -25,7 +25,7 @@ func harborAddr(t *testing.T) string {
 // TestHarborHandshakeWithAbilityTable is the baseline: a client that fills
 // abilityTable must complete the handshake against harbor too.
 func TestHarborHandshakeWithAbilityTable(t *testing.T) {
-	c, err := Dial(harborAddr(t))
+	c, err := dialConn(harborAddr(t))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestHarborHandshakeWithAbilityTable(t *testing.T) {
 // native client is relying on the 100ms sleep path rather than on a handshake
 // acknowledgement.
 func TestHarborSilentWithoutAbilityTable(t *testing.T) {
-	c, err := Dial(harborAddr(t))
+	c, err := dialConn(harborAddr(t))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestHarborSilentWithoutAbilityTable(t *testing.T) {
 		t.Fatalf("openStream: %v", err)
 	}
 	p, err := marshalRequest(ConnectionSetupRequest{
-		ClientVersion: ClientVersion,
+		ClientVersion: clientVersion,
 		Tenant:        "public",
 		Labels:        map[string]string{"source": "sdk", "module": "naming"},
 		// AbilityTable intentionally nil — `json:"abilityTable"` with no omitempty

@@ -21,7 +21,7 @@ func TestProbeUnaryWithoutSetup(t *testing.T) {
 	if addr == "" {
 		t.Skipf("set %s", envAddr)
 	}
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestProbeBidiFramesDumpsEverythingReceived(t *testing.T) {
 	if addr == "" {
 		t.Skipf("set %s", envAddr)
 	}
-	c, err := Dial(addr)
+	c, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestProbeBidiFramesDumpsEverythingReceived(t *testing.T) {
 	if err := c.openStream(); err != nil {
 		t.Fatalf("openStream: %v", err)
 	}
-	setup := ConnectionSetupRequest{ClientVersion: ClientVersion, Tenant: "public",
+	setup := ConnectionSetupRequest{ClientVersion: clientVersion, Tenant: "public",
 		Labels: map[string]string{"source": "sdk", "module": "naming"}}
 	p, err := marshalRequest(setup, "127.0.0.1")
 	if err != nil {

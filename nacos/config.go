@@ -33,10 +33,10 @@ import (
 // md5 per (groupKey, connectionId) when listening
 // (ConfigChangeBatchListenRequestHandler.java:80).
 type ConfigClient struct {
-	servers *ServerList
+	servers *serverList
 	opts    ConfigOptions
 
-	conn *Conn // current connection; nil while a reconnect is in flight
+	conn *sdkConn // current connection; nil while a reconnect is in flight
 	addr string
 	// generation counts connection swaps; a push consumer stops when the number it
 	// was started with no longer matches.
@@ -85,7 +85,7 @@ type ConfigOptions struct {
 	//
 	// Failover is connection-level only, matching the official client — an
 	// in-flight request still returns its error to the caller instead of being
-	// replayed elsewhere (RpcClient.java:717-723). See ServerList.
+	// replayed elsewhere (RpcClient.java:717-723). See serverList.
 	Servers []string
 
 	// Tenant is the namespace id, and it is the field config calls "tenant"
@@ -157,7 +157,7 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ConfigClient{
-		servers:   NewServerList(addrs, 0),
+		servers:   newServerList(addrs, 0),
 		opts:      opts,
 		tenant:    opts.Tenant,
 		labels:    labels,
@@ -190,10 +190,10 @@ func (c *ConfigClient) budget() time.Duration {
 }
 
 // dialFor builds and handshakes a connection to one address. Every knob is applied
-// here rather than at construction, because the address — and with it the Conn
+// here rather than at construction, because the address — and with it the sdkConn
 // object — can change on any retry.
-func (c *ConfigClient) dialFor(ctx context.Context, addr string) (*Conn, error) {
-	conn, err := Dial(addr)
+func (c *ConfigClient) dialFor(ctx context.Context, addr string) (*sdkConn, error) {
+	conn, err := dialConn(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +269,7 @@ func (c *ConfigClient) reconnectOnce(ctx context.Context) error {
 // publish installs a live connection, retires the previous one and starts its push
 // consumer. Two consumers would double-deliver every notify, and a route table
 // applied twice is a duplicate-registration error — hence the generation tag.
-func (c *ConfigClient) publish(conn *Conn, addr string) {
+func (c *ConfigClient) publish(conn *sdkConn, addr string) {
 	c.mu.Lock()
 	old := c.conn
 	c.conn, c.addr = conn, addr
@@ -311,7 +311,7 @@ func (c *ConfigClient) WaitReady(ctx context.Context) error {
 
 // PushDropped counts server pushes discarded because the consumer stalled, across
 // whichever connection is current. Read through the lock on purpose: the field it
-// reports lives on a Conn that the supervisor may replace at any moment.
+// reports lives on a sdkConn that the supervisor may replace at any moment.
 func (c *ConfigClient) PushDropped() int64 {
 	c.mu.Lock()
 	conn := c.conn
@@ -339,7 +339,7 @@ func (c *ConfigClient) addrs() string {
 }
 
 // current returns the live connection or an ErrUnavailable that says so.
-func (c *ConfigClient) current() (*Conn, error) {
+func (c *ConfigClient) current() (*sdkConn, error) {
 	c.mu.Lock()
 	conn, msg := c.conn, c.lastErr
 	c.mu.Unlock()
@@ -720,7 +720,7 @@ func (c *ConfigClient) log(msg string, kv ...any) {
 // consumePushes serves one connection until it is superseded or closed. Every
 // pushed ServerRequest is acked — an un-acked push is re-sent until the server
 // unregisters the connection.
-func (c *ConfigClient) consumePushes(conn *Conn, gen int64) {
+func (c *ConfigClient) consumePushes(conn *sdkConn, gen int64) {
 	defer func() {
 		if v := recover(); v != nil {
 			// A poison frame must not kill the only consumer of pushes; that would
@@ -773,7 +773,7 @@ func (c *ConfigClient) Close() error {
 	return conn.Close()
 }
 
-// decodeBody reads a pushed frame's JSON body, which Conn already unwrapped
+// decodeBody reads a pushed frame's JSON body, which sdkConn already unwrapped
 // from the Payload envelope.
 func decodeBody(p Push, out any) error {
 	return json.Unmarshal(p.Body, out)

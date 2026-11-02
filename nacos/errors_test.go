@@ -41,12 +41,12 @@ func TestCauseStaysClassifiableThroughWrapping(t *testing.T) {
 	tests := []struct {
 		name string
 		// call runs one unary request and returns its error.
-		call func(ctx context.Context, c *Conn) error
+		call func(ctx context.Context, c *sdkConn) error
 		want codes.Code
 	}{
 		{
 			name: "peer unreachable",
-			call: func(ctx context.Context, c *Conn) error {
+			call: func(ctx context.Context, c *sdkConn) error {
 				_, _, err := c.Unary(ctx, HealthCheckRequest{RequestID: "1"})
 				return err
 			},
@@ -54,7 +54,7 @@ func TestCauseStaysClassifiableThroughWrapping(t *testing.T) {
 		},
 		{
 			name: "caller gave up",
-			call: func(ctx context.Context, c *Conn) error {
+			call: func(ctx context.Context, c *sdkConn) error {
 				cctx, cancel := context.WithCancel(ctx)
 				cancel() // cancelled before the call even starts
 				_, _, err := c.Unary(cctx, HealthCheckRequest{RequestID: "1"})
@@ -67,7 +67,7 @@ func TestCauseStaysClassifiableThroughWrapping(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := Dial("127.0.0.1:1")
+			c, err := dialConn("127.0.0.1:1")
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
@@ -110,7 +110,7 @@ func TestCauseStaysClassifiableThroughWrapping(t *testing.T) {
 // put context.Canceled in the Unwrap chain, so the sentinel check that works for
 // io.EOF or a hand-rolled errNotReady finds nothing here. Map the code.
 func TestCancelledRPCIsNotSentinelReachable(t *testing.T) {
-	c, err := Dial("127.0.0.1:1")
+	c, err := dialConn("127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestCancelledRPCIsNotSentinelReachable(t *testing.T) {
 // comparisons agree either way, message comparisons do not — so classify on the
 // code, and treat the message as human-facing.
 func TestFromErrorVsAsMessage(t *testing.T) {
-	c, err := Dial("127.0.0.1:1")
+	c, err := dialConn("127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

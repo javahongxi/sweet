@@ -252,9 +252,11 @@ func (r *Registry) pump() {
 			if !ok {
 				return
 			}
-			name := naming.TrimGroup(info.Name, info.GroupName)
-			r.deliver(name, toInstances(info.Hosts), false)
-			r.remember(name, info.Hosts)
+			// NamingClient already peels the "GROUP@@" qualification off both
+			// the subscribe response and the push, so the name here is the one
+			// the watcher asked for.
+			r.deliver(info.Name, toInstances(info.Hosts), false)
+			r.remember(info.Name, info.Hosts)
 		}
 	}
 }

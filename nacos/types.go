@@ -39,12 +39,12 @@ const (
 // NotifySubscriberRequest → {"headers":{},"requestId":"5","serviceInfo":{...}}),
 // never a Metadata.headers key. Unary calls still need no correlation id of
 // their own (gRPC does it), but a push MUST be acked with the same requestId or
-// the server re-pushes it. See Conn.Ack.
+// the server re-pushes it. See sdkConn.Ack.
 
-// ClientVersion is reported in the setup request. The server only records it
+// clientVersion is reported in the setup request. The server only records it
 // (GrpcBiStreamRequestAcceptor.java:170 → RemotingHeartBeatEvent), it does not
 // gate behaviour on it.
-const ClientVersion = "sweet/0.1"
+const clientVersion = "sweet/0.1"
 
 // ConnectionSetupRequest mirrors api/.../remote/request/
 // ConnectionSetupRequest.java:30-36 — exactly four fields, and it is an

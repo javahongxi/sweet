@@ -30,7 +30,7 @@ func liveAddr(t *testing.T) string {
 // TestLiveSetupHandshakeIsAcknowledged is S2's acceptance: three frames must
 // complete, otherwise Setup would hang or time out.
 func TestLiveSetupHandshakeIsAcknowledged(t *testing.T) {
-	c, err := Dial(liveAddr(t))
+	c, err := dialConn(liveAddr(t))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestLiveSetupHandshakeIsAcknowledged(t *testing.T) {
 // TestLiveUnaryServerCheck proves the unary RPC path (method name + Payload
 // envelope) is accepted by a real server; the naming calls ride on top of it.
 func TestLiveUnaryServerCheck(t *testing.T) {
-	c, err := Dial(liveAddr(t))
+	c, err := dialConn(liveAddr(t))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestLiveUnaryServerCheck(t *testing.T) {
 // hangs off the connection's context: a caller whose Setup deadline expires
 // must not kill an already-established connection.
 func TestLiveSetupIsNotTornDownByCallerTimeout(t *testing.T) {
-	c, err := Dial(liveAddr(t))
+	c, err := dialConn(liveAddr(t))
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestLiveSetupIsNotTornDownByCallerTimeout(t *testing.T) {
 		t.Fatalf("Setup with 1ms budget should report the deadline, got %v", err)
 	}
 
-	// Second attempt on the same Conn must still be able to finish.
+	// Second attempt on the same sdkConn must still be able to finish.
 	ctx, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
 	if err := c.Setup(ctx, "public", nil); err != nil {
@@ -99,7 +99,7 @@ func TestLiveSetupIsNotTornDownByCallerTimeout(t *testing.T) {
 // (camelCase, not client_ip), and the body is the object's JSON.
 func TestMarshalEnvelopeShape(t *testing.T) {
 	p, err := marshalRequest(ConnectionSetupRequest{
-		ClientVersion: ClientVersion,
+		ClientVersion: clientVersion,
 		Tenant:        "public",
 		Labels:        map[string]string{"source": "sdk"},
 	}, "10.0.0.1")

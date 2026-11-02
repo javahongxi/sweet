@@ -76,7 +76,7 @@ func (s *namingStub) PushNotify(service string, hosts []Instance) error {
 	s.mu.Unlock()
 
 	// A real push always carries a requestId (ServerRequest.requestId); without
-	// one the client has nothing to echo and Conn.Ack no-ops by design.
+	// one the client has nothing to echo and sdkConn.Ack no-ops by design.
 	body := NotifySubscriber{
 		RequestID:   id,
 		ServiceInfo: ServiceInfo{Name: service, GroupName: "DEFAULT_GROUP", Hosts: hosts, LastRefTime: time.Now().UnixMilli()},

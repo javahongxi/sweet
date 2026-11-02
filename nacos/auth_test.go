@@ -127,7 +127,7 @@ func TestNamingRefusalKeepsServerMessage(t *testing.T) {
 	stub.instanceMessage = "no right to register"
 	addr := startConfigStub(t, stub)
 
-	conn, err := Dial(addr)
+	conn, err := dialConn(addr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestNamingRefusalKeepsServerMessage(t *testing.T) {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	n := NewNamingCaller(conn, "", "DEFAULT_GROUP", false)
+	n := newNamingCaller(conn, "", "DEFAULT_GROUP", false)
 	err = n.RegisterInstance(ctx, "sweet.example.v1.Greeter", TypeRegisterInstance,
 		Instance{IP: "127.0.0.1", Port: 20001, Weight: 1, Ephemeral: true})
 	if err == nil {

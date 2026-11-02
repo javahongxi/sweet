@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// ServerList picks which Nacos endpoint to dial and remembers which ones just
+// serverList picks which Nacos endpoint to dial and remembers which ones just
 // failed, so a reconnect rotates instead of hammering the node that is down.
 //
 // The failover is deliberately connection-level. The official client does not
@@ -17,7 +17,7 @@ import (
 // Request-level failover would mean deciding per request whether a register,
 // deregister or publish is safe to replay, and that is a policy the caller owns,
 // not the transport.
-type ServerList struct {
+type serverList struct {
 	mu       sync.Mutex
 	addrs    []string
 	failed   map[string]time.Time
@@ -28,7 +28,7 @@ type ServerList struct {
 // NewServerList builds a list from addresses in preference order. An empty or
 // all-blank input yields nil, which callers treat as "no list, use the single
 // address I already have".
-func NewServerList(addrs []string, cooldown time.Duration) *ServerList {
+func newServerList(addrs []string, cooldown time.Duration) *serverList {
 	kept := make([]string, 0, len(addrs))
 	for _, a := range addrs {
 		if a != "" {
@@ -43,14 +43,14 @@ func NewServerList(addrs []string, cooldown time.Duration) *ServerList {
 		// that a real outage still rotates away from it.
 		cooldown = 30 * time.Second
 	}
-	return &ServerList{addrs: kept, failed: map[string]time.Time{}, cooldown: cooldown}
+	return &serverList{addrs: kept, failed: map[string]time.Time{}, cooldown: cooldown}
 }
 
 // Pick returns the address to try next. Preference order: a node with no failure
 // record, then one whose cooldown has expired, then the least-recently-failed —
 // so a cluster where *everything* is down still gets probed in a stable order
 // instead of freezing on one node forever.
-func (l *ServerList) Pick() string {
+func (l *serverList) Pick() string {
 	if l == nil {
 		return ""
 	}
@@ -98,7 +98,7 @@ func (l *ServerList) Pick() string {
 
 // MarkFailed records that this address did not complete a handshake, so Pick
 // avoids it until the cooldown passes.
-func (l *ServerList) MarkFailed(addr string) {
+func (l *serverList) MarkFailed(addr string) {
 	if l == nil {
 		return
 	}
@@ -109,7 +109,7 @@ func (l *ServerList) MarkFailed(addr string) {
 
 // MarkHealthy clears a node's failure record: a successful handshake is the
 // evidence that matters, not a timer.
-func (l *ServerList) MarkHealthy(addr string) {
+func (l *serverList) MarkHealthy(addr string) {
 	if l == nil {
 		return
 	}
@@ -120,7 +120,7 @@ func (l *ServerList) MarkHealthy(addr string) {
 
 // Addrs reports the list and which entries are currently cooling down, for
 // logging and for a caller that wants to surface health without reaching in here.
-func (l *ServerList) Addrs() (all []string, unhealthy []string) {
+func (l *serverList) Addrs() (all []string, unhealthy []string) {
 	if l == nil {
 		return nil, nil
 	}

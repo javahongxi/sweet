@@ -98,7 +98,7 @@ type SubscribeServiceResponse struct {
 	ServiceInfo ServiceInfo `json:"serviceInfo"`
 }
 
-// NamingCaller issues naming-domain calls over one Conn someone else owns,
+// namingCaller issues naming-domain calls over one sdkConn someone else owns,
 // filling the identity fields every naming request carries — namespace and
 // groupName, per AbstractNamingRequest.java:30-34.
 //
@@ -107,8 +107,8 @@ type SubscribeServiceResponse struct {
 // connection. The split exists because registry/nacos spent several rounds
 // earning its reconnect semantics (deregister-first, stale-consumer guard), and
 // those guarantees had to keep running while the owner moved.
-type NamingCaller struct {
-	conn        *Conn
+type namingCaller struct {
+	conn        *sdkConn
 	namespace   string
 	group       string
 	healthyOnly bool
@@ -116,18 +116,18 @@ type NamingCaller struct {
 
 // NewNamingCaller wraps a connection with the identity fields requests should
 // carry.
-func NewNamingCaller(c *Conn, namespace, group string, healthyOnly bool) *NamingCaller {
-	return &NamingCaller{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
+func newNamingCaller(c *sdkConn, namespace, group string, healthyOnly bool) *namingCaller {
+	return &namingCaller{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
 }
 
-// Conn returns the transport the owner still manages: pushes, acks, epoch.
-func (n *NamingCaller) Conn() *Conn { return n.conn }
+// sdkConn returns the transport the owner still manages: pushes, acks, epoch.
+func (n *namingCaller) sdkConn() *sdkConn { return n.conn }
 
 // RegisterInstance registers or deregisters one instance. action is one of
 // TypeRegisterInstance / TypeDeregisterInstance — the caller decides which,
 // because "deregister first, then register" is a policy of the owner, not of the
 // wire format.
-func (n *NamingCaller) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
+func (n *namingCaller) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
 	req := InstanceRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group,
 		Type: action, Instance: in,
@@ -145,7 +145,7 @@ func (n *NamingCaller) RegisterInstance(ctx context.Context, serviceName, action
 
 // Subscribe turns pushes for one service on or off and returns the list the
 // server answered with. Whether to persist that list is the caller's business.
-func (n *NamingCaller) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
+func (n *namingCaller) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
 	t, body, err := n.conn.Unary(ctx, SubscribeServiceRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, Subscribe: subscribe,
 	})
@@ -167,7 +167,7 @@ func (n *NamingCaller) Subscribe(ctx context.Context, serviceName string, subscr
 
 // Query asks what the server currently believes is registered, independently of
 // the push path.
-func (n *NamingCaller) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
+func (n *namingCaller) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
 	t, body, err := n.conn.Unary(ctx, ServiceQueryRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, HealthyOnly: n.healthyOnly,
 	})
@@ -211,13 +211,13 @@ func DecodeNotify(p Push) (NotifySubscriber, error) {
 
 // ServiceName is the unqualified name the subscriber asked for.
 func (n NotifySubscriber) ServiceName() string {
-	return TrimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
+	return trimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
 }
 
-// TrimGroup strips the "GROUP@@" prefix a qualified Nacos service name carries.
+// trimGroup strips the "GROUP@@" prefix a qualified Nacos service name carries.
 // Both the DEFAULT_GROUP and the "default" cluster group appear in practice, so
 // both are peeled; anything unqualified passes through untouched.
-func TrimGroup(qualified, group string) string {
+func trimGroup(qualified, group string) string {
 	if qualified == "" {
 		return qualified
 	}

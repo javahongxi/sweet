@@ -163,8 +163,43 @@ sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据�
 最外环的 restart drill 在真 Nacos 上重跑通过：`calls=179 failures=0`、
 `state-updates=6`、两轮收敛各约 611ms。这是"生命周期搬家没弄坏收敛性"的读数。
 
+### 导出面已收敛（同日）
+
+**做法与"逐个方法改小写"不同**：只要 `Dial` 与 `Conn` 类型本身不导出，挂在它上面的
+导出方法就不可达，于是收的是类型与构造器——`Conn`→`sdkConn`、`Dial`→`dialConn`、
+`NamingCaller`→`namingCaller`、`ServerList`→`serverList`、`ClientVersion` 常量→
+`clientVersion`、`TrimGroup`→`trimGroup`（顺带把名字规整挪进 `Subscribe`/`Query`，
+registry 不再需要自己剥 `GROUP@@`）。逐个改几十个方法是无收益的 churn。
+
+包外现在只用得到 5 个符号：`NamingClient` / `NewNamingClient` / `NamingOptions` /
+`Instance` / `AccessGetter`。
+
+**一个改名踩到的真雷**：`ClientVersion` 同时是包级常量和
+`ConnectionSetupRequest` 的 **JSON 字段**，一刀切改成小写后 `go vet` 报
+"struct field clientVersion has json tag but is not exported"——字段一旦不导出，
+`encoding/json` 直接不序列化它，握手会静默变成"没带 clientVersion"。字段恢复导出，
+常量保持小写。
+
+**DTO 决定不删**（`InstanceRequest`/`ConfigQueryRequest`/`ConnectionSetupRequest`
+等）。理由：这个包的价值就是"线级契约可读、可逐行对着真服务端断言"，把它们藏进
+窄门面等于扔掉那份证据。改在新建的 `nacos/doc.go` 里划清层次——受支持 API 只有两个
+客户端 + Options + 返回值类型 + 错误 sentinel；DTO 是协议文档，"别建在上面"。
+将来若真发独立 module，正确做法是把 DTO 挪进 `nacos/wire` 子包，两全。
+
+顺带修掉一处过期注释：`envelope.go` 顶着一句"Package conn implements…"——包名是
+`nacos`，而且早就不只是传输层了。
+
+### 探针升级成测试（同日）
+
+`registry/nacos/probe_push_test.go` 原来通篇 `t.Logf`、永远不会红。拆成两条：
+
+- `TestPushReachesAnotherConnection` —— 硬断言：一条连接上的订阅者必须收到另一条
+  连接注册的推送。这条不成立，全fleet 的 resolver 都是瞎的。
+- `TestSameConnectionRegistrationTakesEffect` —— 把两件事分开：注册**生效**用
+  `Query` 硬断言；Nacos 是否给发起注册的那条连接也推一份，作为**测量**记录。
+
+真机读数：`same-connection push: YES`。这是原来那个探针想问却没答案的问题。
+
 ### 第二步还没做
 
-- 收敛导出面（`SetStreamLostHook`/`CloseStream`/`ProbeFatal`/`Unary`/`Call`/`Pushes`/
-  `Ack`/`Epoch`/`TrimGroup`）——现在 registry 已不直接碰 Conn，这一步可以做干净了。
-- 判据 10：真机开鉴权。
+- 判据 10：真机开鉴权（要重启本地 Nacos）。
