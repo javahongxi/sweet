@@ -76,6 +76,10 @@ func main() {
 		"at cold start when the config centre is unreachable; empty (the default) disables disk I/O, "+
 		"same switch as the registry snapshot directory")
 	namespace := flag.String("namespace", "", "Nacos namespace (the config domain calls it tenant)")
+	username := flag.String("username", "", "Nacos user for the config connection; empty means the server does not require auth")
+	password := flag.String("password", "", "password for -username")
+	authHTTP := flag.String("auth-http-addr", "127.0.0.1:8848", "host:port of the Nacos HTTP port used to log in "+
+		"(stated explicitly: this tool never derives the gRPC port from it or the other way round)")
 	printTable := flag.Bool("print-status-table", false, "print the gRPC to HTTP mapping and exit")
 	flag.Parse()
 
@@ -193,9 +197,18 @@ func main() {
 		// module and its naming module ignores anything not labelled "naming"
 		// (ConnectionBasedClientManager.java:60-64), so config cannot ride on the
 		// registry's connection. Within this domain, query and listen do share it.
+		var access nacos.AccessGetter
+		if *username != "" {
+			access = &nacos.PasswordAccess{
+				BaseURL:  "http://" + *authHTTP + "/nacos",
+				Username: *username,
+				Password: *password,
+			}
+		}
 		cfg, err := nacos.NewConfigClient(nacos.ConfigOptions{
 			Addr:   *serverAddr,
 			Tenant: *namespace,
+			Access: access,
 			OnError: func(key nacos.ConfigKey, err error) {
 				log.Printf("config %s/%s: %v (keeping the live route table)", key.Group, key.DataID, err)
 			},

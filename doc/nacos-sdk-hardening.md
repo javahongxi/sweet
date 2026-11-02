@@ -200,6 +200,38 @@ registry 不再需要自己剥 `GROUP@@`）。逐个改几十个方法是无收�
 
 真机读数：`same-connection push: YES`。这是原来那个探针想问却没答案的问题。
 
-### 第二步还没做
+### 判据 10 已完成（2026-11-03，隔离实例）
 
-- 判据 10：真机开鉴权（要重启本地 Nacos）。
+**做法**：把 install 复制一份到 `~/ai-infra/nacos-auth-test`（排除 4.7G 日志与 1.3G data，
+实得 227M），端口 18848 / gRPC 19848 / console 18080，独立 derby 目录，完全不碰在跑的 8848。
+先关鉴权建账号，再翻 `auth.enabled=true` 并把 `token.expire.seconds` 调到 20 秒，好把续期
+路径也逼出来。
+
+三条读数：
+
+1. **负向**：不带 `Access` 的 SDK 连接 → 握手**成功**并拿到 connectionId，config 查询被拒，
+   错误落进 `ErrDenied`（`denied (auth): query … Code: 401, User not found`）。这同时实测
+   印证了"建连不鉴权、每请求才校验"那条源码结论。
+2. **正向**：带 `PasswordAccess` 的网关 → `applied 1 route(s)`；越过 TTL 两分钟后再发布 →
+   `applied 2 route(s)`，全程不重启。
+3. **刷新窗口**：60 秒内成功登录恰好 **3 次** = 预测值（TTL 20s、窗口 ttl/10 ⇒ 每 18s 一次）。
+   口令里带 `&`，顺带真机验了一次 form 编码。
+
+`example/gateway` 为此补了 `-username` / `-password` / `-auth-http-addr` 三个 flag——
+`PasswordAccess` 此前没有任何真实调用方。HTTP 口显式给，**不做 gRPC↔HTTP 端口互推**。
+
+### 两条运维地雷（都是真踩的）
+
+1. **derby 不种默认用户**：`META-INF/derby-schema.sql:171-175` 只建 `users` 表、没有 INSERT，
+   且 HTTP 没有列用户的口。直接 `auth.enabled=true` 会把自己锁在外面。
+   `POST /nacos/v3/auth/user/admin` 会**当场生成一个随机口令的 `nacos` 管理员并只回显一次**，
+   那是唯一拿到凭证的窗口。
+2. **`bin/shutdown.sh:18` 是 `pgrep -f nacos.nacos`** —— 匹配全机所有 Nacos 进程。同一台机器
+   上跑第二实例时，关一个会把**另一个也杀掉**。本次就误杀了在跑的 8848（已重启恢复，
+   2248 条配置无损，服务列表为 0 是因为那些都是临时实例）。多实例环境下要么按 pid 文件关，
+   要么别用这个脚本。
+
+### 第二步之外还剩什么
+
+判据 1–10 全绿。可选方向：`nacos/wire` 子包（DTO 彻底分层，发独立 module 时做）、
+`ConnectResetRequest` 的语义处理（目前 naming/config 两边都只 ack 不用）。
