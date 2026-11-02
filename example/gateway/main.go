@@ -44,7 +44,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,6 +72,9 @@ func main() {
 	routesFrom := flag.String("routes", "embedded", "embedded | nacos — where the route table comes from")
 	routesDataID := flag.String("routes.dataId", "sweet-gateway-routes.json", "config dataId holding the route table")
 	routesGroup := flag.String("routes.group", "DEFAULT_GROUP", "config group of the route table")
+	routeCache := flag.String("route-cache", "", "keep the last accepted route table in this file and restore it "+
+		"at cold start when the config centre is unreachable; empty (the default) disables disk I/O, "+
+		"same switch as the registry snapshot directory")
 	namespace := flag.String("namespace", "", "Nacos namespace (the config domain calls it tenant)")
 	printTable := flag.Bool("print-status-table", false, "print the gRPC to HTTP mapping and exit")
 	flag.Parse()
@@ -126,6 +128,12 @@ func main() {
 				},
 			},
 		},
+		RouteCacheFile:   *routeCache,
+		RouteCacheSource: *routesGroup + "/" + *routesDataID,
+		OnRouteCache: func(err error) {
+			// The swap already happened; this only says the safety net is not there.
+			log.Printf("route cache: %v", err)
+		},
 	})
 	if err != nil {
 		log.Fatalf("gateway.New: %v", err)
@@ -167,6 +175,20 @@ func main() {
 		}
 
 	case "nacos":
+		// Restore before watching: a stale table that answers requests now beats an
+		// empty edge, and the live table replaces it the moment the config centre
+		// answers. Doing it the other way round would let the restore overwrite
+		// fresher data.
+		if *routeCache != "" {
+			applied, age, err := gw.RestoreRoutes()
+			switch {
+			case err != nil:
+				log.Printf("route cache %s: %v — starting with no routes", *routeCache, err)
+			case applied:
+				log.Printf("route cache: restored %d route(s) (age %s) from %s — stale until the config centre answers",
+					len(gw.Routes()), age.Round(time.Second), *routeCache)
+			}
+		}
 		// A second SDK connection, deliberately: Nacos labels connections by
 		// module and its naming module ignores anything not labelled "naming"
 		// (ConnectionBasedClientManager.java:60-64), so config cannot ride on the
@@ -178,14 +200,21 @@ func main() {
 				log.Printf("config %s/%s: %v (keeping the live route table)", key.Group, key.DataID, err)
 			},
 		})
-		if err != nil {
+		if cfg == nil {
+			// Only a misconfiguration gets here: an unreachable server still hands
+			// back a client that keeps retrying in the background, which is what
+			// makes the route cache worth anything.
 			log.Fatalf("config client %s: %v", *serverAddr, err)
 		}
+		if err != nil {
+			log.Printf("config centre %s unreachable at startup: %v — retrying in the background%s",
+				*serverAddr, err, cacheHint(*routeCache))
+		} else {
+			log.Printf("config: connected to %s as %s (its own SDK connection; the %s registry keeps a separate one)",
+				*serverAddr, cfg.ConnectionID(), reg.Name())
+		}
 		defer func() { _ = cfg.Close() }()
-		log.Printf("config: connected to %s as %s (its own SDK connection; the %s registry keeps a separate one)",
-			*serverAddr, cfg.ConnectionID(), reg.Name())
 
-		var applied atomic.Bool
 		key := nacos.ConfigKey{DataID: *routesDataID, Group: *routesGroup}
 		watch := func(c nacos.Config) {
 			specs, err := gateway.ParseRouteSpecs([]byte(c.Content))
@@ -197,18 +226,23 @@ func main() {
 				log.Printf("routes: apply failed: %v — live table untouched", err)
 				return
 			}
-			applied.Store(true)
 			log.Printf("routes: applied %d route(s) from %s/%s (md5 %s)", len(specs), key.Group, key.DataID, c.MD5)
 			for _, r := range gw.Routes() {
 				log.Printf("  %s %s -> %s via %s", r.Method, r.Path, r.FullMethod, r.Service)
 			}
 		}
-		if err := cfg.Watch(context.Background(), key, watch); err != nil {
-			log.Fatalf("watch %s/%s: %v", key.Group, key.DataID, err)
+		if werr := cfg.Watch(context.Background(), key, watch); werr != nil {
+			// The watcher is registered regardless: the supervisor pulls the content
+			// once a connection exists. Fatalling here would undo the cache.
+			log.Printf("watch %s/%s: %v — registered, will pull once the config centre answers%s",
+				key.Group, key.DataID, werr, cacheHint(*routeCache))
 		}
-		if !applied.Load() {
-			log.Printf("no route table yet in %s/%s — the edge answers 404 until one is published",
-				key.Group, key.DataID)
+		// Ask the live table, not the flag: a restore from the cache is a table,
+		// and claiming "answers 404" after one was installed would send an operator
+		// looking for a problem that does not exist.
+		if len(gw.Routes()) == 0 {
+			log.Printf("no route table installed (config %s/%s) — the edge answers 404 until one arrives%s",
+				key.Group, key.DataID, cacheHint(*routeCache))
 		}
 
 	default:
@@ -235,4 +269,14 @@ func main() {
 		log.Printf("shutdown: %v", err)
 	}
 	log.Printf("stopped: %d route(s) served through the %s registry", len(gw.Routes()), reg.Name())
+}
+
+// cacheHint points an operator at the switch that decides whether "no table yet"
+// is survivable, so they learn about -route-cache from a log line during an
+// outage instead of from the source afterwards.
+func cacheHint(routeCache string) string {
+	if routeCache != "" {
+		return ""
+	}
+	return " — pass -route-cache to serve the last accepted table through a config-centre outage"
 }

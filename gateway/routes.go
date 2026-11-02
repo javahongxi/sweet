@@ -169,5 +169,7 @@ func (g *Gateway) ApplyRoutes(specs []RouteSpec) error {
 	g.byPath = byPath
 	g.routes = routes
 	g.mu.Unlock()
+	// Only after the swap: the cache must never hold a table this gateway refused.
+	g.cacheRoutes(specs)
 	return nil
 }

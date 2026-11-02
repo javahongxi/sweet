@@ -118,6 +118,23 @@ type Options struct {
 	// data, the types stay compiled.
 	Services map[string]ServiceTypes
 
+	// RouteCacheFile, when set, keeps every table accepted by ApplyRoutes on disk
+	// so RestoreRoutes can serve something when the config centre is unreachable
+	// at cold start. Empty (the default) means no disk I/O at all — the same
+	// switch discipline as registry/nacos' snapshot directory, on the reasoning
+	// that a table whose age nobody asked for is a liability.
+	RouteCacheFile string
+
+	// RouteCacheSource is written inside the cache file and checked on read, so a
+	// cache copied from another gateway (or pointed at another dataId) is refused
+	// instead of silently served. Typical value: "DEFAULT_GROUP/<dataId>".
+	RouteCacheSource string
+
+	// OnRouteCache receives cache write errors. The swap has already happened at
+	// that point, so the failure is not returned to the caller of ApplyRoutes —
+	// silently swallowing it would be worse.
+	OnRouteCache func(error)
+
 	// DialOptions are applied to every connection the gateway opens.
 	//
 	// There is no default here on purpose. A public-facing HTTP edge that

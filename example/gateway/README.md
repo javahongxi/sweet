@@ -29,7 +29,8 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 `-endpoints`（只在 `direct` 时用）、`-service`（注册中心里的查找名）、`-timeout`（调用方没给
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
 `-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
-`-routes.dataId`、`-routes.group`、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant）。
+`-routes.dataId`、`-routes.group`、`-route-cache`（把最后一次被接受的路由表留在盘上，
+冷启动时兜底；默认空 = 不碰磁盘）、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant）。
 
 `direct` 那一档是给你只想验线格式、不掺进发现时用的：
 
@@ -110,6 +111,36 @@ $ curl -s -o /dev/null -w '%{http_code}\n' localhost:20112/v1/greeter/greet-stre
 - **空表被拒**。删掉配置和"不路由任何请求"是两种意图，让边缘因为一个 dataId 被删而全 404 是更贵
   的那种错。要真清空，Go 侧改默认值，别指望配置。
 
+### 配置中心不可达时冷启动（`-route-cache`）
+
+`-routes=nacos` 让网关的启动多了一个依赖：配置中心。默认行为是"拿不到表就一条都不路由"，
+所以 `-route-cache <文件>` 把最后一次**被接受的**表留在盘上，冷启动先装它，live 表到了再覆盖：
+
+```
+go run ./example/gateway -routes=nacos -route-cache "$HOME/.cache/sweet/gateway-routes.json"
+```
+
+默认空 = 完全不碰磁盘，与注册中心的快照目录是同一套开关纪律（一份没人问过年龄的表是负担，
+不是福利）。给绝对路径，别让缓存落在当前工作目录里。
+
+实测（2026-11-02 21:35）：网关 #1 连真 Nacos 写出 295 字节缓存后停掉；网关 #2 把 `-server`
+指向无人监听的 19999、后端改用 `-registry=direct` 保住，于是这一发隔离出的正是
+「配置中心不可达、后端活着」：
+
+```
+2026-11-02 21:35:20 route cache: restored 1 route(s) (age 1m0s) from …/routes.cache.json — stale until the config centre answers
+2026-11-02 21:35:20 config centre 127.0.0.1:19999 unreachable at startup: nacos: server check … connection refused — retrying in the background
+2026-11-02 21:35:20 watch DEFAULT_GROUP/sweet-gateway-routes.json: nacos: call ConfigQueryRequest: … connection refused — registered, will pull once the config centre answers
+
+$ curl -s localhost:20116/v1/greeter/greet -d '{"name":"still-cold"}'
+{"message":"Hello, still-cold!"}
+```
+
+三条日志各有分工：第一条说"我在服务一份旧表、旧到什么程度"，第二条说"我还在后台重试"，
+第三条说"订阅已经登记上了，配置中心一活就自动补拉，不用重启"。缓存只在换表成功**之后**才写，
+所以一张被拒的表永远进不了盘——这条由 `TestRouteCacheNotWrittenOnFailedApply` 钉住；其余
+`TestRouteCache*` / `TestRestoreRoutes*` 五条分别钉住回读可用、来源不符拒装、无时间戳与空表拒装、
+表已解析不出时拒装、以及默认关闭时不产生任何磁盘 I/O。
 
 ## 实测：一元（2026-10-30 那一跑，`-timeout 1s`）
 

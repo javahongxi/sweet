@@ -111,13 +111,17 @@ func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 		var req ConfigBatchListenRequest
 		_, _ = unmarshal(in, &req)
 		resp := map[string]any{"resultCode": 200, "success": true, "changedConfigs": []any{}}
-		if s.staleOnListen {
-			changed := make([]any, 0, len(req.ConfigListenContexts))
-			for _, c := range req.ConfigListenContexts {
+		// Faithful to ConfigChangeBatchListenRequestHandler.java:82-88: the server
+		// compares the md5 the client sent with the one it holds and lists the
+		// keys that differ. A stub that always answered "nothing stale" would let
+		// a client that never pulls look perfectly healthy.
+		changed := make([]any, 0, len(req.ConfigListenContexts))
+		for _, c := range req.ConfigListenContexts {
+			if s.staleOnListen || c.MD5 != s.md5 {
 				changed = append(changed, ConfigContext{Group: c.Group, DataID: c.DataID, Tenant: c.Tenant})
 			}
-			resp["changedConfigs"] = changed
 		}
+		resp["changedConfigs"] = changed
 		s.mu.Unlock()
 		return frame("ConfigChangeBatchListenResponse", resp)
 	}
@@ -196,6 +200,15 @@ func startConfigStub(t *testing.T, s *configStub) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	serveConfigStub(t, lis, s)
+	return lis.Addr().String()
+}
+
+// serveConfigStub runs the stub on an already-bound listener, so a test can
+// reserve an address, let a client fail against it, and then make the config
+// centre appear on that same address.
+func serveConfigStub(t *testing.T, lis net.Listener, s *configStub) {
+	t.Helper()
 	srv := grpc.NewServer()
 	srv.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "Request",
@@ -229,7 +242,6 @@ func startConfigStub(t *testing.T, s *configStub) string {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	t.Cleanup(func() { closeQuietly(s.kill) })
-	return lis.Addr().String()
 }
 
 func itoa(n int) string {
@@ -244,7 +256,12 @@ func closeQuietly(ch chan struct{}) {
 
 func waitForCond(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	waitWithin(t, 3*time.Second, what, cond)
+}
+
+func waitWithin(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -479,4 +496,68 @@ func TestConfigClientIsLabelledAsConfig(t *testing.T) {
 	if !strings.Contains(bodies[0], `"abilityTable"`) {
 		t.Errorf("abilityTable must be present or the server never acks: %s", bodies[0])
 	}
+}
+
+// TestConfigClientHealsWhenCentreAppears is the reason NewConfigClient does not
+// fail on an unreachable server. The gateway's route cache is worthless if a
+// cold start against a down config centre kills the process before it can serve
+// from disk, so the client must come up degraded, keep the Watch registration,
+// and deliver content the moment a server exists — without anyone calling Watch
+// again.
+func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve addr: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	c, err := NewConfigClient(ConfigOptions{Addr: addr, ReconnectBackoff: 50 * time.Millisecond})
+	if c == nil {
+		t.Fatalf("no client for an unreachable server: %v", err)
+	}
+	if err == nil {
+		t.Error("the first handshake failure should still be reported, even though the client is usable")
+	}
+	defer func() { _ = c.Close() }()
+	if id := c.ConnectionID(); id != "" {
+		t.Errorf("ConnectionID = %q before any server exists", id)
+	}
+
+	var mu sync.Mutex
+	var got Config
+	key := ConfigKey{DataID: "routes.json", Group: "DEFAULT_GROUP"}
+	if werr := c.Watch(context.Background(), key, func(cfg Config) {
+		mu.Lock()
+		got = cfg
+		mu.Unlock()
+	}); werr == nil {
+		t.Error("Watch should report the failed seed pull while the centre is down")
+	}
+	mu.Lock()
+	if got.Content != "" {
+		mu.Unlock()
+		t.Fatalf("callback fired early with %q while nothing was reachable", got.Content)
+	}
+	mu.Unlock()
+
+	// The config centre appears on the same address. A just-closed loopback port
+	// can take a moment to be reusable, so retry the bind rather than skip it.
+	var bound net.Listener
+	for i := 0; i < 40; i++ {
+		if bound, err = net.Listen("tcp", addr); err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if bound == nil {
+		t.Fatalf("could not rebind %s: %v", addr, err)
+	}
+	serveConfigStub(t, bound, newConfigStub("v9", "md5-v9"))
+
+	waitWithin(t, 20*time.Second, "the client to heal and deliver the content on its own", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return got.Content == "v9" && got.MD5 == "md5-v9"
+	})
 }

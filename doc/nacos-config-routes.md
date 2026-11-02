@@ -57,8 +57,8 @@ dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间
 ```
 
 `service` 是注册中心查找名（与 gRPC 服务名可以不同，jaws 服务就是 `jaws/<FQN>`）；
-消息类型由 `gateway.RegisterService("sweet.example.v1.Greeter", …)` 的表按
-`fullMethod` 解析出来。
+消息类型由 `gateway.Options.Services` 那张表（`map[服务名]ServiceTypes`，键是方法名）
+按 `fullMethod` 解析出来。
 
 ## 关键语义决定
 
@@ -68,6 +68,14 @@ dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间
 - 热更新只换「匹配表」，已建立的 gRPC 连接按查找名继续复用，不因换表而断开。
 - 断连重连后必须用**当前 md5** 重放 batch listen（服务端订阅表按 connectionId 存，
   旧 connectionId 的订阅随断连失效）。
+- **配置中心不可达不得杀死冷启动**：`NewConfigClient` 对首次建连失败只报告不拒绝
+  （返回可用客户端 + 后台重试），`Watch` 也照样登记，种子拉取失败返回的是提示性错误。
+  理由与 `registry/nacos/snapshot.go` 的 `scheduleRecover` 同源——否则下面的缓存永远
+  轮不到出场。
+- **路由缓存**（`Options.RouteCacheFile` + `RestoreRoutes`）：只在成功换表**之后**落盘，
+  所以缓存里永远不会出现被拒的表；读回时校验文件内 `source`、拒装无时间戳 / 空表 /
+  已解析不出的表；默认关闭，与 registry 快照目录同一套开关纪律。启动顺序是先 restore
+  再 watch，live 表到达后覆盖旧的、并把 age 如实打进日志。
 
 ## 验收判据（可当场跑）
 
@@ -85,6 +93,16 @@ dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间
    旧 path 404、新 path 200。
 7. 真机：本地 Nacos 3.2.x 起 example/gateway `-routes=nacos`，**不重启网关**改配置，
    新 path 立刻可调用；输出块取自同一次运行、同一端口。
+8. `TestConfigClientHealsWhenCentreAppears`：先占一个端口再释放，客户端对着"没有服务端"
+   的地址构造成功（`err` 报告首次握手失败但客户端可用）；`Watch` 登记后返回提示性错误、
+   不回调；随后把桩服务端绑到同一地址，断言**没有人再调用 Watch**，内容自己到了。
+9. 缓存五条：`TestRouteCacheRoundTrip`（换进程从盘上装回并可服务）、
+   `TestRouteCacheNotWrittenOnFailedApply`（被拒的表不落盘）、
+   `TestRouteCacheRefusesMismatchedSource` / `...UndatedAndEmpty` /
+   `...TableThatNoLongerResolves`（三种拒装）、`TestRouteCacheDisabledByDefault`、
+   `TestRestoreRoutesWithoutFileIsNotAnError`。
+10. 真机兜底：网关 #1 连真 Nacos 写盘 → 停掉；网关 #2 用 `-server` 指向死端口 +
+    `-registry=direct` 保住后端，断言从缓存装上路由并返回 200，且日志如实报 age。
 
 ## 验收结果（2026-11-02，全部达成）
 
@@ -117,6 +135,33 @@ go test ./...` 亦全绿。测试名与判据一一对应：`TestConfigQueryRoun
 
 补记一条实现约束：Nacos 3.x 的 v1 HTTP 口已移除（`No endpoint POST /nacos/v1/cs/configs`），
 发布走 `/nacos/v3/admin/cs/config`，参数名是 `groupName` 而非 `group`。
+
+8 与 9 在 `go test -race -count=1 ./...` 下全绿。10 真机（同日 21:35，缓存文件 295 字节，
+网关 #2 的 `-server` 指向无人监听的 19999、后端走 `-registry=direct`）：
+
+```
+2026-11-02 21:35:20 route cache: restored 1 route(s) (age 1m0s) from …/routes.cache.json — stale until the config centre answers
+2026-11-02 21:35:20 config centre 127.0.0.1:19999 unreachable at startup: nacos: server check 127.0.0.1:19999: rpc error: code = Unavailable … connection refused — retrying in the background
+2026-11-02 21:35:20 watch DEFAULT_GROUP/sweet-gateway-routes.json: nacos: call ConfigQueryRequest: … connection refused — registered, will pull once the config centre answers
+
+$ curl -s localhost:20116/v1/greeter/greet -d '{"name":"still-cold"}'
+{"message":"Hello, still-cold!"}
+```
+
+## 验收过程中修掉的三处
+
+1. **`NewConfigClient` 原本对着不可达的服务端直接返回 error**，example 会 `log.Fatalf`。
+   那等于"配置中心挂了 → 网关起不来"，缓存写了也白写。改成报告但不拒绝，后台重试，
+   `Watch` 照常登记（判据 8 就是钉这个）。
+2. **桩服务端不忠实**：`ConfigBatchListenRequest` 一律回空 `changedConfigs`，而真服务端
+   是按 `isUptodate(groupKey, md5, …)` 比对后回"哪些过期"
+   （`ConfigChangeBatchListenRequestHandler.java:82-88`）。判据 8 第一次跑不绿就是被这个
+   假桩挡住的——**测不出来不代表没坏，也可能是测量装置自己不对**。
+3. **一句假日志**：从缓存装回 1 条路由之后，最后一行仍说
+   `no route table installed yet … answers 404`，因为那个标记只跟踪 live watch。
+   改成按 `len(gw.Routes())` 判断。上面 21:35 的日志块已是修正后的版本；
+   更早那次（21:02 补跑，判据 7 的表格里）引用的 `no route table yet …` 是修正前的原文。
+
 
 ## 顺手修掉的一个真 bug：Ack 的类名
 

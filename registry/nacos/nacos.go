@@ -20,11 +20,9 @@ package nacos
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -450,12 +448,12 @@ func (r *Registry) consumePushes(c *naming.Conn) {
 			}
 			continue
 		}
-		var note notifyPush
-		if err := json.Unmarshal(push.Body, &note); err != nil {
+		note, err := naming.DecodeNotify(push)
+		if err != nil {
 			r.logf("decode %s: %v", push.Type, err)
 			continue
 		}
-		name := note.serviceName()
+		name := note.ServiceName()
 		if err := c.Ack(push); err != nil { // stop the re-push loop (§8.4)
 			r.logf("ack %s: %v", push.Type, err)
 		}
@@ -464,54 +462,29 @@ func (r *Registry) consumePushes(c *naming.Conn) {
 	}
 }
 
+// client wraps a connection with this registry's identity fields. The naming
+// wire calls live in nacos.NamingClient; what stays here is the registry's own
+// concern — which connection is current, when to persist a snapshot, and how a
+// wire Instance becomes a registry.Instance.
+func (r *Registry) client(c *naming.Conn) *naming.NamingClient {
+	return naming.NewNamingClient(c, r.opts.Namespace, r.opts.GroupName, r.opts.HealthyOnly)
+}
+
 func (r *Registry) register(ctx context.Context, c *naming.Conn, serviceName string, in registry.Instance) error {
-	req := naming.InstanceRequest{
-		Namespace:   r.opts.Namespace,
-		ServiceName: serviceName,
-		GroupName:   r.opts.GroupName,
-		Type:        actionFor(in),
-		Instance:    toWireInstance(in),
-	}
-	t, body, err := c.Unary(ctx, req)
-	if err != nil {
-		return err
-	}
-	var resp naming.Response
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("nacos: %s refused (%d): %s", req.Type, resp.ErrorCode, resp.ErrorMsg)
-	}
-	return nil
+	return r.client(c).RegisterInstance(ctx, serviceName, actionFor(in), toWireInstance(in))
 }
 
 func (r *Registry) subscribe(ctx context.Context, c *naming.Conn, serviceName string, subscribe bool) ([]registry.Instance, error) {
-	t, body, err := c.Unary(ctx, naming.SubscribeServiceRequest{
-		Namespace:   r.opts.Namespace,
-		ServiceName: serviceName,
-		GroupName:   r.opts.GroupName,
-		Subscribe:   subscribe,
-	})
+	info, err := r.client(c).Subscribe(ctx, serviceName, subscribe)
 	if err != nil {
 		return nil, err
-	}
-	if t != naming.TypeSubscribeServiceResponse {
-		return nil, fmt.Errorf("nacos: subscribe answered with type %q", t)
-	}
-	var resp naming.SubscribeServiceResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
 	}
 	if subscribe {
 		// Unsubscribing also answers with a list; only a subscribe is worth
 		// persisting as "what we last knew about this service".
-		r.remember(serviceName, resp.ServiceInfo.Hosts)
+		r.remember(serviceName, info.Hosts)
 	}
-	return toInstances(resp.ServiceInfo.Hosts), nil
+	return toInstances(info.Hosts), nil
 }
 
 // Query is the exported form of query, for tests and for callers that want to
@@ -527,26 +500,11 @@ func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.In
 	if err != nil {
 		return nil, err
 	}
-	t, body, err := c.Unary(ctx, naming.ServiceQueryRequest{
-		Namespace:   r.opts.Namespace,
-		ServiceName: serviceName,
-		GroupName:   r.opts.GroupName,
-		HealthyOnly: r.opts.HealthyOnly,
-	})
+	info, err := r.client(c).Query(ctx, serviceName)
 	if err != nil {
 		return nil, err
 	}
-	if t != "QueryServiceResponse" {
-		return nil, fmt.Errorf("nacos: query answered with type %q", t)
-	}
-	var resp naming.QueryServiceResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("nacos: query refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
-	}
-	return toInstances(resp.ServiceInfo.Hosts), nil
+	return toInstances(info.Hosts), nil
 }
 
 // stillCurrent reports whether c is the connection this registry is now using.
@@ -623,31 +581,6 @@ func (r *Registry) logf(format string, args ...any) {
 	if r.opts.Logger != nil {
 		r.opts.Logger.Printf("sweet/registry/nacos: "+format, args...)
 	}
-}
-
-// notifyPush mirrors NotifySubscriberRequest. Measured on a live 3.2.3 server
-// its JSON is {"headers":{},"requestId":"5","serviceInfo":{...}} — there is no
-// top-level serviceName; identity lives in serviceInfo.name and is qualified
-// ("GROUP@@service" whenever the group is not DEFAULT_GROUP).
-type notifyPush struct {
-	Headers     map[string]string  `json:"headers,omitempty"`
-	RequestID   string             `json:"requestId,omitempty"`
-	Namespace   string             `json:"namespace,omitempty"`
-	ServiceInfo naming.ServiceInfo `json:"serviceInfo"`
-}
-
-func (n notifyPush) serviceName() string {
-	return trimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
-}
-
-func trimGroup(qualified, group string) string {
-	if qualified == "" {
-		return qualified
-	}
-	if group != "" && group != "DEFAULT_GROUP" {
-		return strings.TrimPrefix(qualified, group+"@@")
-	}
-	return strings.TrimPrefix(strings.TrimPrefix(qualified, "DEFAULT_GROUP@@"), "default@@")
 }
 
 func toInstances(hosts []naming.Instance) []registry.Instance {

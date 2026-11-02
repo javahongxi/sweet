@@ -1,5 +1,12 @@
 package nacos
 
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 // Naming wire shapes, verified against nacos @3.2.3 (tag c843da5be):
 //
 //   - api/.../naming/remote/NamingRemoteConstants.java:27,31,33,35 — type and
@@ -95,4 +102,136 @@ type QueryServiceResponse struct {
 type SubscribeServiceResponse struct {
 	Response
 	ServiceInfo ServiceInfo `json:"serviceInfo"`
+}
+
+// NamingClient issues naming-domain calls over one Conn, filling the identity
+// fields every naming request carries — namespace and groupName, per
+// AbstractNamingRequest.java:30-34. It is the naming counterpart of
+// ConfigClient, and it deliberately does *not* own the Conn: the naming
+// connection is rotated by whoever owns it (registry/nacos builds a fresh Conn
+// per reconnect and guards against goroutines outliving it), while the config
+// connection is owned and replayed by its client. Same protocol, different
+// lifecycle owner — moving the lifecycle is a separate step, not a side effect
+// of this one.
+type NamingClient struct {
+	conn        *Conn
+	namespace   string
+	group       string
+	healthyOnly bool
+}
+
+// NewNamingClient wraps a connection with the identity fields this client should
+// put on every request.
+func NewNamingClient(c *Conn, namespace, group string, healthyOnly bool) *NamingClient {
+	return &NamingClient{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
+}
+
+// Conn returns the transport the owner still manages: pushes, acks, epoch.
+func (n *NamingClient) Conn() *Conn { return n.conn }
+
+// RegisterInstance registers or deregisters one instance. action is one of
+// TypeRegisterInstance / TypeDeregisterInstance — the caller decides which,
+// because "deregister first, then register" is a policy of the owner, not of the
+// wire format.
+func (n *NamingClient) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
+	req := InstanceRequest{
+		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group,
+		Type: action, Instance: in,
+	}
+	t, body, err := n.conn.Unary(ctx, req)
+	if err != nil {
+		return err
+	}
+	var resp Response
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("nacos: %s refused (%d): %s", req.Type, resp.ErrorCode, resp.ErrorMsg)
+	}
+	return nil
+}
+
+// Subscribe turns pushes for one service on or off and returns the list the
+// server answered with. Whether to persist that list is the caller's business.
+func (n *NamingClient) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
+	t, body, err := n.conn.Unary(ctx, SubscribeServiceRequest{
+		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, Subscribe: subscribe,
+	})
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	if t != typeSubscribeServiceResponse {
+		return ServiceInfo{}, fmt.Errorf("nacos: subscribe answered with type %q", t)
+	}
+	var resp SubscribeServiceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ServiceInfo{}, err
+	}
+	if !resp.Success {
+		return ServiceInfo{}, fmt.Errorf("nacos: subscribe refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	}
+	return resp.ServiceInfo, nil
+}
+
+// Query asks what the server currently believes is registered, independently of
+// the push path.
+func (n *NamingClient) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
+	t, body, err := n.conn.Unary(ctx, ServiceQueryRequest{
+		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, HealthyOnly: n.healthyOnly,
+	})
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	if t != typeQueryServiceResponse {
+		return ServiceInfo{}, fmt.Errorf("nacos: query answered with type %q", t)
+	}
+	var resp QueryServiceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ServiceInfo{}, err
+	}
+	if !resp.Success {
+		return ServiceInfo{}, fmt.Errorf("nacos: query refused (%d): %s", resp.ErrorCode, resp.ErrorMsg)
+	}
+	return resp.ServiceInfo, nil
+}
+
+// NotifySubscriber mirrors NotifySubscriberRequest. Measured on a live 3.2.3
+// server its JSON is {"headers":{},"requestId":"5","serviceInfo":{...}} — there
+// is no top-level serviceName; identity lives in serviceInfo.name and is
+// qualified ("GROUP@@service" whenever the group is not DEFAULT_GROUP).
+type NotifySubscriber struct {
+	Headers     map[string]string `json:"headers,omitempty"`
+	RequestID   string            `json:"requestId,omitempty"`
+	Namespace   string            `json:"namespace,omitempty"`
+	ServiceInfo ServiceInfo       `json:"serviceInfo"`
+}
+
+// DecodeNotify unpacks a pushed frame. The caller still has to ack it — decoding
+// and acking are separate on purpose, because an owner that drops the frame on
+// an undecodable body may still want to stop the server's re-push loop.
+func DecodeNotify(p Push) (NotifySubscriber, error) {
+	var note NotifySubscriber
+	if err := json.Unmarshal(p.Body, &note); err != nil {
+		return note, fmt.Errorf("nacos: decode %s: %w", p.Type, err)
+	}
+	return note, nil
+}
+
+// ServiceName is the unqualified name the subscriber asked for.
+func (n NotifySubscriber) ServiceName() string {
+	return TrimGroup(n.ServiceInfo.Name, n.ServiceInfo.GroupName)
+}
+
+// TrimGroup strips the "GROUP@@" prefix a qualified Nacos service name carries.
+// Both the DEFAULT_GROUP and the "default" cluster group appear in practice, so
+// both are peeled; anything unqualified passes through untouched.
+func TrimGroup(qualified, group string) string {
+	if qualified == "" {
+		return qualified
+	}
+	if group != "" && group != "DEFAULT_GROUP" {
+		return strings.TrimPrefix(qualified, group+"@@")
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(qualified, "DEFAULT_GROUP@@"), "default@@")
 }

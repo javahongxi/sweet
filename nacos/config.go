@@ -46,6 +46,7 @@ type ConfigClient struct {
 	mu        sync.Mutex
 	watchers  map[configKey]*watcher
 	onError   func(configKey, error)
+	lastErr   error
 	reconnect time.Duration
 }
 
@@ -88,8 +89,17 @@ type ConfigOptions struct {
 	ReconnectBackoff time.Duration
 }
 
-// NewConfigClient dials, handshakes as a config-domain connection and starts
-// the push loop. Close it when done.
+// NewConfigClient dials and handshakes as a config-domain connection, then
+// starts the push loop.
+//
+// An unreachable server is NOT an error here. The gateway's cold start is the
+// whole point of having a route cache, and failing construction would turn
+// "config centre down" into "edge refuses to boot" — the outcome the cache
+// exists to prevent. registry/nacos made the same call for the same reason
+// (see scheduleRecover in registry/nacos/snapshot.go: a cold start against an
+// unreachable server must still heal). Errors from the first handshake and the
+// first Watch are reported to the caller through those calls, and the
+// supervisor keeps retrying in the background.
 func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 	if opts.Addr == "" {
 		return nil, errors.New("nacos: ConfigOptions.Addr required")
@@ -134,23 +144,39 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 	if c.reconnect <= 0 {
 		c.reconnect = time.Second
 	}
-	conn.SetStreamLostHook(func(error) {
-		select {
-		case c.lost <- struct{}{}:
-		default:
-		}
-	})
+	conn.SetStreamLostHook(func(error) { c.signalLost() })
 	setupCtx, cancelSetup := context.WithTimeout(ctx, c.setupBudget())
-	err = conn.Setup(setupCtx, opts.Tenant, labels)
+	setupErr := conn.Setup(setupCtx, opts.Tenant, labels)
 	cancelSetup()
-	if err != nil {
-		conn.Close()
-		cancel()
-		return nil, err
-	}
 	go c.servePushes()
 	go c.supervise(opts.OnError)
+	if setupErr != nil {
+		// Not fatal by design: the supervisor is already retrying, and Watch will
+		// keep the registration for the replay. Returned as an error anyway so a
+		// caller who *wants* fail-fast can bail on it.
+		c.mu.Lock()
+		c.lastErr = setupErr
+		c.mu.Unlock()
+		c.signalLost()
+		return c, setupErr
+	}
 	return c, nil
+}
+
+// signalLost nudges the supervisor without pretending a stream died.
+func (c *ConfigClient) signalLost() {
+	select {
+	case c.lost <- struct{}{}:
+	default:
+	}
+}
+
+// LastErr is the most recent handshake or refresh failure, for a caller that
+// wants to report a degraded start without owning the retry loop.
+func (c *ConfigClient) LastErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastErr
 }
 
 func (c *ConfigClient) setupBudget() time.Duration {
@@ -201,11 +227,16 @@ func (c *ConfigClient) Query(ctx context.Context, key ConfigKey) (Config, error)
 // Watch registers interest in one config. It first pulls the current value and
 // calls fn with it, then keeps calling fn after every server push.
 //
-// If the config does not exist yet, fn is not called — there is nothing to
-// report — but the listen is still registered, so the first publish reaches
-// this watcher. A pull that fails for any other reason is returned and no
-// listen is registered, because silently watching a config we could not read
-// would look like "the config is broken" later.
+// The registration is kept whatever the seed pull does, because a config centre
+// that is unreachable right now is the exact case the caller needs to survive:
+// the supervisor's replay re-listens with an empty md5, the server answers
+// "stale", and the pull that follows delivers the content. Returning early
+// without registering would mean a cold start against a down server never
+// recovers, only restarts do.
+//
+// So the returned error is informational: nil when the seed landed (or the
+// config simply does not exist yet), and the pull failure otherwise — with the
+// watcher still installed.
 func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)) error {
 	if key.Tenant == "" {
 		key.Tenant = c.tenant
@@ -213,11 +244,8 @@ func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)
 	if fn == nil {
 		return errors.New("nacos: Watch needs a callback")
 	}
-	seed, err := c.Query(ctx, key)
-	notFound := errors.As(err, &ErrConfigNotFound{})
-	if err != nil && !notFound {
-		return err
-	}
+	seed, seedErr := c.Query(ctx, key)
+	notFound := errors.As(seedErr, &ErrConfigNotFound{})
 
 	c.mu.Lock()
 	w, existed := c.watchers[key]
@@ -227,21 +255,40 @@ func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)
 	} else {
 		w.fn = fn // re-watching replaces the callback, it does not stack another
 	}
-	if !notFound {
+	if !notFound && seedErr == nil {
 		w.md5 = seed.MD5
 	}
 	c.mu.Unlock()
 
+	if notFound {
+		// Nothing to report yet, but the listen is in: the first publish reaches
+		// this watcher without anyone having to call Watch again.
+		if err := c.listen([]configKey{key}); err != nil {
+			return fmt.Errorf("nacos: watch %s/%s registered but the listen failed: %w", key.Group, key.DataID, err)
+		}
+		return nil
+	}
+	if seedErr != nil {
+		// Registration kept, error surfaced: the supervisor's replay will pull the
+		// content once the connection exists.
+		c.noteErr(seedErr)
+		return seedErr
+	}
 	if err := c.listen([]configKey{key}); err != nil {
 		// The supervisor replays every registration once the stream is back, so
 		// a failed listen here is a degraded-but-recoverable state, not a
 		// reason to refuse the Watch.
+		c.noteErr(err)
 		return fmt.Errorf("nacos: watch %s/%s registered but the listen failed: %w", key.Group, key.DataID, err)
 	}
-	if !notFound {
-		fn(seed)
-	}
+	fn(seed)
 	return nil
+}
+
+func (c *ConfigClient) noteErr(err error) {
+	c.mu.Lock()
+	c.lastErr = err
+	c.mu.Unlock()
 }
 
 // Unwatch drops interest in one config and tells the server so with listen=false
