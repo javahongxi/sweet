@@ -127,19 +127,15 @@ func TestNamingRefusalKeepsServerMessage(t *testing.T) {
 	stub.instanceMessage = "no right to register"
 	addr := startConfigStub(t, stub)
 
-	conn, err := dialConn(addr)
+	n, err := NewNamingClient(NamingOptions{Addr: addr, ReconnectBackoff: 20 * time.Millisecond})
 	if err != nil {
-		t.Fatalf("Dial: %v", err)
+		t.Fatalf("NewNamingClient: %v", err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer func() { _ = n.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := conn.Setup(ctx, "", map[string]string{"source": "sdk", "module": "naming"}); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
 
-	n := newNamingCaller(conn, "", "DEFAULT_GROUP", false)
-	err = n.RegisterInstance(ctx, "sweet.example.v1.Greeter", TypeRegisterInstance,
+	err = n.Register(ctx, "sweet.example.v1.Greeter",
 		Instance{IP: "127.0.0.1", Port: 20001, Weight: 1, Ephemeral: true})
 	if err == nil {
 		t.Fatal("a refused registration must be an error")
@@ -149,6 +145,11 @@ func TestNamingRefusalKeepsServerMessage(t *testing.T) {
 	}
 	if !errors.Is(err, ErrDenied) {
 		t.Errorf("error = %v, want it to wrap ErrDenied", err)
+	}
+	// A refused registration must not become an intent, or the reconnect loop
+	// would knock on a server that already said no.
+	if got := n.Registered(); len(got) != 0 {
+		t.Errorf("Registered() = %v after a refusal, want nothing recorded", got)
 	}
 }
 

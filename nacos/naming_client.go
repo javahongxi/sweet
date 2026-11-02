@@ -2,6 +2,7 @@ package nacos
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,7 +43,6 @@ type NamingClient struct {
 
 	mu            sync.Mutex
 	conn          *sdkConn
-	caller        *namingCaller
 	addr          string
 	generation    int64
 	handshakes    int64
@@ -180,11 +180,11 @@ func (n *NamingClient) WaitReady(ctx context.Context) error {
 // Register publishes one instance and records the intent, so a later reconnect
 // puts it back.
 func (n *NamingClient) Register(ctx context.Context, service string, in Instance) error {
-	caller, err := n.currentCaller()
+	conn, err := n.liveConn()
 	if err != nil {
 		return err
 	}
-	if err := caller.RegisterInstance(ctx, service, TypeRegisterInstance, in); err != nil {
+	if err := n.registerInstance(ctx, conn, service, TypeRegisterInstance, in); err != nil {
 		return err
 	}
 	key := instanceKey(service, in)
@@ -208,8 +208,8 @@ func (n *NamingClient) Deregister(ctx context.Context, service string, in Instan
 	n.mu.Unlock()
 
 	err := error(nil)
-	if caller, cerr := n.currentCaller(); cerr == nil {
-		err = caller.RegisterInstance(ctx, service, TypeDeregisterInstance, in)
+	if conn, cerr := n.liveConn(); cerr == nil {
+		err = n.registerInstance(ctx, conn, service, TypeDeregisterInstance, in)
 	}
 	n.mu.Lock()
 	delete(n.registrations, key)
@@ -232,11 +232,11 @@ func (n *NamingClient) Subscribe(ctx context.Context, service string) (ServiceIn
 	n.subscriptions[service] = &subIntent{service: service, live: true}
 	n.mu.Unlock()
 
-	caller, err := n.currentCaller()
+	conn, err := n.liveConn()
 	if err != nil {
 		return ServiceInfo{}, err
 	}
-	info, err := caller.Subscribe(ctx, service, true)
+	info, err := n.callSubscribe(ctx, conn, service, true)
 	if err != nil {
 		return ServiceInfo{}, err
 	}
@@ -256,21 +256,21 @@ func (n *NamingClient) Unsubscribe(ctx context.Context, service string) error {
 	delete(n.subscriptions, service)
 	n.mu.Unlock()
 
-	caller, err := n.currentCaller()
+	conn, err := n.liveConn()
 	if err != nil {
 		return nil // nothing left registered on a connection we do not have
 	}
-	_, err = caller.Subscribe(ctx, service, false)
+	_, err = n.callSubscribe(ctx, conn, service, false)
 	return err
 }
 
 // Query asks what the server currently believes, without subscribing.
 func (n *NamingClient) Query(ctx context.Context, service string) (ServiceInfo, error) {
-	caller, err := n.currentCaller()
+	conn, err := n.liveConn()
 	if err != nil {
 		return ServiceInfo{}, err
 	}
-	return caller.Query(ctx, service)
+	return n.callQuery(ctx, conn, service)
 }
 
 // Updates carries every instance list the server pushed. It is drained by one
@@ -365,7 +365,7 @@ func (n *NamingClient) Close() error {
 	n.cancel()
 	n.mu.Lock()
 	conn := n.conn
-	n.conn, n.caller, n.addr = nil, nil, ""
+	n.conn, n.addr = nil, ""
 	n.closed = true
 	n.broadcastLocked()
 	n.mu.Unlock()
@@ -377,14 +377,87 @@ func (n *NamingClient) Close() error {
 
 // --- lifecycle internals ---------------------------------------------------
 
-func (n *NamingClient) currentCaller() (*namingCaller, error) {
+// liveConn returns the current connection or an ErrUnavailable naming the list
+// tried and why it last failed. Callers take the connection once and use it for
+// the whole call: the supervisor may publish another one mid-flight, and writing
+// through a retired connection is what the generation guard exists to prevent.
+func (n *NamingClient) liveConn() (*sdkConn, error) {
 	n.mu.Lock()
-	caller, msg := n.caller, n.lastErr
+	c, msg := n.conn, n.lastErr
 	n.mu.Unlock()
-	if caller == nil {
+	if c == nil || !c.Ready() {
 		return nil, fmt.Errorf("%w: no connection to %s (last error: %v)", ErrUnavailable, n.addrs(), msg)
 	}
-	return caller, nil
+	return c, nil
+}
+
+// --- the three naming-domain RPCs ------------------------------------------
+//
+// They fill the identity fields every naming request carries — namespace and
+// groupName, per AbstractNamingRequest.java:30-34 — and do nothing else: no
+// intents, no retry, no lifecycle. That is the rest of NamingClient's job.
+
+// registerInstance sends one InstanceRequest. action is TypeRegisterInstance or
+// TypeDeregisterInstance; which to send is the caller's policy, not the wire
+// format's.
+func (n *NamingClient) registerInstance(ctx context.Context, c *sdkConn, service, action string, in Instance) error {
+	req := InstanceRequest{
+		Namespace: n.opts.Namespace, ServiceName: service, GroupName: n.opts.GroupName,
+		Type: action, Instance: in,
+	}
+	t, body, err := c.Unary(ctx, req)
+	if err != nil {
+		return err
+	}
+	var resp Response
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
+	}
+	return resp.classify("register "+req.Type, service)
+}
+
+// callSubscribe turns pushes on or off and returns the list the server answered
+// with. Whether to remember that list is the caller's business.
+func (n *NamingClient) callSubscribe(ctx context.Context, c *sdkConn, service string, subscribe bool) (ServiceInfo, error) {
+	t, body, err := c.Unary(ctx, SubscribeServiceRequest{
+		Namespace: n.opts.Namespace, ServiceName: service, GroupName: n.opts.GroupName, Subscribe: subscribe,
+	})
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	if t != typeSubscribeServiceResponse {
+		return ServiceInfo{}, fmt.Errorf("nacos: subscribe answered with type %q", t)
+	}
+	var resp SubscribeServiceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ServiceInfo{}, err
+	}
+	if err := resp.classify("subscribe", service); err != nil {
+		return ServiceInfo{}, err
+	}
+	return resp.ServiceInfo, nil
+}
+
+// callQuery asks what the server currently believes, independent of the push path.
+func (n *NamingClient) callQuery(ctx context.Context, c *sdkConn, service string) (ServiceInfo, error) {
+	t, body, err := c.Unary(ctx, ServiceQueryRequest{
+		Namespace: n.opts.Namespace, ServiceName: service, GroupName: n.opts.GroupName,
+		HealthyOnly: n.opts.HealthyOnly,
+	})
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	if t != typeQueryServiceResponse {
+		return ServiceInfo{}, fmt.Errorf("nacos: query answered with type %q", t)
+	}
+	var resp QueryServiceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ServiceInfo{}, err
+	}
+	if err := resp.classify("query", service); err != nil {
+		return ServiceInfo{}, err
+	}
+	return resp.ServiceInfo, nil
 }
 
 func (n *NamingClient) budget() time.Duration {
@@ -481,7 +554,6 @@ func (n *NamingClient) publish(conn *sdkConn, addr string) {
 	n.mu.Lock()
 	old := n.conn
 	n.conn, n.addr = conn, addr
-	n.caller = newNamingCaller(conn, n.opts.Namespace, n.opts.GroupName, n.opts.HealthyOnly)
 	n.generation++
 	gen := n.generation
 	n.handshakes++
@@ -501,7 +573,7 @@ func (n *NamingClient) publish(conn *sdkConn, addr string) {
 // replay re-establishes every live intent on the current connection.
 func (n *NamingClient) replay() error {
 	n.mu.Lock()
-	caller := n.caller
+	conn := n.conn
 	regs := make([]*regIntent, 0, len(n.registrations))
 	for _, rec := range n.registrations {
 		if rec.live {
@@ -515,7 +587,7 @@ func (n *NamingClient) replay() error {
 		}
 	}
 	n.mu.Unlock()
-	if caller == nil {
+	if conn == nil {
 		return errors.New("nacos: no connection to replay onto")
 	}
 
@@ -532,12 +604,12 @@ func (n *NamingClient) replay() error {
 	sort.Strings(subs)
 
 	for _, rec := range regs {
-		if err := caller.RegisterInstance(ctx, rec.service, TypeRegisterInstance, rec.want); err != nil {
+		if err := n.registerInstance(ctx, conn, rec.service, TypeRegisterInstance, rec.want); err != nil {
 			return fmt.Errorf("replay register %s: %w", rec.service, err)
 		}
 	}
 	for _, service := range subs {
-		if _, err := caller.Subscribe(ctx, service, true); err != nil {
+		if _, err := n.callSubscribe(ctx, conn, service, true); err != nil {
 			return fmt.Errorf("replay subscribe %s: %w", service, err)
 		}
 	}
@@ -593,7 +665,7 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 func (n *NamingClient) signalLost() {
 	n.mu.Lock()
 	conn := n.conn
-	n.conn, n.caller, n.addr = nil, nil, ""
+	n.conn, n.addr = nil, ""
 	n.generation++
 	n.broadcastLocked()
 	n.mu.Unlock()

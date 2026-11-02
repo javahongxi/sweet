@@ -4,7 +4,7 @@ package nacos
 //
 //   - api/.../config/remote/request/AbstractConfigRequest.java:30-34 — every
 //     config request carries dataId / group / tenant. Note the asymmetry with
-//     naming: the namespace is "namespace" there (naming.go) and "tenant" here.
+//     naming: the namespace is "namespace" there (naming_types.go) and "tenant" here.
 //   - api/.../config/remote/request/ConfigQueryRequest.java:29 — adds tag.
 //   - api/.../config/remote/request/ConfigBatchListenRequest.java:33-35,90-98 —
 //     listen flag plus a list of ConfigListenContext{group,md5,dataId,tenant}.

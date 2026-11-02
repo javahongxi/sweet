@@ -1,7 +1,6 @@
 package nacos
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -84,6 +83,9 @@ func (SubscribeServiceRequest) typeName() string { return typeSubscribeServiceRe
 
 // Response — the shared base of every Nacos response — lives in errors.go,
 // because config and naming answer with the same four fields.
+//
+// The naming-domain RPCs are not here: they are private methods on NamingClient
+// (naming_client.go), which owns the connection these calls need.
 
 // QueryServiceResponse wraps the instance list (response class name carries it).
 type QueryServiceResponse struct {
@@ -96,95 +98,6 @@ type QueryServiceResponse struct {
 type SubscribeServiceResponse struct {
 	Response
 	ServiceInfo ServiceInfo `json:"serviceInfo"`
-}
-
-// namingCaller issues naming-domain calls over one sdkConn someone else owns,
-// filling the identity fields every naming request carries — namespace and
-// groupName, per AbstractNamingRequest.java:30-34.
-//
-// It holds no lifecycle: no reconnect, no intents, no serverlist. NamingClient
-// (naming_client.go) is the lifecycle owner and wraps one of these per
-// connection. The split exists because registry/nacos spent several rounds
-// earning its reconnect semantics (deregister-first, stale-consumer guard), and
-// those guarantees had to keep running while the owner moved.
-type namingCaller struct {
-	conn        *sdkConn
-	namespace   string
-	group       string
-	healthyOnly bool
-}
-
-// NewNamingCaller wraps a connection with the identity fields requests should
-// carry.
-func newNamingCaller(c *sdkConn, namespace, group string, healthyOnly bool) *namingCaller {
-	return &namingCaller{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
-}
-
-// sdkConn returns the transport the owner still manages: pushes, acks, epoch.
-func (n *namingCaller) sdkConn() *sdkConn { return n.conn }
-
-// RegisterInstance registers or deregisters one instance. action is one of
-// TypeRegisterInstance / TypeDeregisterInstance — the caller decides which,
-// because "deregister first, then register" is a policy of the owner, not of the
-// wire format.
-func (n *namingCaller) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
-	req := InstanceRequest{
-		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group,
-		Type: action, Instance: in,
-	}
-	t, body, err := n.conn.Unary(ctx, req)
-	if err != nil {
-		return err
-	}
-	var resp Response
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("nacos: %s answered with type %q, undecodable: %w", req.Type, t, err)
-	}
-	return resp.classify("register "+req.Type, serviceName)
-}
-
-// Subscribe turns pushes for one service on or off and returns the list the
-// server answered with. Whether to persist that list is the caller's business.
-func (n *namingCaller) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
-	t, body, err := n.conn.Unary(ctx, SubscribeServiceRequest{
-		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, Subscribe: subscribe,
-	})
-	if err != nil {
-		return ServiceInfo{}, err
-	}
-	if t != typeSubscribeServiceResponse {
-		return ServiceInfo{}, fmt.Errorf("nacos: subscribe answered with type %q", t)
-	}
-	var resp SubscribeServiceResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return ServiceInfo{}, err
-	}
-	if err := resp.classify("subscribe", serviceName); err != nil {
-		return ServiceInfo{}, err
-	}
-	return resp.ServiceInfo, nil
-}
-
-// Query asks what the server currently believes is registered, independently of
-// the push path.
-func (n *namingCaller) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
-	t, body, err := n.conn.Unary(ctx, ServiceQueryRequest{
-		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, HealthyOnly: n.healthyOnly,
-	})
-	if err != nil {
-		return ServiceInfo{}, err
-	}
-	if t != typeQueryServiceResponse {
-		return ServiceInfo{}, fmt.Errorf("nacos: query answered with type %q", t)
-	}
-	var resp QueryServiceResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return ServiceInfo{}, err
-	}
-	if err := resp.classify("query", serviceName); err != nil {
-		return ServiceInfo{}, err
-	}
-	return resp.ServiceInfo, nil
 }
 
 // NotifySubscriber mirrors NotifySubscriberRequest. Measured on a live 3.2.3
