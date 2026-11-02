@@ -128,12 +128,12 @@ go run ./example/gateway -routes=nacos -route-cache "$HOME/.cache/sweet/gateway-
 「配置中心不可达、后端活着」：
 
 ```
-2026-11-02 21:35:20 route cache: restored 1 route(s) (age 1m0s) from …/routes.cache.json — stale until the config centre answers
-2026-11-02 21:35:20 config centre 127.0.0.1:19999 unreachable at startup: nacos: server check … connection refused — retrying in the background
-2026-11-02 21:35:20 watch DEFAULT_GROUP/sweet-gateway-routes.json: nacos: call ConfigQueryRequest: … connection refused — registered, will pull once the config centre answers
+2026-11-02 23:53:00 route cache: restored 1 route(s) (age 2h17m4s) from …/routes.cache.json — stale until the config centre answers
+2026-11-02 23:53:03 config: nacos: server unavailable: none of [127.0.0.1:19999] ([127.0.0.1:19999] on cooldown) reachable (last error: nacos: server check 127.0.0.1:19999: … connection refused) — retrying in the background
+2026-11-02 23:53:03 watch DEFAULT_GROUP/sweet-gateway-routes.json: nacos: server unavailable: no connection to [127.0.0.1:19999] … — registered, will pull once the config centre answers
 
-$ curl -s localhost:20116/v1/greeter/greet -d '{"name":"still-cold"}'
-{"message":"Hello, still-cold!"}
+$ curl -s localhost:20120/v1/greeter/greet -d '{"name":"cold"}'
+{"message":"Hello, cold!"}
 ```
 
 三条日志各有分工：第一条说"我在服务一份旧表、旧到什么程度"，第二条说"我还在后台重试"，

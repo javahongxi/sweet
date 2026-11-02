@@ -96,8 +96,10 @@ type Conn struct {
 
 	pushDropped atomic.Int64
 
-	closed   bool
-	closedMu sync.Mutex
+	// closed is atomic because it is read by Ready() under sendMu and written by
+	// Close() with no lock at all: guarding one field with two mutexes guards it
+	// with none. -race found it the moment a supervisor started polling Ready().
+	closed atomic.Bool
 
 	// Access supplies the credential headers merged into Metadata.headers of
 	// every request. Nil means "this deployment needs no credentials".
@@ -343,7 +345,7 @@ func (c *Conn) failStream(err error) {
 		err = errors.New("stream closed")
 	}
 	c.streamErr = err
-	closed := c.closed
+	closed := c.closed.Load()
 	c.sendMu.Unlock()
 
 	c.connectionID.Store("")
@@ -468,7 +470,7 @@ func (c *Conn) Pushes() <-chan Push { return c.pushes }
 
 func (c *Conn) offer(p Push) {
 	c.pushMu.Lock()
-	ready := !c.closed
+	ready := !c.closed.Load()
 	c.pushMu.Unlock()
 	if !ready {
 		return
@@ -675,7 +677,7 @@ func (c *Conn) Ready() bool {
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	return c.stream != nil && !c.closed
+	return c.stream != nil && !c.closed.Load()
 }
 
 // awaitSetup returns the latch for the *current* handshake attempt. Re-handshake
@@ -731,13 +733,9 @@ func (c *Conn) CloseStream() {
 
 // Close tears the connection down. Safe to call more than once.
 func (c *Conn) Close() error {
-	c.closedMu.Lock()
-	if c.closed {
-		c.closedMu.Unlock()
+	if c.closed.Swap(true) {
 		return nil
 	}
-	c.closed = true
-	c.closedMu.Unlock()
 
 	c.pushMu.Lock()
 	close(c.pushes)

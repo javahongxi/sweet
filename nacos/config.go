@@ -33,9 +33,16 @@ import (
 // md5 per (groupKey, connectionId) when listening
 // (ConfigChangeBatchListenRequestHandler.java:80).
 type ConfigClient struct {
-	conn   *Conn
-	tenant string
-	labels map[string]string
+	servers *ServerList
+	opts    ConfigOptions
+
+	conn *Conn // current connection; nil while a reconnect is in flight
+	addr string
+	// generation counts connection swaps; a push consumer stops when the number it
+	// was started with no longer matches.
+	generation int64
+	tenant     string
+	labels     map[string]string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -51,6 +58,11 @@ type ConfigClient struct {
 	lastErr   error
 	reconnect time.Duration
 	attempt   int
+
+	// signal is closed and replaced on every connection state change, so WaitReady
+	// can block without polling and without the polarity trap of a latch that has
+	// to be "un-closed" when a connection drops.
+	signal chan struct{}
 }
 
 type watcher struct {
@@ -64,7 +76,17 @@ type ConfigOptions struct {
 	// Addr is the Nacos gRPC SDK address — main port + 1000 (Constants.java:102,
 	// GrpcSdkServer.java:49-51), i.e. 127.0.0.1:9848 for a server on 8848. The
 	// offset is not applied here: pass the gRPC port, same convention as naming.
+	// Ignored when Servers is set.
 	Addr string
+
+	// Servers is a cluster's worth of SDK addresses. When set it takes precedence
+	// over Addr and enables failover: a node whose handshake fails goes on
+	// cooldown and the next attempt uses another address.
+	//
+	// Failover is connection-level only, matching the official client — an
+	// in-flight request still returns its error to the caller instead of being
+	// replayed elsewhere (RpcClient.java:717-723). See ServerList.
+	Servers []string
 
 	// Tenant is the namespace id, and it is the field config calls "tenant"
 	// (naming calls the same thing "namespace"). Empty means public.
@@ -118,17 +140,73 @@ type ConfigOptions struct {
 // first Watch are reported to the caller through those calls, and the
 // supervisor keeps retrying in the background.
 func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
-	if opts.Addr == "" {
-		return nil, errors.New("nacos: ConfigOptions.Addr required")
+	addrs := opts.Servers
+	if len(addrs) == 0 {
+		if opts.Addr == "" {
+			return nil, errors.New("nacos: ConfigOptions.Addr or Servers required")
+		}
+		addrs = []string{opts.Addr}
 	}
-	conn, err := Dial(opts.Addr)
+	labels := map[string]string{"source": "sdk", "module": "config", "appName": "sweet"}
+	for k, v := range opts.Labels {
+		if k == "module" {
+			return nil, errors.New("nacos: config connection must keep label module=config")
+		}
+		labels[k] = v
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &ConfigClient{
+		servers:   NewServerList(addrs, 0),
+		opts:      opts,
+		tenant:    opts.Tenant,
+		labels:    labels,
+		ctx:       ctx,
+		cancel:    cancel,
+		lost:      make(chan struct{}, 1),
+		watchers:  map[configKey]*watcher{},
+		onError:   opts.OnError,
+		reconnect: opts.ReconnectBackoff,
+		signal:    make(chan struct{}),
+	}
+	if c.reconnect <= 0 {
+		c.reconnect = time.Second
+	}
+	// One attempt inline so a WaitReady immediately after construction has a real
+	// answer. Its failure is recorded, not returned — see the type comment.
+	if err := c.reconnectOnce(ctx); err != nil {
+		c.noteErr(err)
+	}
+	go c.supervise()
+	return c, nil
+}
+
+// budget is the per-attempt handshake allowance.
+func (c *ConfigClient) budget() time.Duration {
+	if t := c.opts.SetupTimeout; t > 0 {
+		return t * 4
+	}
+	return 12 * time.Second
+}
+
+// dialFor builds and handshakes a connection to one address. Every knob is applied
+// here rather than at construction, because the address — and with it the Conn
+// object — can change on any retry.
+func (c *ConfigClient) dialFor(ctx context.Context, addr string) (*Conn, error) {
+	conn, err := Dial(addr)
 	if err != nil {
 		return nil, err
 	}
+	opts := c.opts
 	conn.ProbeFatal = true
 	conn.Access = opts.Access
 	conn.Logger = opts.Logger
-	conn.OnPushDropped = opts.OnPushDropped
+	conn.OnPushDropped = func(p Push) {
+		c.log("push dropped; the value may stay stale until the next change", "type", p.Type)
+		if opts.OnPushDropped != nil {
+			opts.OnPushDropped(p)
+		}
+	}
 	if opts.ServerCheckTimeout > 0 {
 		conn.ServerCheckTimeout = opts.ServerCheckTimeout
 	}
@@ -141,50 +219,156 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 	if opts.CallTimeout > 0 {
 		conn.CallTimeout = opts.CallTimeout
 	}
-
-	labels := map[string]string{"source": "sdk", "module": "config", "appName": "sweet"}
-	for k, v := range opts.Labels {
-		if k == "module" {
-			return nil, errors.New("nacos: config connection must keep label module=config")
-		}
-		labels[k] = v
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	c := &ConfigClient{
-		conn:      conn,
-		tenant:    opts.Tenant,
-		labels:    labels,
-		ctx:       ctx,
-		cancel:    cancel,
-		lost:      make(chan struct{}, 1),
-		watchers:  map[configKey]*watcher{},
-		reconnect: opts.ReconnectBackoff,
-	}
-	if c.reconnect <= 0 {
-		c.reconnect = time.Second
-	}
+	// Installed before Setup so even the first stream loss is caught.
 	conn.SetStreamLostHook(func(error) { c.signalLost() })
-	setupCtx, cancelSetup := context.WithTimeout(ctx, c.setupBudget())
-	setupErr := conn.Setup(setupCtx, opts.Tenant, labels)
-	cancelSetup()
-	go c.servePushes()
-	go c.supervise(opts.OnError)
-	if setupErr != nil {
-		// Not fatal by design: the supervisor is already retrying, and Watch will
-		// keep the registration for the replay. Returned as an error anyway so a
-		// caller who *wants* fail-fast can bail on it.
-		c.mu.Lock()
-		c.lastErr = setupErr
-		c.mu.Unlock()
-		c.signalLost()
-		return c, setupErr
+
+	hctx, cancel := context.WithTimeout(ctx, c.budget())
+	defer cancel()
+	if err := conn.Setup(hctx, c.tenant, c.labels); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
-	return c, nil
+	return conn, nil
 }
 
-// signalLost nudges the supervisor without pretending a stream died.
+// reconnectOnce tries once: the same address while it is still considered healthy,
+// otherwise the next one from the list.
+func (c *ConfigClient) reconnectOnce(ctx context.Context) error {
+	addr := c.servers.Pick()
+	if addr == "" {
+		return errors.New("nacos: no server address to try")
+	}
+	c.mu.Lock()
+	conn, curAddr := c.conn, c.addr
+	c.mu.Unlock()
+
+	// A lost stream is not evidence the node is gone: retry it in place first,
+	// which keeps the warm channel.
+	if conn != nil && curAddr == addr {
+		conn.CloseStream()
+		hctx, cancel := context.WithTimeout(ctx, c.budget())
+		err := conn.Setup(hctx, c.tenant, c.labels)
+		cancel()
+		if err == nil {
+			c.publish(conn, addr)
+			return nil
+		}
+		c.servers.MarkFailed(addr)
+		_ = conn.Close()
+	}
+
+	next, err := c.dialFor(ctx, addr)
+	if err != nil {
+		c.servers.MarkFailed(addr)
+		return err
+	}
+	c.publish(next, addr)
+	return nil
+}
+
+// publish installs a live connection, retires the previous one and starts its push
+// consumer. Two consumers would double-deliver every notify, and a route table
+// applied twice is a duplicate-registration error — hence the generation tag.
+func (c *ConfigClient) publish(conn *Conn, addr string) {
+	c.mu.Lock()
+	old := c.conn
+	c.conn, c.addr = conn, addr
+	c.generation++
+	gen := c.generation
+	c.lastErr = nil
+	c.attempt = 0
+	c.broadcastLocked()
+	c.mu.Unlock()
+
+	c.servers.MarkHealthy(addr)
+	if old != nil && old != conn {
+		_ = old.Close()
+	}
+	c.log("connected", "addr", addr, "connectionId", conn.ConnectionID())
+	go c.consumePushes(conn, gen)
+}
+
+// WaitReady blocks until a handshaked connection exists, ctx ends, or Close is
+// called. The error wraps ErrUnavailable and names the list plus the last failure,
+// so a caller can log *why* it is degraded rather than "it didn't connect".
+func (c *ConfigClient) WaitReady(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		conn, sig, msg := c.conn, c.signal, c.lastErr
+		c.mu.Unlock()
+		if conn != nil && conn.Ready() {
+			return nil
+		}
+		select {
+		case <-sig:
+		case <-ctx.Done():
+			return fmt.Errorf("%w: none of %s reachable (last error: %v)", ErrUnavailable, c.addrs(), msg)
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		}
+	}
+}
+
+// PushDropped counts server pushes discarded because the consumer stalled, across
+// whichever connection is current. Read through the lock on purpose: the field it
+// reports lives on a Conn that the supervisor may replace at any moment.
+func (c *ConfigClient) PushDropped() int64 {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return 0
+	}
+	return conn.PushDropped()
+}
+
+// CurrentAddr is the SDK address in use, "" while a reconnect is in flight.
+func (c *ConfigClient) CurrentAddr() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.addr
+}
+
+// addrs renders the list and who is on cooldown, for error text and logs.
+func (c *ConfigClient) addrs() string {
+	all, bad := c.servers.Addrs()
+	if len(bad) == 0 {
+		return fmt.Sprint(all)
+	}
+	return fmt.Sprintf("%v (%v on cooldown)", all, bad)
+}
+
+// current returns the live connection or an ErrUnavailable that says so.
+func (c *ConfigClient) current() (*Conn, error) {
+	c.mu.Lock()
+	conn, msg := c.conn, c.lastErr
+	c.mu.Unlock()
+	if conn == nil || !conn.Ready() {
+		return nil, fmt.Errorf("%w: no connection to %s (last error: %v)", ErrUnavailable, c.addrs(), msg)
+	}
+	return conn, nil
+}
+
+// broadcastLocked wakes everyone waiting on a connection state change.
+func (c *ConfigClient) broadcastLocked() {
+	close(c.signal)
+	c.signal = make(chan struct{})
+}
+
+// signalLost retires the current connection and nudges the supervisor. The address
+// is not marked failed here: a stream the server ended is retried against the same
+// node first, and only a failed handshake puts it on cooldown.
 func (c *ConfigClient) signalLost() {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn, c.addr = nil, ""
+	c.generation++
+	c.broadcastLocked()
+	c.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
 	select {
 	case c.lost <- struct{}{}:
 	default:
@@ -209,7 +393,18 @@ func (c *ConfigClient) setupBudget() time.Duration {
 // ConnectionID is the id the server gave this config connection; empty while a
 // reconnect is in flight. Exposed because a replay is only meaningful against a
 // fresh connectionId — the server's listen table is keyed by it.
-func (c *ConfigClient) ConnectionID() string { return c.conn.ConnectionID() }
+// ConnectionID is the id the server gave the current connection, "" while a
+// reconnect is in flight. Exposed because a replay is only meaningful against a
+// fresh id — the server's listen table is keyed by it.
+func (c *ConfigClient) ConnectionID() string {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return ""
+	}
+	return conn.ConnectionID()
+}
 
 // Config is one config's content plus the md5 to echo back on the next listen.
 type Config struct {
@@ -227,9 +422,13 @@ func (c *ConfigClient) Query(ctx context.Context, key ConfigKey) (Config, error)
 	if key.Tenant == "" {
 		key.Tenant = c.tenant
 	}
+	conn, err := c.current()
+	if err != nil {
+		return Config{}, err
+	}
 	req := ConfigQueryRequest{DataID: key.DataID, Group: key.Group, Tenant: key.Tenant}
 	var resp ConfigQueryResponse
-	if err := c.conn.Call(ctx, req, &resp); err != nil {
+	if err := conn.Call(ctx, req, &resp); err != nil {
 		return Config{}, err
 	}
 	if err := resp.check("query", key); err != nil {
@@ -327,6 +526,9 @@ func (c *ConfigClient) nextBackoff() time.Duration {
 }
 
 func (c *ConfigClient) noteErr(err error) {
+	if err == nil {
+		return
+	}
 	c.mu.Lock()
 	c.lastErr = err
 	c.mu.Unlock()
@@ -347,11 +549,15 @@ func (c *ConfigClient) Unwatch(ctx context.Context, key ConfigKey) error {
 	if !ok {
 		return nil
 	}
+	conn, err := c.current()
+	if err != nil {
+		return nil // nothing registered on a connection that does not exist
+	}
 	req := ConfigBatchListenRequest{Listen: false, ConfigListenContexts: []ConfigListenContext{
 		{Group: key.Group, DataID: key.DataID, Tenant: key.Tenant, MD5: w.md5},
 	}}
 	var resp ConfigChangeBatchListenResponse
-	return c.conn.Call(ctx, req, &resp)
+	return conn.Call(ctx, req, &resp)
 }
 
 // listen sends a batch listen for the given keys with the md5s we currently
@@ -376,9 +582,13 @@ func (c *ConfigClient) listen(keys []configKey) error {
 		return nil
 	}
 
+	conn, err := c.current()
+	if err != nil {
+		return err
+	}
 	req := ConfigBatchListenRequest{Listen: true, ConfigListenContexts: contexts}
 	var resp ConfigChangeBatchListenResponse
-	if err := c.conn.Call(c.ctx, req, &resp); err != nil {
+	if err := conn.Call(c.ctx, req, &resp); err != nil {
 		return err
 	}
 	if err := resp.check("listen", configKey{}); err != nil {
@@ -387,7 +597,7 @@ func (c *ConfigClient) listen(keys []configKey) error {
 	// The immediate answer is the stale subset: a change that landed between our
 	// query and our listen would otherwise be missed until the next one.
 	for _, changed := range resp.ChangedConfigs {
-		go c.refresh(changed.key(), nil)
+		go c.refresh(changed.key())
 	}
 	return nil
 }
@@ -417,11 +627,12 @@ func (c *ConfigClient) watchedKeys() []configKey {
 // sees an ack, and a duplicate notify for a config we already applied must not
 // call fn twice — a route table applied twice would be rejected as a duplicate
 // registration by the gateway.
-func (c *ConfigClient) refresh(key configKey, onError func(configKey, error)) {
+func (c *ConfigClient) refresh(key configKey) {
 	cfg, err := c.Query(c.ctx, key)
 	if err != nil {
-		if onError != nil {
-			onError(key, err)
+		c.noteErr(err)
+		if c.onError != nil {
+			c.onError(key, err)
 		}
 		return
 	}
@@ -438,95 +649,128 @@ func (c *ConfigClient) refresh(key configKey, onError func(configKey, error)) {
 	fn(cfg)
 	// Re-register with the fresh md5 so the server's per-connection record stops
 	// treating this client as stale (ConfigChangeBatchListenRequestHandler.java:80).
-	if err := c.listen([]configKey{key}); err != nil && onError != nil {
-		onError(key, err)
+	if err := c.listen([]configKey{key}); err != nil && c.onError != nil {
+		c.onError(key, err)
 	}
 }
 
-// servePushes consumes the stream's pushes for the lifetime of the connection.
-// Every pushed ServerRequest is acked — an un-acked push is re-sent forever and
-// eventually gets the connection unregistered.
-func (c *ConfigClient) servePushes() {
+// supervise turns "the connection is gone" into "retry this node, then rotate",
+// until Close. Without it a dropped stream leaves the client holding a
+// registration the server deleted along with the old connectionId.
+func (c *ConfigClient) supervise() {
 	defer func() {
-		if v := recover(); v != nil && c.conn != nil {
-			// A poison frame must not kill the only consumer of pushes; that
-			// would look like "config stopped updating" with a live connection.
-			c.conn.failStream(fmt.Errorf("nacos: config push loop panicked: %v", v))
+		if v := recover(); v != nil {
+			// A dead supervisor means no replay after the next disconnect, which is
+			// worse than a restartable one.
+			c.log("supervisor panicked, restarting it", "err", fmt.Sprint(v))
+			go c.supervise()
 		}
 	}()
-	for push := range c.conn.Pushes() {
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+		if c.connected() {
+			// Idle until the stream goes; the loss signal is the only work to do.
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-c.lost:
+				continue
+			}
+		}
+
+		// Not connected. This branch also covers "the very first handshake failed",
+		// where no stream ever existed to be lost — waiting on the loss signal there
+		// would sleep forever and the client would never heal.
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.nextBackoff()):
+		}
+		if err := c.reconnectOnce(c.ctx); err != nil {
+			c.noteErr(err)
+			c.log("handshake failed", "err", err)
+			continue
+		}
+		// Replay with the md5s we actually hold: the server keyed the previous
+		// connectionId's subscriptions, and those died with it.
+		if err := c.listen(c.watchedKeys()); err != nil {
+			c.log("replay failed", "err", err)
+		}
+	}
+}
+
+// connected reports a live, handshaked connection.
+func (c *ConfigClient) connected() bool {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	return conn != nil && conn.Ready()
+}
+
+// log writes to Options.Logger if one was set.
+func (c *ConfigClient) log(msg string, kv ...any) {
+	if c.opts.Logger == nil {
+		return
+	}
+	c.opts.Logger.Log(c.ctx, slog.LevelDebug, "nacos: config "+msg, kv...)
+}
+
+// consumePushes serves one connection until it is superseded or closed. Every
+// pushed ServerRequest is acked — an un-acked push is re-sent until the server
+// unregisters the connection.
+func (c *ConfigClient) consumePushes(conn *Conn, gen int64) {
+	defer func() {
+		if v := recover(); v != nil {
+			// A poison frame must not kill the only consumer of pushes; that would
+			// look like "config stopped updating" on a live connection. Turning it
+			// into a reconnect is the honest response.
+			c.log("push consumer panicked", "err", fmt.Sprint(v))
+			c.signalLost()
+		}
+	}()
+	for push := range conn.Pushes() {
+		c.mu.Lock()
+		current := c.generation == gen && c.conn == conn
+		c.mu.Unlock()
+		if !current {
+			return
+		}
 		switch push.Type {
 		case TypeConfigChangeNotifyRequest:
 			var note ConfigChangeNotifyRequest
 			if err := decodeBody(push, &note); err != nil {
-				_ = c.conn.Ack(push) // still ack: a malformed push will not fix itself
+				_ = conn.Ack(push) // still ack: a malformed push will not fix itself
 				continue
 			}
-			if err := c.conn.Ack(push); err != nil {
-				continue // stream is going away; supervisor handles it
+			if err := conn.Ack(push); err != nil {
+				c.signalLost()
+				continue
 			}
-			key := ConfigKey{DataID: note.DataID, Group: note.Group, Tenant: note.Tenant}
-			c.refreshWithErrors(key)
+			c.refresh(ConfigKey{DataID: note.DataID, Group: note.Group, Tenant: note.Tenant})
 		default:
-			_ = c.conn.Ack(push) // naming pushes cannot arrive on this connection;
-			// anything else (ClientDetectionRequest, …) still needs the 200 echo.
+			// ClientDetectionRequest and any other ServerRequest expects a Response
+			// carrying its requestId back; naming pushes cannot arrive on this
+			// connection.
+			_ = conn.Ack(push)
 		}
 	}
 }
 
-func (c *ConfigClient) refreshWithErrors(key configKey) {
-	c.mu.Lock()
-	onError := c.onError
-	c.mu.Unlock()
-	c.refresh(key, onError)
-}
-
-// supervise turns "the stream died" into "re-handshake and replay". Without the
-// replay a reconnect would leave the client holding a registration the server
-// dropped with the old connectionId — exactly the silent-death failure mode the
-// naming side already guards against.
-func (c *ConfigClient) supervise(onError func(configKey, error)) {
-	c.mu.Lock()
-	c.onError = onError
-	c.mu.Unlock()
-	defer func() {
-		if v := recover(); v != nil {
-			// Same reasoning as the push loop: a dead supervisor means no replay
-			// after the next disconnect, which is worse than a loud crash.
-			go c.supervise(onError)
-		}
-	}()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-c.lost:
-		}
-		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			case <-time.After(c.nextBackoff()):
-			}
-			c.conn.CloseStream() // resets the setup latch; Setup would otherwise
-			// return against the *previous* handshake
-			ctx, cancel := context.WithTimeout(c.ctx, c.setupBudget())
-			err := c.conn.Setup(ctx, c.tenant, c.labels)
-			cancel()
-			if err == nil {
-				c.attempt = 0
-				break
-			}
-			c.noteErr(err)
-		}
-		_ = c.listen(c.watchedKeys())
-	}
-}
-
-// Close shuts the connection down. Watch callbacks stop with it.
+// Close shuts the connection down. Watch callbacks stop with it, and it is safe
+// to call on a client that never managed to connect — which is the common case
+// for a gateway that booted against a dead config centre and gave up.
 func (c *ConfigClient) Close() error {
 	c.cancel()
-	return c.conn.Close()
+	c.mu.Lock()
+	conn := c.conn
+	c.conn, c.addr = nil, ""
+	c.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
 }
 
 // decodeBody reads a pushed frame's JSON body, which Conn already unwrapped

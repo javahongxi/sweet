@@ -68,18 +68,37 @@ sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据�
 
 ## 本轮状态（2026-11-02）
 
-已落并通过：A 鉴权（`nacos/auth.go` + `Conn` 每请求注入 + 403 作废重取一次）、
-C 错误面（`nacos/errors.go`，两域共用 `Response` 基类）、D 日志注入、E 丢弃可见化、
-F 指数退避 + 抖动。判据 1–7 全绿（`go test -race -count=1 ./...` 六包通过，
-`registry/nacos` 的既有测试一行未改）。
+判据 1–9 全绿（`go test -race -count=1 ./...` 六包通过，重复跑两次无新竞态；
+`registry/nacos` 既有测试一行未改）。已落：
 
-其中判据 6 顺手证实了一处实况：命名域此前解的是 `errorMsg`，而
-`Response.java` 只有 `resultCode/errorCode/message/requestId` 四个 getter 加
-`isSuccess()`，所以**每条命名拒绝的理由都是空的**。
+- A 鉴权（`auth.go` + `Conn` 每请求注入 + 403 作废重取一次）
+- C 错误面（`errors.go`，两域共用 `Response` 基类；顺带证实命名域一直在解
+  `errorMsg` 这个服务端不发的键，所以每条拒绝的原因都是空串）
+- D 日志注入、E 丢弃可见化、F 指数退避 + 抖动
+- G serverlist（`serverlist.go`，连接级；判据 8 真机验过：`Servers=[死地址, 真 9848]`
+  → `WaitReady ok; CurrentAddr=127.0.0.1:9848` 并成功 Query）
+- H 构造形状：`New` 只对非法配置失败，`WaitReady(ctx)` 表达连接状态，
+  `CurrentAddr` / `ConnectionID` / `LastErr` / `PushDropped` 可读
 
-未落，留作本步第二轮：G config 域 serverlist、H `New` 不再"可用但报错"
-（改成 `New` 只对非法配置失败 + `WaitReady(ctx)`）。这两条互相咬住（都动
-ConfigClient 的构造与状态），且判据 8、9、10 依赖它们，本轮不硬凑。
+判据 10（真机开鉴权重跑热更新）**未做**：那要重启他本地这套在跑的 Nacos
+（`/Users/hongxi/ai-infra/nacos/standalone/nacos-3.2.3`），代价大于收益，留给你
+自己方便时做：改 `application.properties` 的 `nacos.core.auth.enabled=true` +
+`nacos.core.auth.server.identity.key/value` + `nacos.core.auth.plugin.nacos.token.secret.key`
+（三者都不能留空，且鉴权开着而客户端不配 `Access` 时应当看到 `ErrDenied`）。
+
+### 顺手修掉的一个既有竞态
+
+`-race` 在 supervisor 开始轮询 `Ready()` 之后立刻抓到：`Conn.closed` 由 `Ready()`
+在 `sendMu` 下读、由 `Close()` 在另一把 `closedMu` 下写——同一字段两把锁等于没锁。
+以前没人轮询所以潜伏着。改成 `atomic.Bool`（`conn.go`）。
+
+### 两条判据的测试写法教训
+
+- 判据 8 第一次不绿，原因不在被测代码而在**桩不忠实**：`ConfigBatchListenRequest`
+  一律回空 `changedConfigs`，真服务端要按 `isUptodate(groupKey, md5, …)` 比对
+  （`ConfigChangeBatchListenRequestHandler.java:82-88`）。测不出来不代表没坏。
+- 另一个是**自己写的测试死锁**：`Watch` 会同步回调一次，回调里放永久阻塞就等于
+  把测试自己卡在 `Watch` 里。改成在 goroutine 里 Watch。
 
 ## 一条环境事实，影响测试写法
 

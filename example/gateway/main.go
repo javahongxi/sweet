@@ -200,20 +200,26 @@ func main() {
 				log.Printf("config %s/%s: %v (keeping the live route table)", key.Group, key.DataID, err)
 			},
 		})
-		if cfg == nil {
-			// Only a misconfiguration gets here: an unreachable server still hands
-			// back a client that keeps retrying in the background, which is what
-			// makes the route cache worth anything.
-			log.Fatalf("config client %s: %v", *serverAddr, err)
-		}
 		if err != nil {
-			log.Printf("config centre %s unreachable at startup: %v — retrying in the background%s",
-				*serverAddr, err, cacheHint(*routeCache))
-		} else {
-			log.Printf("config: connected to %s as %s (its own SDK connection; the %s registry keeps a separate one)",
-				*serverAddr, cfg.ConnectionID(), reg.Name())
+			// Only misconfiguration gets here now: an unreachable server hands back
+			// a client that keeps retrying, which is what makes the route cache worth
+			// anything. Readiness is WaitReady's job, not New's.
+			log.Fatalf("config client: %v", err)
 		}
 		defer func() { _ = cfg.Close() }()
+
+		// A short wait rather than a block: the edge should start serving from the
+		// cache (if there is one) without sitting on a centre that may be down for
+		// minutes.
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		werr := cfg.WaitReady(rctx)
+		rcancel()
+		if werr != nil {
+			log.Printf("config: %v — retrying in the background%s", werr, cacheHint(*routeCache))
+		} else {
+			log.Printf("config: connected to %s as %s (its own SDK connection; the %s registry keeps a separate one)",
+				cfg.CurrentAddr(), cfg.ConnectionID(), reg.Name())
+		}
 
 		key := nacos.ConfigKey{DataID: *routesDataID, Group: *routesGroup}
 		watch := func(c nacos.Config) {

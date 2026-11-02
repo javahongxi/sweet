@@ -3,6 +3,7 @@ package nacos
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -43,6 +44,16 @@ type configStub struct {
 
 	push chan ConfigChangeNotifyRequest
 	kill chan struct{}
+
+	grpcSrv *grpc.Server
+}
+
+// killNow stops the gRPC server behind this stub, so the port starts refusing and
+// a client with somewhere else to go has to move.
+func (s *configStub) killNow() {
+	if s.grpcSrv != nil {
+		s.grpcSrv.Stop()
+	}
 }
 
 func newConfigStub(content, md5 string) *configStub {
@@ -255,7 +266,7 @@ func startConfigStub(t *testing.T, s *configStub) string {
 // serveConfigStub runs the stub on an already-bound listener, so a test can
 // reserve an address, let a client fail against it, and then make the config
 // centre appear on that same address.
-func serveConfigStub(t *testing.T, lis net.Listener, s *configStub) {
+func serveConfigStub(t *testing.T, lis net.Listener, s *configStub) *grpc.Server {
 	t.Helper()
 	srv := grpc.NewServer()
 	srv.RegisterService(&grpc.ServiceDesc{
@@ -287,9 +298,12 @@ func serveConfigStub(t *testing.T, lis net.Listener, s *configStub) {
 			},
 		}},
 	}, s)
+	s.grpcSrv = srv
+	s.grpcSrv = srv
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	t.Cleanup(func() { closeQuietly(s.kill) })
+	return srv
 }
 
 func itoa(n int) string {
@@ -327,6 +341,11 @@ func newTestConfigClient(t *testing.T, addr string) *ConfigClient {
 	})
 	if err != nil {
 		t.Fatalf("NewConfigClient: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
@@ -546,13 +565,10 @@ func TestConfigClientIsLabelledAsConfig(t *testing.T) {
 	}
 }
 
-// TestConfigClientHealsWhenCentreAppears is the reason NewConfigClient does not
-// fail on an unreachable server. The gateway's route cache is worthless if a
-// cold start against a down config centre kills the process before it can serve
-// from disk, so the client must come up degraded, keep the Watch registration,
-// and deliver content the moment a server exists — without anyone calling Watch
-// again.
-func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
+// TestWaitReadyReportsDegraded is criterion 9: New must not fail because a
+// server is unreachable — a gateway with a route cache has to come up anyway —
+// and WaitReady must say so with an error that names the address and the reason.
+func TestWaitReadyReportsDegraded(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve addr: %v", err)
@@ -562,15 +578,42 @@ func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
 
 	c, err := NewConfigClient(ConfigOptions{Addr: addr, ReconnectBackoff: 50 * time.Millisecond})
 	if c == nil {
-		t.Fatalf("no client for an unreachable server: %v", err)
+		t.Fatalf("New must hand back a usable client even with nothing listening: %v", err)
 	}
-	if err == nil {
-		t.Error("the first handshake failure should still be reported, even though the client is usable")
+	if err != nil {
+		t.Fatalf("New must not fail on an unreachable server, got %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	if id := c.ConnectionID(); id != "" {
-		t.Errorf("ConnectionID = %q before any server exists", id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	werr := c.WaitReady(ctx)
+	if !errors.Is(werr, ErrUnavailable) {
+		t.Fatalf("WaitReady err = %v, want it to wrap ErrUnavailable", werr)
 	}
+	if !strings.Contains(werr.Error(), addr) {
+		t.Errorf("WaitReady error should name the address, got %v", werr)
+	}
+	if id := c.ConnectionID(); id != "" {
+		t.Errorf("ConnectionID = %q with no connection", id)
+	}
+}
+
+// TestConfigClientHealsWhenCentreAppears is criterion 8's sibling: after the
+// server appears, the client heals on its own — nobody calls New or Watch again.
+func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve addr: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	c, err := NewConfigClient(ConfigOptions{Addr: addr, ReconnectBackoff: 50 * time.Millisecond})
+	if err != nil || c == nil {
+		t.Fatalf("New: (%v, %v)", c, err)
+	}
+	defer func() { _ = c.Close() }()
 
 	var mu sync.Mutex
 	var got Config
@@ -589,8 +632,6 @@ func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// The config centre appears on the same address. A just-closed loopback port
-	// can take a moment to be reusable, so retry the bind rather than skip it.
 	var bound net.Listener
 	for i := 0; i < 40; i++ {
 		if bound, err = net.Listen("tcp", addr); err == nil {
@@ -608,4 +649,86 @@ func TestConfigClientHealsWhenCentreAppears(t *testing.T) {
 		defer mu.Unlock()
 		return got.Content == "v9" && got.MD5 == "md5-v9"
 	})
+}
+
+// --- serverlist failover (criterion 8) --------------------------------------
+
+// TestConfigServerListRotatesOnFailure: the first address has nothing behind it,
+// so the client must come up on the second without anyone reconfiguring it.
+func TestConfigServerListRotatesOnFailure(t *testing.T) {
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	deadAddr := dead.Addr().String()
+	_ = dead.Close()
+
+	live := newConfigStub("live", "md5-live")
+	liveAddr := startConfigStub(t, live)
+
+	c, err := NewConfigClient(ConfigOptions{
+		Servers:          []string{deadAddr, liveAddr},
+		ReconnectBackoff: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if got := c.CurrentAddr(); got != liveAddr {
+		t.Errorf("CurrentAddr = %q, want the reachable node %q", got, liveAddr)
+	}
+	got, err := c.Query(context.Background(), ConfigKey{DataID: "routes.json", Group: "DEFAULT_GROUP"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if got.Content != "live" {
+		t.Errorf("content = %q, want it served by the second node", got.Content)
+	}
+}
+
+// TestConfigServerListSkipsUnhealthy covers the running case: the node the client
+// is on goes away entirely, so the reconnect must land on the other one instead of
+// retrying a port that now refuses.
+func TestConfigServerListSkipsUnhealthy(t *testing.T) {
+	first := newConfigStub("first", "md5-first")
+	firstAddr := startConfigStub(t, first)
+	second := newConfigStub("second", "md5-second")
+	secondAddr := startConfigStub(t, second)
+
+	c, err := NewConfigClient(ConfigOptions{
+		Servers:          []string{firstAddr, secondAddr},
+		ReconnectBackoff: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if got := c.CurrentAddr(); got != firstAddr {
+		t.Fatalf("CurrentAddr = %q, want the first node in the list", got)
+	}
+
+	// The first node dies: stop its gRPC server so the port starts refusing.
+	first.killNow()
+	waitWithin(t, 20*time.Second, "the client to land on the second node", func() bool {
+		return c.CurrentAddr() == secondAddr
+	})
+	got, err := c.Query(context.Background(), ConfigKey{DataID: "routes.json", Group: "DEFAULT_GROUP"})
+	if err != nil {
+		t.Fatalf("Query after failover: %v", err)
+	}
+	if got.Content != "second" {
+		t.Errorf("content = %q, want it served by the second node", got.Content)
+	}
 }

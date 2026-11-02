@@ -205,7 +205,7 @@ func TestPushDroppedIsReported(t *testing.T) {
 		default:
 			return false
 		}
-		return c.conn.PushDropped() > 0
+		return c.PushDropped() > 0
 	})
 	select {
 	case p := <-dropped:
