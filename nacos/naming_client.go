@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -34,27 +32,17 @@ import (
 //     reconnect racing the caller cannot resurrect an instance that was asked to
 //     go away (注销优先).
 type NamingClient struct {
-	serversList *serverList
-	opts        NamingOptions
+	// lifecycle owns the connection, the reconnect supervisor and the accessors;
+	// embedding it keeps WaitReady / CurrentAddr / ConnectionID / Handshakes /
+	// PushDropped / LastErr as part of this type's API, and shares the mutex so
+	// connection state and intents are never guarded by two different locks.
+	lifecycle
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	lost   chan struct{}
-
-	mu            sync.Mutex
-	conn          *sdkConn
-	addr          string
-	generation    int64
-	handshakes    int64
-	signal        chan struct{}
-	lastErr       error
-	attempt       int
-	reconnect     time.Duration
+	opts          NamingOptions
 	registrations map[string]*regIntent
 	subscriptions map[string]*subIntent
+	updates       chan ServiceInfo
 	closed        bool
-
-	updates chan ServiceInfo
 }
 
 // regIntent is one instance this client wants published.
@@ -136,47 +124,73 @@ func NewNamingClient(opts NamingOptions) (*NamingClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &NamingClient{
-		serversList:   newServerList(addrs, 0),
 		opts:          opts,
-		ctx:           ctx,
-		cancel:        cancel,
-		lost:          make(chan struct{}, 1),
-		signal:        make(chan struct{}),
 		registrations: map[string]*regIntent{},
 		subscriptions: map[string]*subIntent{},
 		updates:       make(chan ServiceInfo, 16),
 	}
-	if opts.ReconnectBackoff > 0 {
-		n.reconnect = opts.ReconnectBackoff
-	} else {
-		n.reconnect = time.Second
+	n.lifecycle = lifecycle{
+		serversList: newServerList(addrs, 0),
+		newConn:     n.dial,
+		onReady:     func(conn *sdkConn, gen int64) { go n.consumePushes(conn, gen) },
+		replay:      n.replay,
+		logFn:       func(msg string, kv ...any) { n.logger().Log(n.ctx, slog.LevelDebug, "nacos: naming "+msg, kv...) },
+		tenantFn:    func() string { return n.opts.Namespace },
+		labelsFn:    func() map[string]string { return n.opts.Labels },
 	}
-	if err := n.reconnectOnce(ctx); err != nil {
-		n.noteErr(err)
-	}
-	go n.supervise()
+	n.lifecycle.setup(n.serversList, ctx, cancel, 0, opts.ReconnectBackoff)
+	n.lifecycle.start()
 	return n, nil
 }
 
-// WaitReady blocks until a handshaked connection exists, ctx ends, or Close runs.
-func (n *NamingClient) WaitReady(ctx context.Context) error {
-	for {
-		n.mu.Lock()
-		conn, sig, msg := n.conn, n.signal, n.lastErr
-		n.mu.Unlock()
-		if conn != nil && conn.Ready() {
-			return nil
-		}
-		select {
-		case <-sig:
-		case <-ctx.Done():
-			return fmt.Errorf("%w: none of %s reachable (last error: %v)", ErrUnavailable, n.addrs(), msg)
-		case <-n.ctx.Done():
-			return n.ctx.Err()
+// dial performs the naming-domain handshake on a fresh address. Every knob comes
+// from this domain's Options, which is why the skeleton cannot own it.
+func (n *NamingClient) dial(ctx context.Context, addr string) (*sdkConn, error) {
+	conn, err := dialConn(addr)
+	if err != nil {
+		return nil, err
+	}
+	opts := n.opts
+	conn.ProbeFatal = true
+	conn.Access = opts.Access
+	conn.Logger = opts.Logger
+	conn.OnPushDropped = func(p Push) {
+		n.log("push dropped; a view may stay stale until the next change", "type", p.Type)
+		if opts.OnPushDropped != nil {
+			opts.OnPushDropped(p)
 		}
 	}
+	if opts.ServerCheckTimeout > 0 {
+		conn.ServerCheckTimeout = opts.ServerCheckTimeout
+	}
+	if opts.SetupTimeout > 0 {
+		conn.SetupTimeout = opts.SetupTimeout
+	}
+	if opts.KeepAlive > 0 {
+		conn.KeepAlive = opts.KeepAlive
+	}
+	if opts.CallTimeout > 0 {
+		conn.CallTimeout = opts.CallTimeout
+	}
+	conn.SetStreamLostHook(func(error) { n.streamLost(conn) })
+
+	hctx, cancel := context.WithTimeout(ctx, n.budget())
+	defer cancel()
+	if err := conn.Setup(hctx, opts.Namespace, opts.Labels); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
+func (n *NamingClient) logger() *slog.Logger {
+	if n.opts.Logger == nil {
+		return noopLogger
+	}
+	return n.opts.Logger
+}
+
+// WaitReady blocks until a handshaked connection exists, ctx ends, or Close runs.
 // Register publishes one instance and records the intent, so a later reconnect
 // puts it back.
 func (n *NamingClient) Register(ctx context.Context, service string, in Instance) error {
@@ -279,15 +293,6 @@ func (n *NamingClient) Query(ctx context.Context, service string) (ServiceInfo, 
 func (n *NamingClient) Updates() <-chan ServiceInfo { return n.updates }
 
 // Handshakes counts completed handshakes. A test that expects a replay must
-// first prove a new handshake happened — otherwise "nothing was replayed" and
-// "nothing was needed" look identical. Distinct from the generation counter,
-// which also moves when a connection is merely retired.
-func (n *NamingClient) Handshakes() int64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.handshakes
-}
-
 // Subscribed lists the services with a live subscription intent. It exists so
 // the snapshot fallback's central claim — "a stale list was handed out *and* the
 // subscription is still going to be re-established" — stays assertable from
@@ -322,75 +327,20 @@ func (n *NamingClient) Registered() []string {
 }
 
 // CurrentAddr is the SDK address in use, "" while a reconnect is in flight.
-func (n *NamingClient) CurrentAddr() string {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.addr
-}
-
-// ConnectionID is the id the server gave the current connection, "" while
-// reconnecting.
-func (n *NamingClient) ConnectionID() string {
-	n.mu.Lock()
-	conn := n.conn
-	n.mu.Unlock()
-	if conn == nil {
-		return ""
-	}
-	return conn.ConnectionID()
-}
-
 // PushDropped counts pushes discarded because Updates() was not drained.
-func (n *NamingClient) PushDropped() int64 {
-	n.mu.Lock()
-	conn := n.conn
-	n.mu.Unlock()
-	if conn == nil {
-		return 0
-	}
-	return conn.PushDropped()
-}
-
-// LastErr is the most recent handshake or replay failure.
-func (n *NamingClient) LastErr() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.lastErr
-}
-
 // Close tears the connection down. It does not deregister — an owner that wants
 // graceful withdrawal calls Deregister first, because a process that dies should
 // not also erase the service it was serving.
 func (n *NamingClient) Close() error {
-	n.cancel()
 	n.mu.Lock()
-	conn := n.conn
-	n.conn, n.addr = nil, ""
 	n.closed = true
-	n.broadcastLocked()
 	n.mu.Unlock()
-	if conn == nil {
-		return nil
-	}
-	return conn.Close()
+	return n.closeConn()
 }
 
 // --- lifecycle internals ---------------------------------------------------
 
 // liveConn returns the current connection or an ErrUnavailable naming the list
-// tried and why it last failed. Callers take the connection once and use it for
-// the whole call: the supervisor may publish another one mid-flight, and writing
-// through a retired connection is what the generation guard exists to prevent.
-func (n *NamingClient) liveConn() (*sdkConn, error) {
-	n.mu.Lock()
-	c, msg := n.conn, n.lastErr
-	n.mu.Unlock()
-	if c == nil || !c.Ready() {
-		return nil, fmt.Errorf("%w: no connection to %s (last error: %v)", ErrUnavailable, n.addrs(), msg)
-	}
-	return c, nil
-}
-
 // --- the three naming-domain RPCs ------------------------------------------
 //
 // They fill the identity fields every naming request carries — namespace and
@@ -460,116 +410,7 @@ func (n *NamingClient) callQuery(ctx context.Context, c *sdkConn, service string
 	return resp.ServiceInfo, nil
 }
 
-func (n *NamingClient) budget() time.Duration {
-	if t := n.opts.SetupTimeout; t > 0 {
-		return t * 4
-	}
-	return 12 * time.Second
-}
-
-func (n *NamingClient) addrs() string {
-	all, bad := n.serversList.Addrs()
-	if len(bad) == 0 {
-		return fmt.Sprint(all)
-	}
-	return fmt.Sprintf("%v (%v on cooldown)", all, bad)
-}
-
 // reconnectOnce tries once: the same address while it is still considered
-// healthy, otherwise the next one from the list.
-func (n *NamingClient) reconnectOnce(ctx context.Context) error {
-	addr := n.serversList.Pick()
-	if addr == "" {
-		return errors.New("nacos: no server address to try")
-	}
-	n.mu.Lock()
-	conn, curAddr := n.conn, n.addr
-	n.mu.Unlock()
-
-	if conn != nil && curAddr == addr {
-		conn.CloseStream()
-		hctx, cancel := context.WithTimeout(ctx, n.budget())
-		err := conn.Setup(hctx, n.opts.Namespace, n.opts.Labels)
-		cancel()
-		if err == nil {
-			n.publish(conn, addr)
-			return nil
-		}
-		n.serversList.MarkFailed(addr)
-		_ = conn.Close()
-	}
-
-	next, err := n.dialFor(ctx, addr)
-	if err != nil {
-		n.serversList.MarkFailed(addr)
-		return err
-	}
-	n.publish(next, addr)
-	return nil
-}
-
-func (n *NamingClient) dialFor(ctx context.Context, addr string) (*sdkConn, error) {
-	conn, err := dialConn(addr)
-	if err != nil {
-		return nil, err
-	}
-	opts := n.opts
-	conn.ProbeFatal = true
-	conn.Access = opts.Access
-	conn.Logger = opts.Logger
-	conn.OnPushDropped = func(p Push) {
-		n.log("push dropped; a view may stay stale until the next change", "type", p.Type)
-		if opts.OnPushDropped != nil {
-			opts.OnPushDropped(p)
-		}
-	}
-	if opts.ServerCheckTimeout > 0 {
-		conn.ServerCheckTimeout = opts.ServerCheckTimeout
-	}
-	if opts.SetupTimeout > 0 {
-		conn.SetupTimeout = opts.SetupTimeout
-	}
-	if opts.KeepAlive > 0 {
-		conn.KeepAlive = opts.KeepAlive
-	}
-	if opts.CallTimeout > 0 {
-		conn.CallTimeout = opts.CallTimeout
-	}
-	conn.SetStreamLostHook(func(error) { n.streamLost(conn) })
-
-	hctx, cancel := context.WithTimeout(ctx, n.budget())
-	defer cancel()
-	if err := conn.Setup(hctx, opts.Namespace, opts.Labels); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-// publish installs a live connection and starts its consumer. The generation tag
-// is what stops a previous connection's consumer from acking or delivering after
-// it was superseded — registry/nacos learned that an untagged consumer logs
-// "ack …: stream not open" forever and can overwrite newer state.
-func (n *NamingClient) publish(conn *sdkConn, addr string) {
-	n.mu.Lock()
-	old := n.conn
-	n.conn, n.addr = conn, addr
-	n.generation++
-	gen := n.generation
-	n.handshakes++
-	n.lastErr = nil
-	n.attempt = 0
-	n.broadcastLocked()
-	n.mu.Unlock()
-
-	n.serversList.MarkHealthy(addr)
-	if old != nil && old != conn {
-		_ = old.Close()
-	}
-	n.log("connected", "addr", addr, "connectionId", conn.ConnectionID())
-	go n.consumePushes(conn, gen)
-}
-
 // replay re-establishes every live intent on the current connection.
 func (n *NamingClient) replay() error {
 	n.mu.Lock()
@@ -669,150 +510,9 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 }
 
 // streamLost retires `dead` and wakes the supervisor — but only when `dead` is
-// still the current connection. A planned switch closes a connection it has
-// already replaced, and honouring that callback would reconnect twice for one
-// event; this is the job GrpcClient's abandon flag does (GrpcClient.java:310-322
-// only switches when the connection is not abandoned).
-//
-// The address is not marked failed here — a stream the server ended is retried in
-// place first.
-func (n *NamingClient) streamLost(dead *sdkConn) {
-	n.mu.Lock()
-	if n.conn != dead {
-		n.mu.Unlock()
-		return
-	}
-	n.conn, n.addr = nil, ""
-	n.generation++
-	n.broadcastLocked()
-	n.mu.Unlock()
-
-	if dead != nil {
-		_ = dead.Close()
-	}
-	select {
-	case n.lost <- struct{}{}:
-	default:
-	}
-}
-
 // --- resetTarget: the hooks handleConnectReset needs ---
 
-func (n *NamingClient) currentConn() (*sdkConn, string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.conn, n.addr
-}
-
 // switchTo moves to a specific address now, which is what ConnectResetRequest
-// asks for. The new connection is published before the old one is closed (publish
-// retires it), so there is never a window with no live connection — the same order
-// RpcClient.java:522-544 keeps.
-func (n *NamingClient) switchTo(ctx context.Context, addr string) error {
-	conn, err := n.dialFor(ctx, addr)
-	if err != nil {
-		return err
-	}
-	n.publish(conn, addr)
-	// Replaying here is not optional. Ephemeral instances live and die with the
-	// connection (harbor-vs-nacos.md §8.5), so arriving on the new node without
-	// re-registering means the service is simply gone for every consumer — and
-	// unlike the supervisor path, nothing else will retry it, because the
-	// connection is healthy.
-	if err := n.replay(); err != nil {
-		n.log("replay after ConnectReset failed; supervisor will retry", "err", err)
-		n.streamLost(conn)
-	}
-	return nil
-}
-
-func (n *NamingClient) backgroundCtx() context.Context { return n.ctx }
-
-func (n *NamingClient) servers() *serverList { return n.serversList }
-
-func (n *NamingClient) supervise() {
-	defer func() {
-		if v := recover(); v != nil {
-			n.log("supervisor panicked, restarting it", "err", fmt.Sprint(v))
-			go n.supervise()
-		}
-	}()
-	for {
-		if n.ctx.Err() != nil {
-			return
-		}
-		if n.connected() {
-			select {
-			case <-n.ctx.Done():
-				return
-			case <-n.lost:
-				continue
-			}
-		}
-		select {
-		case <-n.ctx.Done():
-			return
-		case <-time.After(n.nextBackoff()):
-		}
-		if err := n.reconnectOnce(n.ctx); err != nil {
-			n.noteErr(err)
-			n.log("handshake failed", "err", err)
-			continue
-		}
-		// The whole reason this type exists: without the replay a reconnect leaves
-		// the service empty on the server while this process still believes it is
-		// published.
-		if err := n.replay(); err != nil {
-			n.noteErr(err)
-			n.log("replay failed", "err", err)
-		}
-	}
-}
-
-func (n *NamingClient) connected() bool {
-	n.mu.Lock()
-	conn := n.conn
-	n.mu.Unlock()
-	return conn != nil && conn.Ready()
-}
-
-func (n *NamingClient) nextBackoff() time.Duration {
-	n.mu.Lock()
-	n.attempt++
-	a := n.attempt
-	n.mu.Unlock()
-
-	d := n.reconnect << min(a-1, 5)
-	if d > 30*time.Second {
-		d = 30 * time.Second
-	}
-	if d <= 0 {
-		return n.reconnect
-	}
-	return d + time.Duration(rand.Int64N(int64(d/4)+1))
-}
-
-func (n *NamingClient) noteErr(err error) {
-	if err == nil {
-		return
-	}
-	n.mu.Lock()
-	n.lastErr = err
-	n.mu.Unlock()
-}
-
-func (n *NamingClient) broadcastLocked() {
-	close(n.signal)
-	n.signal = make(chan struct{})
-}
-
-func (n *NamingClient) log(msg string, kv ...any) {
-	if n.opts.Logger == nil {
-		return
-	}
-	n.opts.Logger.Log(n.ctx, slog.LevelDebug, "nacos: naming "+msg, kv...)
-}
-
 // instanceKey identifies one published instance. It mirrors registry/nacos'
 // regKey so the two agree on what "the same registration" means.
 func instanceKey(service string, in Instance) string {

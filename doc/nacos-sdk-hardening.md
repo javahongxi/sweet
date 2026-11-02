@@ -273,9 +273,41 @@ connectionId 重建。测试侧另加六条（`nacos/reset_test.go`）：换节�
 且 requestId 回显、采纳推荐地址、忽略列表外地址、单节点原地重建、未知推送不 ack、以及
 naming 侧注册重放。
 
+### 生命周期骨架已抽取（2026-11-03）
+
+`nacos/lifecycle.go`（452 行）承接两个域共用的部分：连接所有权、`reconnectOnce`、
+`publish`、`supervise`、退避、`streamLost`、`switchTo`、`WaitReady` 与全部状态访问器。
+`config_client.go` 834→521 行，`naming_client.go` 820→520 行。
+
+域间真正不同的三件事做成钩子：`newConn`（各自的 Options 怎么落到连接上）、
+`onReady`（启动谁的推送消费者）、`replay`（重放什么意图）。嵌入而非命名持有，
+于是 `WaitReady`/`CurrentAddr`/`ConnectionID`/`Handshakes`/`PushDropped`/`LastErr`
+仍是两个客户端自己的公开 API。
+
+**抽取过程改强了一条不变式**：`replay` 原先挂在 `supervise` 和 `switchTo` 两个调用方
+身上，而 `start()` 的首次连接不重放——新写的 `TestLifecycleReplaysOncePerConnection`
+直接把这条不对称照出来了。现在 `publish` 自己负责重放，语义变成"被发布的连接必然带着
+意图"；重放失败就 retire 该连接交给 supervisor，而不是留一条服务端一无所知的健康连接。
+调用方忘记重放的可能性被消掉了，这正是抽骨架的意义。
+
+共用测试 5 条（`lifecycle_test.go`，用只握手的 probeStub + 计数钩子）：重试到服务端应答、
+每条连接恰好重放一次且空闲时不再重放、`switchTo` 退役旧连接且握手数只 +1（验证被替换
+连接的 loss 回调不会引发第二次重连）、`WaitReady` 的错误里带地址与冷却状态、退避增长封顶
+加抖动。两个域原有的端到端测试**一行未改**通过，真机 restart drill 复跑
+`calls=177 failures=0`、两轮收敛约 562ms，真机 ConnectReset 复跑
+`04:49:05.969 收到 → 04:49:05.973 新 connectionId`。
+
+### 这一轮自己踩的两处
+
+1. 批量删函数的脚本按"找下一个 `\n}\n`"定界，**单行方法**（`func (n *X) servers() *serverList { … }`）
+   没有独立结尾行，于是一路删到下一个函数，啃掉了 `callSubscribe`/`callQuery`。
+   改成按大括号配对定界，并用"HEAD 函数集合 − 当前集合 − 预期删除集 = 空"做审计。
+   教训：脚本删代码必须事后做集合差核对，不能只看编译通过。
+2. 我以为 Go 禁止在复合字面量里写嵌入结构体的提升字段，准备去"修"一条旧测试——
+   实测（最小复现 + `go build`/`go vet` 均通过）**这个工具链是接受的**。
+   先验证再动手，别拿记忆当规范。
+
 ### 第二步之外还剩什么
 
-判据 1–10 全绿，ConnectReset 已补。可选方向：`nacos/wire` 子包（DTO 彻底分层，发独立
-module 时做）；以及 config/naming 两个客户端仍各自重复一份 supervise/退避/发布骨架
-（约 150 行），值得抽成共用的生命周期类型——这次是把 reset 逻辑写进共用的 `reset.go`
-以避免第三份拷贝，但骨架本身的重复还在。
+判据 1–10 全绿，ConnectReset 已补，骨架已收敛到一处。剩下的可选项只有一个：
+`nacos/wire` 子包（把线级 DTO 彻底分层，发独立 module 时再做）。
