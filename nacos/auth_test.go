@@ -138,7 +138,7 @@ func TestNamingRefusalKeepsServerMessage(t *testing.T) {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	n := NewNamingClient(conn, "", "DEFAULT_GROUP", false)
+	n := NewNamingCaller(conn, "", "DEFAULT_GROUP", false)
 	err = n.RegisterInstance(ctx, "sweet.example.v1.Greeter", TypeRegisterInstance,
 		Instance{IP: "127.0.0.1", Port: 20001, Weight: 1, Ephemeral: true})
 	if err == nil {

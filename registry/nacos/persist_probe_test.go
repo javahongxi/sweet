@@ -48,7 +48,7 @@ func TestIdleRegistrationSurvives(t *testing.T) {
 	for time.Now().Before(deadline) {
 		time.Sleep(15 * time.Second)
 		probes++
-		got, err := reg.query(ctx, service)
+		got, err := reg.Query(ctx, service)
 		if err != nil {
 			t.Fatalf("probe %d: query failed: %v", probes, err)
 		}
@@ -87,7 +87,7 @@ func TestReconnectAfterServerRestart(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
 		time.Sleep(5 * time.Second)
-		if got, err := reg.query(ctx, service); err == nil && len(got) == 1 && got[0].Port == port {
+		if got, err := reg.Query(ctx, service); err == nil && len(got) == 1 && got[0].Port == port {
 			t.Logf("recovered: registration replayed automatically (instances=%v)", got)
 			return
 		}

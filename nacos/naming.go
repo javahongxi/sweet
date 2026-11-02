@@ -98,36 +98,36 @@ type SubscribeServiceResponse struct {
 	ServiceInfo ServiceInfo `json:"serviceInfo"`
 }
 
-// NamingClient issues naming-domain calls over one Conn, filling the identity
-// fields every naming request carries — namespace and groupName, per
-// AbstractNamingRequest.java:30-34. It is the naming counterpart of
-// ConfigClient, and it deliberately does *not* own the Conn: the naming
-// connection is rotated by whoever owns it (registry/nacos builds a fresh Conn
-// per reconnect and guards against goroutines outliving it), while the config
-// connection is owned and replayed by its client. Same protocol, different
-// lifecycle owner — moving the lifecycle is a separate step, not a side effect
-// of this one.
-type NamingClient struct {
+// NamingCaller issues naming-domain calls over one Conn someone else owns,
+// filling the identity fields every naming request carries — namespace and
+// groupName, per AbstractNamingRequest.java:30-34.
+//
+// It holds no lifecycle: no reconnect, no intents, no serverlist. NamingClient
+// (naming_client.go) is the lifecycle owner and wraps one of these per
+// connection. The split exists because registry/nacos spent several rounds
+// earning its reconnect semantics (deregister-first, stale-consumer guard), and
+// those guarantees had to keep running while the owner moved.
+type NamingCaller struct {
 	conn        *Conn
 	namespace   string
 	group       string
 	healthyOnly bool
 }
 
-// NewNamingClient wraps a connection with the identity fields this client should
-// put on every request.
-func NewNamingClient(c *Conn, namespace, group string, healthyOnly bool) *NamingClient {
-	return &NamingClient{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
+// NewNamingCaller wraps a connection with the identity fields requests should
+// carry.
+func NewNamingCaller(c *Conn, namespace, group string, healthyOnly bool) *NamingCaller {
+	return &NamingCaller{conn: c, namespace: namespace, group: group, healthyOnly: healthyOnly}
 }
 
 // Conn returns the transport the owner still manages: pushes, acks, epoch.
-func (n *NamingClient) Conn() *Conn { return n.conn }
+func (n *NamingCaller) Conn() *Conn { return n.conn }
 
 // RegisterInstance registers or deregisters one instance. action is one of
 // TypeRegisterInstance / TypeDeregisterInstance — the caller decides which,
 // because "deregister first, then register" is a policy of the owner, not of the
 // wire format.
-func (n *NamingClient) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
+func (n *NamingCaller) RegisterInstance(ctx context.Context, serviceName, action string, in Instance) error {
 	req := InstanceRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group,
 		Type: action, Instance: in,
@@ -145,7 +145,7 @@ func (n *NamingClient) RegisterInstance(ctx context.Context, serviceName, action
 
 // Subscribe turns pushes for one service on or off and returns the list the
 // server answered with. Whether to persist that list is the caller's business.
-func (n *NamingClient) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
+func (n *NamingCaller) Subscribe(ctx context.Context, serviceName string, subscribe bool) (ServiceInfo, error) {
 	t, body, err := n.conn.Unary(ctx, SubscribeServiceRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, Subscribe: subscribe,
 	})
@@ -167,7 +167,7 @@ func (n *NamingClient) Subscribe(ctx context.Context, serviceName string, subscr
 
 // Query asks what the server currently believes is registered, independently of
 // the push path.
-func (n *NamingClient) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
+func (n *NamingCaller) Query(ctx context.Context, serviceName string) (ServiceInfo, error) {
 	t, body, err := n.conn.Unary(ctx, ServiceQueryRequest{
 		Namespace: n.namespace, ServiceName: serviceName, GroupName: n.group, HealthyOnly: n.healthyOnly,
 	})

@@ -159,11 +159,9 @@ func (r *Registry) serveStaleOnFailure(ctx context.Context, serviceName string, 
 		return fmt.Errorf("nacos: subscribe %s: %w", serviceName, cause)
 	}
 
-	r.mu.Lock()
-	// Kept live on purpose: replay() re-subscribes this service as soon as a
-	// connection exists again, and the fresh list then replaces the stale one.
-	r.subscriptions[serviceName] = &intent{service: serviceName, live: true}
-	r.mu.Unlock()
+	// Nothing to record here: NamingClient.Subscribe keeps the subscription
+	// intent even when the wire call fails, so its reconnect replay re-subscribes
+	// and the fresh list replaces this stale one.
 
 	r.logf("serving %d instance(s) for %s from snapshot (age %s) after: %v; "+
 		"the list is stale, reconnect loop will replace it", len(insts), serviceName, age.Round(time.Second), cause)
@@ -176,20 +174,5 @@ func (r *Registry) serveStaleOnFailure(ctx context.Context, serviceName string, 
 		r.dropWatcher(serviceName, ch)
 		return ctx.Err()
 	}
-	r.scheduleRecover()
 	return nil
-}
-
-// scheduleRecover starts the reconnect loop for a registry that never had a
-// connection at all. onStreamLost only covers the case where one was lost, so a
-// cold start against an unreachable server would otherwise never heal.
-func (r *Registry) scheduleRecover() {
-	r.mu.Lock()
-	if r.closing || r.recovering {
-		r.mu.Unlock()
-		return
-	}
-	r.recovering = true
-	r.mu.Unlock()
-	go r.recover()
 }

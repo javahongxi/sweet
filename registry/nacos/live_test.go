@@ -57,7 +57,7 @@ func TestLiveRegisterQueryDeregister(t *testing.T) {
 		t.Fatalf("Expose: %v", err)
 	}
 
-	got, err := reg.query(ctx, service)
+	got, err := reg.Query(ctx, service)
 	if err != nil {
 		t.Fatalf("query after register: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestLiveRegisterQueryDeregister(t *testing.T) {
 	unreg()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		got, err = reg.query(ctx, service)
+		got, err = reg.Query(ctx, service)
 		if err == nil && len(got) == 0 {
 			return
 		}

@@ -1,21 +1,24 @@
 // Package nacos implements registry.Registry over Nacos' naming protocol with
 // the client protocol written by hand (see the nacos package) — no nacos-sdk-go.
 //
-// Scope is the ephemeral-instance path: register, deregister, subscribe, and
-// pushes, all over gRPC. Nacos 2.x/3.x carries all of that on the gRPC surface,
-// so this package uses no HTTP at all. The protocol lives in the nacos package
-// (imported here as naming); this package is the adapter to registry.Registry
-// plus the reconnect-and-replay owner.
+// This package is now only the adapter: registry.Registry's shape (Expose returns
+// a closure, Watch returns a channel, instances are host/port/metadata), the
+// watcher fan-out, and the disk snapshot fallback. The connection itself —
+// handshake, keepalive, reconnect, failover across a server list, and the
+// intents a reconnect must rebuild — belongs to nacos.NamingClient.
 //
-// Two things this package treats as load-bearing, both learned from the live
-// server rather than from reading the request classes:
+// What that means for the two load-bearing rules this package learned from the
+// live server rather than from reading request classes:
 //
-//   - Ephemeral liveness IS the connection (harbor-vs-nacos.md §8.5): the
-//     server drops every instance of a connection the moment its stream goes
-//     away, and there is no beat to keep it alive. So reconnect + replay is not
-//     an optimisation, it is what keeps a registration existing.
-//   - "注销优先" (§8.6): a deregistration must survive a reconnect. Redo data
-//     therefore records an intent, not just a last-known value.
+//   - Ephemeral liveness IS the connection (harbor-vs-nacos.md §8.5): the server
+//     drops every instance of a connection whose stream goes away, and there is
+//     no beat to keep it alive. Reconnect + replay is not an optimisation, it is
+//     what keeps a registration existing.
+//   - "注销优先" (§8.6): a deregistration must survive a reconnect. The intent is
+//     marked not-live before the request goes out, inside NamingClient.Deregister.
+//
+// Both are now asserted one layer down (nacos/naming_client_test.go); the
+// registry-side tests that used to be their only proof still pass unchanged.
 package nacos
 
 import (
@@ -38,28 +41,35 @@ var _ registry.Registry = (*Registry)(nil)
 // Options configures a Registry.
 type Options struct {
 	// ServerAddr is the SDK gRPC port, i.e. mainPort + 1000 (9848 for 8848).
+	// Ignored when Servers is set.
 	ServerAddr string
+	// Servers enables failover across a cluster; forwarded to NamingClient.
+	Servers []string
 	// Namespace is the tenant. Empty means "public".
 	Namespace string
 	// GroupName defaults to DEFAULT_GROUP.
 	GroupName string
 	// HealthyOnly filters queried instances.
 	HealthyOnly bool
+	// Access supplies credentials for every request. Nil means the server does
+	// not require auth.
+	Access naming.AccessGetter
 	// WatchFilter, when set, receives every instance list this registry
 	// publishes to watchers (initial snapshots and pushes). It exists for the
 	// restart drill: convergence must be observed, not assumed.
 	WatchFilter func(serviceName string, insts []registry.Instance)
-	// ReconnectDelay is the gap between recovery attempts.
+	// ReconnectDelay is the first gap between reconnection attempts; the client
+	// backs off exponentially from it, capped at 30s.
 	ReconnectDelay time.Duration
-	// Logger, if set, receives connection lifecycle events. Recovery that is
-	// invisible is indistinguishable from recovery that never happens.
+	// Logger, if set, receives registry-side events. Recovery that is invisible
+	// is indistinguishable from recovery that never happens.
 	Logger *log.Logger
 	// SnapshotDir, when set, enables the disk snapshot of service lists: every
-	// list the server actually gave us is written there, and a failed cold dial or
-	// failed subscribe may fall back to the last one instead of returning nothing.
-	// Empty — the default — means no file is ever read or written: serving a list
-	// whose age nobody asked for is a liability, not a convenience. See
-	// snapshot.go for the rules that keep a fallback honest.
+	// list the server actually gave us is written there, and a failed subscribe
+	// may fall back to the last one instead of returning nothing. Empty — the
+	// default — means no file is ever read or written: serving a list whose age
+	// nobody asked for is a liability, not a convenience. See snapshot.go for the
+	// rules that keep a fallback honest.
 	SnapshotDir string
 	// OnSnapshotFallback, when set, is called with every list handed out from
 	// disk, together with how old it is. This is the hook a caller uses to
@@ -67,35 +77,27 @@ type Options struct {
 	OnSnapshotFallback func(serviceName string, insts []registry.Instance, age time.Duration)
 }
 
-// intent is the redo record: what the client *wants* to be true, so a
-// reconnect can rebuild server state from intent rather than from whatever the
-// server last acknowledged.
-type intent struct {
-	service string
-	want    registry.Instance
-	// live is false once deregister/unsubscribe ran, so replay skips it and a
-	// finished lifecycle can never resurrect itself.
-	live bool
-}
-
-// Registry is a Nacos-backed registry.
+// Registry is a Nacos-backed registry: an adapter over nacos.NamingClient.
 type Registry struct {
-	opts Options
+	opts   Options
+	client *naming.NamingClient
 
-	mu         sync.Mutex
-	c          *naming.Conn
-	recovering bool
-	closing    bool
-
-	registrations map[string]*intent // "<service>|<host:port>" -> register intent
-	subscriptions map[string]*intent // service -> subscribe intent
-	watchers      map[string][]chan []registry.Instance
+	mu       sync.Mutex
+	watchers map[string][]chan []registry.Instance
+	closing  bool
+	pumpDone chan struct{}
 }
 
-// New validates opts. No connection is opened yet.
+// New validates opts and starts the underlying client, which connects in the
+// background: no call here blocks on the server.
+//
+// One deliberate change from the implementation this replaces: the reconnect loop
+// no longer gives up after 31 attempts. A capped exponential backoff is quiet
+// enough to run forever, and a registry that stops trying after half an hour of
+// Nacos outage is worse than one that keeps knocking.
 func New(opts Options) (*Registry, error) {
-	if opts.ServerAddr == "" {
-		return nil, errors.New("nacos: Options.ServerAddr required")
+	if opts.ServerAddr == "" && len(opts.Servers) == 0 {
+		return nil, errors.New("nacos: Options.ServerAddr or Servers required")
 	}
 	if opts.Namespace == "" {
 		opts.Namespace = "public"
@@ -106,12 +108,30 @@ func New(opts Options) (*Registry, error) {
 	if opts.ReconnectDelay <= 0 {
 		opts.ReconnectDelay = time.Second
 	}
-	return &Registry{
-		opts:          opts,
-		registrations: map[string]*intent{},
-		subscriptions: map[string]*intent{},
-		watchers:      map[string][]chan []registry.Instance{},
-	}, nil
+
+	r := &Registry{
+		opts:     opts,
+		watchers: map[string][]chan []registry.Instance{},
+		pumpDone: make(chan struct{}),
+	}
+	client, err := naming.NewNamingClient(naming.NamingOptions{
+		Addr:             opts.ServerAddr,
+		Servers:          opts.Servers,
+		Namespace:        opts.Namespace,
+		GroupName:        opts.GroupName,
+		HealthyOnly:      opts.HealthyOnly,
+		Access:           opts.Access,
+		ReconnectBackoff: opts.ReconnectDelay,
+		// After a reconnect the next push may never arrive if nothing changes, so
+		// nudge watchers: their next resolver refresh re-queries.
+		OnReplay: r.nudgeAfterReplay,
+	})
+	if err != nil {
+		return nil, err
+	}
+	r.client = client
+	go r.pump()
+	return r, nil
 }
 
 // Name makes this registry answer the "nacos:///<service>" scheme.
@@ -119,39 +139,18 @@ func (r *Registry) Name() string { return "nacos" }
 
 // Expose registers one instance and returns its deregistration.
 func (r *Registry) Expose(ctx context.Context, serviceName string, in registry.Instance) (func(), error) {
-	c, err := r.ensureConn(ctx)
-	if err != nil {
+	wire := toWireInstance(in)
+	if err := r.client.Register(ctx, serviceName, wire); err != nil {
 		return nil, err
 	}
-	key := regKey(serviceName, in)
-	if err := r.register(ctx, c, serviceName, in); err != nil {
-		return nil, err
-	}
-	r.mu.Lock()
-	r.registrations[key] = &intent{service: serviceName, want: in, live: true}
-	r.mu.Unlock()
-
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			r.mu.Lock()
-			rec := r.registrations[key]
-			if rec != nil {
-				rec.live = false // 注销优先: replay must not bring it back
-			}
-			r.mu.Unlock()
-
 			dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if dc, err := r.currentConn(); err == nil {
-				if err := r.register(dctx, dc, serviceName, deregType(in)); err != nil {
-					r.logf("deregister %s: %v", serviceName, err)
-				}
+			if err := r.client.Deregister(dctx, serviceName, wire); err != nil {
+				r.logf("deregister %s: %v", serviceName, err)
 			}
-
-			r.mu.Lock()
-			delete(r.registrations, key)
-			r.mu.Unlock()
 		})
 	}, nil
 }
@@ -159,11 +158,11 @@ func (r *Registry) Expose(ctx context.Context, serviceName string, in registry.I
 // Watch subscribes to a service and returns its current instances, then every
 // change pushed by the server.
 //
-// When the first attempt cannot reach the server, a configured snapshot may be
-// handed out instead — see snapshot.go and Options.SnapshotDir. That path keeps
-// the subscription intent live, so the reconnect loop re-subscribes and the fresh
-// list replaces the stale one; it is not a way to stop paying attention to
-// Nacos.
+// When the subscribe cannot reach the server, a configured snapshot may be handed
+// out instead — see snapshot.go and Options.SnapshotDir. That path keeps the
+// subscription intent (NamingClient.Subscribe records it even when the call
+// fails), so the reconnect re-subscribes and the fresh list replaces the stale
+// one. It is not a way to stop paying attention to Nacos.
 func (r *Registry) Watch(ctx context.Context, serviceName string) (<-chan []registry.Instance, error) {
 	ch := make(chan []registry.Instance, 4)
 	r.mu.Lock()
@@ -172,16 +171,11 @@ func (r *Registry) Watch(ctx context.Context, serviceName string) (<-chan []regi
 	r.mu.Unlock()
 
 	if !first {
-		// Still requires a live connection: handing back a channel that cannot
-		// deliver would turn a dead registry into a silently hanging resolver.
-		if _, err := r.ensureConn(ctx); err != nil {
-			r.dropWatcher(serviceName, ch)
-			return nil, fmt.Errorf("nacos: subscribe %s: %w", serviceName, err)
-		}
+		// Already subscribed server-side; this watcher just joins the fan-out.
 		return ch, nil
 	}
 
-	snapshot, err := r.trySubscribe(ctx, serviceName)
+	info, err := r.client.Subscribe(ctx, serviceName)
 	if err != nil {
 		if r.snapshotEnabled() {
 			if ferr := r.serveStaleOnFailure(ctx, serviceName, ch, err); ferr != nil {
@@ -193,26 +187,13 @@ func (r *Registry) Watch(ctx context.Context, serviceName string) (<-chan []regi
 		return nil, fmt.Errorf("nacos: subscribe %s: %w", serviceName, err)
 	}
 
-	r.mu.Lock()
-	r.subscriptions[serviceName] = &intent{service: serviceName, live: true}
-	r.mu.Unlock()
 	// A subscribe response already carries the current list (§8.4), so no
 	// separate query is needed to seed the view.
 	select {
-	case ch <- snapshot:
+	case ch <- toInstances(info.Hosts):
 	default:
 	}
 	return ch, nil
-}
-
-// trySubscribe connects if needed and subscribes, returning the initial list.
-// Every failure inside it is a reason to consider a snapshot in Watch.
-func (r *Registry) trySubscribe(ctx context.Context, serviceName string) ([]registry.Instance, error) {
-	c, err := r.ensureConn(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return r.subscribe(ctx, c, serviceName, true)
 }
 
 // Unsubscribe stops pushes for a service and forgets its watchers.
@@ -220,31 +201,32 @@ func (r *Registry) Unsubscribe(ctx context.Context, serviceName string) error {
 	r.mu.Lock()
 	chans := r.watchers[serviceName]
 	delete(r.watchers, serviceName)
-	sub := r.subscriptions[serviceName]
-	if sub != nil {
-		sub.live = false
-	}
-	delete(r.subscriptions, serviceName)
 	r.mu.Unlock()
 	for _, ch := range chans {
 		close(ch)
 	}
-	c, err := r.currentConn()
-	if err != nil {
-		return nil // nothing subscribed server-side that we can still reach
-	}
-	_, err = r.subscribe(ctx, c, serviceName, false)
-	return err
+	// Unsubscribe clears the intent before sending, so a reconnect racing this
+	// call will not re-subscribe. A client we cannot reach has nothing left to
+	// unsubscribe anyway, which Unsubscribe reports as success.
+	return r.client.Unsubscribe(ctx, serviceName)
 }
 
-// Close stops recovery and drops the connection. Registrations are left to the
+// Query is a plain ServiceQueryRequest: what the server believes right now,
+// independent of the push path. Tests assert against it.
+func (r *Registry) Query(ctx context.Context, serviceName string) ([]registry.Instance, error) {
+	info, err := r.client.Query(ctx, serviceName)
+	if err != nil {
+		return nil, err
+	}
+	return toInstances(info.Hosts), nil
+}
+
+// Close drops the connection and every watcher. Registrations are left to the
 // server's connection-scoped cleanup: losing the stream removes them, which is
 // the same mechanism that made them exist.
 func (r *Registry) Close() error {
 	r.mu.Lock()
 	r.closing = true
-	c := r.c
-	r.c = nil
 	for name, chans := range r.watchers {
 		for _, ch := range chans {
 			close(ch)
@@ -252,289 +234,38 @@ func (r *Registry) Close() error {
 		delete(r.watchers, name)
 	}
 	r.mu.Unlock()
-	if c != nil {
-		return c.Close()
-	}
-	return nil
+
+	close(r.pumpDone)
+	return r.client.Close()
 }
 
-func (r *Registry) ensureConn(ctx context.Context) (*naming.Conn, error) {
-	r.mu.Lock()
-	c := r.c
-	r.mu.Unlock()
-	if c != nil && c.Ready() {
-		return c, nil
-	}
-	fresh, err := r.dialAndHandshake(ctx)
-	if err != nil {
-		return nil, err
-	}
-	r.mu.Lock()
-	if r.c != nil && r.c.Ready() {
-		old := r.c
-		r.mu.Unlock()
-		_ = fresh.Close()
-		_ = old.Close()
-		return old, nil
-	}
-	if r.closing {
-		r.mu.Unlock()
-		_ = fresh.Close()
-		return nil, errors.New("nacos: registry closed")
-	}
-	r.c = fresh
-	r.mu.Unlock()
-	go r.consumePushes(fresh)
-	return fresh, nil
-}
+// --- the adapter's own concerns: push fan-out, logging, instance conversion ---
 
-// dialAndHandshake opens a Conn, wires recovery, and performs the handshake.
-// The hook must be installed before Setup so a stream that dies immediately is
-// still caught.
-func (r *Registry) dialAndHandshake(ctx context.Context) (*naming.Conn, error) {
-	c, err := naming.Dial(r.opts.ServerAddr)
-	if err != nil {
-		return nil, err
-	}
-	c.SetStreamLostHook(func(cause error) { r.onStreamLost(c, cause) })
-	if err := c.Setup(ctx, r.opts.Namespace, nil); err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("nacos: handshake with %s: %w", r.opts.ServerAddr, err)
-	}
-	return c, nil
-}
-
-// onStreamLost is the redo trigger. Per §8.6 the disconnect itself sends
-// nothing; a scheduled pass replays every intent still marked live.
-func (r *Registry) onStreamLost(dead *naming.Conn, cause error) {
-	r.logf("connection to %s lost (%v); scheduling reconnect", dead.Addr(), cause)
-	dead.CloseStream()
-
-	r.mu.Lock()
-	if r.closing {
-		r.mu.Unlock()
-		return
-	}
-	if r.recovering {
-		r.mu.Unlock()
-		return
-	}
-	if r.c == dead {
-		r.c = nil
-	}
-	r.recovering = true
-	r.mu.Unlock()
-
-	go r.recover()
-}
-
-func (r *Registry) recover() {
-	// Losing the reconnect attempt is survivable; crashing the host process is
-	// not. The next Expose/Watch/query calls ensureConn again and re-dials.
-	defer func() {
-		if v := recover(); v != nil {
-			r.mu.Lock()
-			r.recovering = false
-			r.mu.Unlock()
-			r.logf("panic during reconnect: %v; giving up this round", v)
-		}
-	}()
-	for attempt := 0; ; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		c, err := r.dialAndHandshake(ctx)
-		state := r.connStatus()
-		cancel()
-		if state == connStatusClosed {
+// pump turns the client's push stream into watcher fan-out and snapshots. It is
+// the only place the registry learns about changes.
+func (r *Registry) pump() {
+	for {
+		select {
+		case <-r.pumpDone:
 			return
-		}
-		if err == nil {
-			r.mu.Lock()
-			r.c = c
-			r.recovering = false
-			r.mu.Unlock()
-			go r.consumePushes(c)
-			if err := r.replay(); err != nil {
-				r.logf("replay after reconnect: %v", err)
+		case info, ok := <-r.client.Updates():
+			if !ok {
+				return
 			}
-			return
-		}
-		r.logf("reconnect attempt %d failed: %v", attempt+1, err)
-		r.mu.Lock()
-		closing := r.closing
-		r.mu.Unlock()
-		if closing {
-			return
-		}
-		time.Sleep(r.opts.ReconnectDelay * time.Duration(attempt+1))
-		if attempt > 30 {
-			r.logf("giving up reconnecting to %s after %d attempts", r.opts.ServerAddr, attempt+1)
-			return
+			name := naming.TrimGroup(info.Name, info.GroupName)
+			r.deliver(name, toInstances(info.Hosts), false)
+			r.remember(name, info.Hosts)
 		}
 	}
 }
 
-// replay re-sends every still-live intent. Instances first, then subscriptions:
-// a subscriber of a service we ourselves provide should not observe a moment
-// where we are subscribed to nothing we publish.
-func (r *Registry) replay() error {
-	r.mu.Lock()
-	regs := make([]*intent, 0, len(r.registrations))
-	for _, rec := range r.registrations {
-		if rec.live {
-			regs = append(regs, rec)
-		}
+// nudgeAfterReplay wakes watchers of the services that were re-subscribed after a
+// reconnect. Without it a watcher that missed pushes during the outage keeps its
+// stale list until something unrelated changes.
+func (r *Registry) nudgeAfterReplay(services []string) {
+	for _, s := range services {
+		r.deliver(s, nil, true)
 	}
-	subs := make([]*intent, 0, len(r.subscriptions))
-	for _, rec := range r.subscriptions {
-		if rec.live {
-			subs = append(subs, rec)
-		}
-	}
-	c := r.c
-	r.mu.Unlock()
-	if c == nil {
-		return errors.New("nacos: no connection to replay onto")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	for _, rec := range regs {
-		if err := r.register(ctx, c, rec.service, rec.want); err != nil {
-			return err
-		}
-	}
-	for _, rec := range subs {
-		if _, err := r.subscribe(ctx, c, rec.service, true); err != nil {
-			return err
-		}
-		r.deliver(rec.service, nil, true) // nudge watchers with whatever the server sends next
-	}
-	r.logf("replayed %d registration(s) and %d subscription(s)", len(regs), len(subs))
-	return nil
-}
-
-// consumePushes is the single reader of one connection's pushes. The
-// generation check makes a goroutine belonging to a dead connection stop as soon
-// as its channel closes, instead of racing a newer connection's deliveries.
-func (r *Registry) consumePushes(c *naming.Conn) {
-	// A panic here (decoding a push we did not expect, a nil map from a
-	// malformed payload) is poison on this connection, not a reason to kill the
-	// host process: drop the connection and let the next ensureConn dial a fresh
-	// one, whose replay re-establishes registrations and subscriptions.
-	defer func() {
-		if v := recover(); v != nil {
-			r.logf("panic in push consumer: %v; dropping connection", v)
-			r.mu.Lock()
-			if r.c == c {
-				r.c = nil
-			}
-			r.mu.Unlock()
-			_ = c.Close()
-		}
-	}()
-	for push := range c.Pushes() {
-		// A goroutine belonging to a superseded connection must stop touching
-		// anything: acking on a stream that is already gone was producing
-		// "ack ClientDetectionRequest: nacos: stream not open" in the logs,
-		// and delivering from a stale connection would overwrite newer state.
-		if !r.stillCurrent(c) {
-			return
-		}
-		if push.Type != naming.TypeNotifySubscriberRequest {
-			// Anything else (ConnectResetRequest, ClientDetectionRequest, …) is
-			// a server request that expects an answer: ack it so the server does
-			// not hold the slot and re-push.
-			if err := c.Ack(push); err != nil {
-				r.logf("ack %s: %v", push.Type, err)
-			}
-			continue
-		}
-		note, err := naming.DecodeNotify(push)
-		if err != nil {
-			r.logf("decode %s: %v", push.Type, err)
-			continue
-		}
-		name := note.ServiceName()
-		if err := c.Ack(push); err != nil { // stop the re-push loop (§8.4)
-			r.logf("ack %s: %v", push.Type, err)
-		}
-		r.deliver(name, toInstances(note.ServiceInfo.Hosts), false)
-		r.remember(name, note.ServiceInfo.Hosts)
-	}
-}
-
-// client wraps a connection with this registry's identity fields. The naming
-// wire calls live in nacos.NamingClient; what stays here is the registry's own
-// concern — which connection is current, when to persist a snapshot, and how a
-// wire Instance becomes a registry.Instance.
-func (r *Registry) client(c *naming.Conn) *naming.NamingClient {
-	return naming.NewNamingClient(c, r.opts.Namespace, r.opts.GroupName, r.opts.HealthyOnly)
-}
-
-func (r *Registry) register(ctx context.Context, c *naming.Conn, serviceName string, in registry.Instance) error {
-	return r.client(c).RegisterInstance(ctx, serviceName, actionFor(in), toWireInstance(in))
-}
-
-func (r *Registry) subscribe(ctx context.Context, c *naming.Conn, serviceName string, subscribe bool) ([]registry.Instance, error) {
-	info, err := r.client(c).Subscribe(ctx, serviceName, subscribe)
-	if err != nil {
-		return nil, err
-	}
-	if subscribe {
-		// Unsubscribing also answers with a list; only a subscribe is worth
-		// persisting as "what we last knew about this service".
-		r.remember(serviceName, info.Hosts)
-	}
-	return toInstances(info.Hosts), nil
-}
-
-// Query is the exported form of query, for tests and for callers that want to
-// assert server state independently of the push path.
-func (r *Registry) Query(ctx context.Context, serviceName string) ([]registry.Instance, error) {
-	return r.query(ctx, serviceName)
-}
-
-// query is a plain ServiceQueryRequest; tests use it to assert what the server
-// believes is registered, independently of the push path.
-func (r *Registry) query(ctx context.Context, serviceName string) ([]registry.Instance, error) {
-	c, err := r.currentConn()
-	if err != nil {
-		return nil, err
-	}
-	info, err := r.client(c).Query(ctx, serviceName)
-	if err != nil {
-		return nil, err
-	}
-	return toInstances(info.Hosts), nil
-}
-
-// stillCurrent reports whether c is the connection this registry is now using.
-func (r *Registry) stillCurrent(c *naming.Conn) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.c == c
-}
-
-func (r *Registry) currentConn() (*naming.Conn, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.c == nil || !r.c.Ready() {
-		return nil, errors.New("nacos: not connected")
-	}
-	return r.c, nil
-}
-
-const (
-	connStatusLive = iota
-	connStatusClosed
-)
-
-func (r *Registry) connStatus() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closing {
-		return connStatusClosed
-	}
-	return connStatusLive
 }
 
 func (r *Registry) deliver(serviceName string, insts []registry.Instance, nudge bool) {
@@ -578,9 +309,10 @@ func (r *Registry) dropWatcher(serviceName string, ch chan []registry.Instance) 
 }
 
 func (r *Registry) logf(format string, args ...any) {
-	if r.opts.Logger != nil {
-		r.opts.Logger.Printf("sweet/registry/nacos: "+format, args...)
+	if r.opts.Logger == nil {
+		return
 	}
+	r.opts.Logger.Printf("nacos: "+format, args...)
 }
 
 func toInstances(hosts []naming.Instance) []registry.Instance {
@@ -613,26 +345,4 @@ func toWireInstance(in registry.Instance) naming.Instance {
 		Healthy: true, Enabled: true, Ephemeral: true,
 		ClusterName: "DEFAULT", Metadata: meta,
 	}
-}
-
-const deregMarker = "\x00deregister"
-
-// deregType tags an instance for deregistration by carrying the action in the
-// instance metadata until the request is built; keeps Expose's closure and
-// replay on one code path.
-func deregType(in registry.Instance) registry.Instance {
-	out := registry.Instance{Host: in.Host, Port: in.Port, Weight: in.Weight}
-	out.Metadata = map[string]string{deregMarker: "1"}
-	return out
-}
-
-func actionFor(in registry.Instance) string {
-	if in.Metadata[deregMarker] == "1" {
-		return naming.TypeDeregisterInstance
-	}
-	return naming.TypeRegisterInstance
-}
-
-func regKey(serviceName string, in registry.Instance) string {
-	return serviceName + "|" + in.Host + ":" + fmt.Sprint(in.Port)
 }

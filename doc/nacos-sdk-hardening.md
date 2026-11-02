@@ -107,3 +107,64 @@ sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据�
 **测试应该断言请求形状**——两个 form 字段都送到了、token 被缓存了、403 后重新取了一次。
 这本来也是更该测的东西。
 
+## 第二步（进行中）：naming 的生命周期下沉
+
+顺序是先钉行为再搬代码。**三个既有测试文件各归各位，不硬搬**：
+
+- `nacos/detect_test.go` 留在 Conn 层。它保的是传输层自己的契约——服务端只结束那一条
+  bidi 流时 gRPC 不给任何信号，唯一可靠探测器是没人应答的探针；应答了的探针不能拆连接；
+  真 3.2.3 上一元应答、流上不应答。它用的是 `nextRequestID`/`send` 这类非导出方法，
+  搬到上层就失去落点。
+- `registry/nacos/probe_push_test.go` 是探针不是测试：通篇 `t.Logf`，唯一的 `t.Fatal`
+  是"push channel closed"，服务端推不推、推几次它都不会红。要动它先给它断言。
+- `restart_drill_test.go` 是最外环（真进程 + 真 Nacos + 真 gRPC 调用 + 按 `code+reason`
+  分类失败），保留；端到端收敛性不能被单元测试替代。
+
+新增 `nacos/naming_client.go`（连接所有权 + serverlist + 意图 + 重放 + generation 守卫）
+与六条测试：
+
+| 保证 | 测试 |
+| --- | --- |
+| 重连后重放注册与订阅（临时实例的活性就是那条连接） | `TestNamingClientReplaysAfterReconnect` |
+| 注销优先：意图先置 not-live 再发注销，重连不得复活已撤回的实例 | `TestDeregisterSurvivesAReconnectRace` |
+| 旧连接的消费者不得再 ack 或投递 | `TestStaleConnectionConsumerIsInert` |
+| naming 吃 serverlist，连接级换节点 | `TestNamingClientServerListFailover` |
+| 连接标签必须 `module=naming` | `TestNamingClientLabelsConnectionNaming` |
+| 构造只对非法配置失败，不可达交给 `WaitReady` | `TestNewNamingClientRejectsBadOptions` |
+
+`registry/nacos` 的既有测试一行未改即通过：这一轮只加东西，没动它。
+
+### 这一轮自己踩的两个坑
+
+1. 批量改文件的 python 脚本里写了 `s = ... if cond else None`，`s` 变 `None` 时文件已被
+   `open(p,'w')` 截断，`naming_client_test.go` 直接清零，只能重写。教训：改文件的脚本
+   不要让主变量有条件为空，且动手前先留副本。
+2. `TestStaleConnectionConsumerIsInert` 第一版少一条 ack。不是客户端漏 ack——`SendMsg`
+   只入队，测试在帧还没出去时就 `Kill()` 拆流。改成"先确认第一条 ack 落地再拆流"，
+   顺带补上了原先根本没验的"第一条 ack 存在"。
+
+### registry/nacos 已削成适配器（同日）
+
+删掉它自己的 `ensureConn`/`dialAndHandshake`/`onStreamLost`/`recover`/`replay`/
+`consumePushes`/`stillCurrent`/`currentConn`/`connStatus` 与 `intent`/`deregType`/
+`actionFor`/`regKey`：`registry/nacos/nacos.go` 从 638 行降到 348 行，只剩
+`Options`/`Expose`/`Watch`/`Unsubscribe`/`Query`/`Close` + watcher 扇出 + 实例转换 +
+快照。连接、重连、重放、failover 全在 `nacos/naming_client.go`。
+
+两处语义跟着搬动做了交代：
+
+- `serveStaleOnFailure` 不再自己记订阅意图——`NamingClient.Subscribe` 在**线级调用
+  失败时也保留意图**，重连的 replay 会重新订阅，所以快照兜底之后仍会被新列表替换。
+  这条保证改由 `NamingClient.Subscribed()` 断言（快照测试原来直接读
+  `r.subscriptions`，那是包内私有字段）。
+- 重连不再"试 31 次就放弃"。指数退避封顶 30s 之后足够安静，而一次半小时的 Nacos
+  故障就把注册中心永久打死，比继续敲门更糟。
+
+最外环的 restart drill 在真 Nacos 上重跑通过：`calls=179 failures=0`、
+`state-updates=6`、两轮收敛各约 611ms。这是"生命周期搬家没弄坏收敛性"的读数。
+
+### 第二步还没做
+
+- 收敛导出面（`SetStreamLostHook`/`CloseStream`/`ProbeFatal`/`Unary`/`Call`/`Pushes`/
+  `Ack`/`Epoch`/`TrimGroup`）——现在 registry 已不直接碰 Conn，这一步可以做干净了。
+- 判据 10：真机开鉴权。

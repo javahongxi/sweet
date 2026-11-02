@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -178,10 +179,7 @@ func TestWatchFallsBackToSnapshot(t *testing.T) {
 	if hookAge < 0 || len(hooked) != 1 {
 		t.Fatalf("hook saw age=%v instances=%v", hookAge, hooked)
 	}
-	r.mu.Lock()
-	sub := r.subscriptions[service]
-	r.mu.Unlock()
-	if sub == nil || !sub.live {
+	if !slices.Contains(r.client.Subscribed(), service) {
 		t.Fatal("the subscription intent was not kept live; a recovered connection would never re-subscribe")
 	}
 }
