@@ -205,38 +205,6 @@ func (c *ConfigClient) logger() *slog.Logger {
 	return c.opts.Logger
 }
 
-// budget is the per-attempt handshake allowance.
-
-// dialFor builds and handshakes a connection to one address. Every knob is applied
-// here rather than at construction, because the address — and with it the sdkConn
-
-// reconnectOnce tries once: the same address while it is still considered healthy,
-
-// publish installs a live connection, retires the previous one and starts its push
-// consumer. Two consumers would double-deliver every notify, and a route table
-
-// WaitReady blocks until a handshaked connection exists, ctx ends, or Close is
-// called. The error wraps ErrUnavailable and names the list plus the last failure,
-
-// PushDropped counts server pushes discarded because the consumer stalled, across
-// whichever connection is current. Read through the lock on purpose: the field it
-
-// Handshakes counts completed handshakes. A test that expects a replay must first
-// prove a new handshake happened, otherwise "nothing was replayed" and "nothing
-
-// streamLost retires `dead` and nudges the supervisor, but only when `dead` is
-// still the current connection: a planned switch closes a connection it already
-// replaced, and honouring that callback would reconnect twice for one event (the
-// job GrpcClient's abandon flag does, GrpcClient.java:310-322).
-//
-// The address is not marked failed here — a stream the server ended is retried
-
-// ConnectionID is the id the server gave this config connection; empty while a
-// reconnect is in flight. Exposed because a replay is only meaningful against a
-// fresh connectionId — the server's listen table is keyed by it.
-// ConnectionID is the id the server gave the current connection, "" while a
-// reconnect is in flight. Exposed because a replay is only meaningful against a
-
 // Config is one config's content plus the md5 to echo back on the next listen.
 type Config struct {
 	ConfigKey
@@ -334,9 +302,6 @@ func (c *ConfigClient) Watch(ctx context.Context, key ConfigKey, fn func(Config)
 	fn(seed)
 	return nil
 }
-
-// nextBackoff grows exponentially from ReconnectBackoff, capped at 30s, with up
-// to a quarter of the delay as jitter. A fixed interval makes a fleet retry in
 
 // Unwatch drops interest in one config and tells the server so with listen=false
 // (ConfigChangeBatchListenRequestHandler.java:91 removeListen).
@@ -457,9 +422,6 @@ func (c *ConfigClient) refresh(key configKey) {
 		c.onError(key, err)
 	}
 }
-
-// supervise turns "the connection is gone" into "retry this node, then rotate",
-// until Close. Without it a dropped stream leaves the client holding a
 
 // consumePushes serves one connection until it is superseded or closed. Every
 // pushed ServerRequest is acked — an un-acked push is re-sent until the server

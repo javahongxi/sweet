@@ -190,7 +190,6 @@ func (n *NamingClient) logger() *slog.Logger {
 	return n.opts.Logger
 }
 
-// WaitReady blocks until a handshaked connection exists, ctx ends, or Close runs.
 // Register publishes one instance and records the intent, so a later reconnect
 // puts it back.
 func (n *NamingClient) Register(ctx context.Context, service string, in Instance) error {
@@ -287,12 +286,20 @@ func (n *NamingClient) Query(ctx context.Context, service string) (ServiceInfo, 
 	return n.callQuery(ctx, conn, service)
 }
 
-// Updates carries every instance list the server pushed. It is drained by one
-// consumer; if that consumer stalls the channel fills and drops are counted and
-// reported, because a missed push here means a stale view until the next change.
+// Updates is the one channel every subscribed service's pushed instance lists
+// arrive on — one per client, not one per service. A caller that subscribes more
+// than one service demuxes by ServiceInfo.Name; registry/nacos' watcher fan-out is
+// the in-repo example. Buffered 16, and only one goroutine may drain it.
+//
+// When that consumer stalls the buffer fills and the excess push is dropped with a
+// Debug log line ("update channel full; dropping a push"). Note which counter that
+// does NOT move: PushDropped and Options.OnPushDropped watch the connection's own
+// push buffer, which overflows for a different reason (the consumer blocked, e.g. on
+// an ack), so PushDropped()==0 is not proof nothing was lost. The consumer here never
+// blocks on this buffer, so the ack path keeps running; the cost lands on freshness —
+// a missed list means a stale view until the next change.
 func (n *NamingClient) Updates() <-chan ServiceInfo { return n.updates }
 
-// Handshakes counts completed handshakes. A test that expects a replay must
 // Subscribed lists the services with a live subscription intent. It exists so
 // the snapshot fallback's central claim — "a stale list was handed out *and* the
 // subscription is still going to be re-established" — stays assertable from
@@ -326,8 +333,6 @@ func (n *NamingClient) Registered() []string {
 	return out
 }
 
-// CurrentAddr is the SDK address in use, "" while a reconnect is in flight.
-// PushDropped counts pushes discarded because Updates() was not drained.
 // Close tears the connection down. It does not deregister — an owner that wants
 // graceful withdrawal calls Deregister first, because a process that dies should
 // not also erase the service it was serving.
@@ -410,7 +415,6 @@ func (n *NamingClient) callQuery(ctx context.Context, c *sdkConn, service string
 	return resp.ServiceInfo, nil
 }
 
-// reconnectOnce tries once: the same address while it is still considered
 // replay re-establishes every live intent on the current connection.
 func (n *NamingClient) replay() error {
 	n.mu.Lock()
@@ -502,17 +506,17 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 		select {
 		case n.updates <- info:
 		default:
-			// A stalled consumer must not block the ack path, but it must not be
-			// invisible either: the drop is counted on the sdkConn and logged here.
+			// A stalled consumer must not block the ack path. This drop is NOT the
+			// one PushDropped()/OnPushDropped report — those count overflows of the
+			// connection's own push buffer (see Updates) — so the Debug log is the
+			// only signal that a service list was lost here.
 			n.log("update channel full; dropping a push", "service", info.Name)
 		}
 	}
 }
 
-// streamLost retires `dead` and wakes the supervisor — but only when `dead` is
 // --- resetTarget: the hooks handleConnectReset needs ---
 
-// switchTo moves to a specific address now, which is what ConnectResetRequest
 // instanceKey identifies one published instance. It mirrors registry/nacos'
 // regKey so the two agree on what "the same registration" means.
 func instanceKey(service string, in Instance) string {

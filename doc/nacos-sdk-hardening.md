@@ -1,7 +1,8 @@
 # nacos 包 SDK 化 · 第一步（加固）
 
 目标：让 `nacos/` 从"sweet 内部能用"变成"外人读了也敢用"。**不改定位**——仍是
-sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据先落此文件再动代码。
+sweet 的内部依赖，不拆 module、不发版。2026-11-03 定案：这不是过渡状态，终点就这样，
+所以"敢用"全靠注释与 README 交代，不靠包边界（见文末）。范围收敛与验收判据先落此文件再动代码。
 
 ## 前提纠正（两条，都影响做法）
 
@@ -33,7 +34,8 @@ sweet 的内部依赖，不拆 module、不发版。范围收敛与验收判据�
 
 ## 本步不做
 
-1. 不拆独立 module、不发版、不写 CHANGELOG/semver（那是第二步之后的承诺）。
+1. 不拆独立 module、不发版、不写 CHANGELOG/semver。2026-11-03 定案：这条不是"第二步之后再兑现"，
+   就是不做——所以全文里凡是把某件事推给"发独立 module 时"的说法都作废，见文末那节。
 2. **不收敛导出面**：`SetStreamLostHook`/`CloseStream`/`ProbeFatal`/`Epoch`/`Unary`/`Call`
    仍公开。它们被 `registry/nacos` 的重连环直接用着——收敛就等于把 naming 的生命周期一起搬下来，
    那是第二步的事，混进来会让两批 drill 测试同时暴露。
@@ -184,7 +186,8 @@ registry 不再需要自己剥 `GROUP@@`）。逐个改几十个方法是无收�
 等）。理由：这个包的价值就是"线级契约可读、可逐行对着真服务端断言"，把它们藏进
 窄门面等于扔掉那份证据。改在新建的 `nacos/doc.go` 里划清层次——受支持 API 只有两个
 客户端 + Options + 返回值类型 + 错误 sentinel；DTO 是协议文档，"别建在上面"。
-将来若真发独立 module，正确做法是把 DTO 挪进 `nacos/wire` 子包，两全。
+（这里原本写的是"将来若真发独立 module，把 DTO 挪进 `nacos/wire` 子包，两全"——2026-11-03 定案
+不拆 module、不发版，那条路一起作废，层次只剩注释这一道防线，没有包边界替你挡。）
 
 顺带修掉一处过期注释：`envelope.go` 顶着一句"Package conn implements…"——包名是
 `nacos`，而且早就不只是传输层了。
@@ -277,7 +280,8 @@ naming 侧注册重放。
 
 `nacos/lifecycle.go`（452 行）承接两个域共用的部分：连接所有权、`reconnectOnce`、
 `publish`、`supervise`、退避、`streamLost`、`switchTo`、`WaitReady` 与全部状态访问器。
-`config_client.go` 834→521 行，`naming_client.go` 820→520 行。
+`config_client.go` 834→521 行，`naming_client.go` 820→520 行。同日清掉这次搬动留下的孤儿注释后
+是 483 / 524（naming 那侧略升是因为把 `Updates()` 的通道契约写全了，见文末）。
 
 域间真正不同的三件事做成钩子：`newConn`（各自的 Options 怎么落到连接上）、
 `onReady`（启动谁的推送消费者）、`replay`（重放什么意图）。嵌入而非命名持有，
@@ -309,5 +313,27 @@ naming 侧注册重放。
 
 ### 第二步之外还剩什么
 
-判据 1–10 全绿，ConnectReset 已补，骨架已收敛到一处。剩下的可选项只有一个：
-`nacos/wire` 子包（把线级 DTO 彻底分层，发独立 module 时再做）。
+判据 1–10 全绿，ConnectReset 已补，骨架已收敛到一处。
+
+**`nacos/wire` 子包作废（2026-11-03 定案）**：它唯一的理由是"发独立 module 时把线级 DTO 挪出去"，
+而不拆 module、不发版现在是终点而不是过渡。于是"受支持 API 只有两个客户端 + Options + 返回值 +
+sentinel"这条层次**只由 `nacos/doc.go` 那段注释维持**——没有包边界替你挡，想建在 DTO 上的人
+拦不住。这也是这个包和"正经 SDK"最实质的差别：SDK 用 module 与版本锁住契约，这里用一段注释。
+
+所以"外人读了也敢用"全部压在文字上，同日按这个口径补了三处交代：
+
+1. README「能力与边界」表此前整张只有命名域，读者会以为这库不做配置——加了配置读侧那一行
+   （主张/测试/真机读数三列，读数出自 `doc/nacos-config-routes.md`，并写明写路径不经本库）。
+2. `Updates()` 的通道契约写进注释与 `doc.go`：一条通道服务所有订阅（按 `ServiceInfo.Name`
+   自己分流）、缓冲 16、满了只有一条 Debug 日志。顺带订正两处旧注释说错的话——它们写着"丢弃会计数并上报"，
+   而 `PushDropped()` 与 `OnPushDropped` 盯的是**连接层那条推送缓冲**（`conn.offer`），
+   `updates` 溢出既不计数也不回调。这条差异必须写明白，否则 `PushDropped()==0` 会被读成"什么都没丢"。
+3. 清掉骨架抽取留下的孤儿注释：批量删函数的脚本把搬去 `lifecycle.go` 的方法的**注释头**剩在了原文件里
+   （`config_client.go` 10 块、共 27 行：`budget`/`dialFor`/`reconnectOnce`/`publish`/`WaitReady`/
+   `PushDropped`/`Handshakes`/`streamLost`/`ConnectionID`（重复两遍）/`nextBackoff`/`supervise`；
+   `naming_client.go` 7 行：`WaitReady`/`Handshakes`/`CurrentAddr`/`PushDropped`/`reconnectOnce`/
+   `streamLost`/`switchTo`）。Go 的文档规则是"紧邻函数上方的注释块就是它的文档"，于是 `go doc` 把
+   `CurrentAddr` 与 `PushDropped` 当成 `Close` 的说明、把半句 `Handshakes…` 接在 `Subscribed` 前面。
+   删之前逐条确认完整版已在 `lifecycle.go` 里（配置域那条独有的"listen 表按 connectionId 建键"
+   被 `lifecycle.go` 的泛化说法覆盖，没有丢信息）。`nacos/conn.go` 里 `dialConn` 头顶还写着
+   `Dial prepares…`，是导出面收敛那轮的旧名字，一并改。

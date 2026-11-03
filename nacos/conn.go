@@ -133,7 +133,7 @@ type sdkConn struct {
 	onStreamLost func(error)
 }
 
-// Dial prepares the transport. No I/O happens here: grpc.NewClient connects
+// dialConn prepares the transport. No I/O happens here: grpc.NewClient connects
 // lazily; Setup performs the handshake described in §8.3.
 func dialConn(addr string, opts ...grpc.DialOption) (*sdkConn, error) {
 	host, _, err := net.SplitHostPort(addr)

@@ -6,7 +6,9 @@
 // Two clients, one per domain, each owning its own connection:
 //
 //   - NamingClient: register, deregister, subscribe, query, with reconnect that
-//     replays the intents, and failover across a server list.
+//     replays the intents, and failover across a server list. Pushes arrive on one
+//     shared Updates() channel for all services, so a multi-service caller demuxes
+//     by ServiceInfo.Name.
 //   - ConfigClient: query and watch a config, with pull-after-notify and the same
 //     reconnect replay keyed by md5.
 //   - Their Options structs, AccessGetter (with PasswordAccess / StaticAccess),
@@ -19,6 +21,10 @@
 // is readable and assertable line by line against a real server, and hiding it
 // behind a narrow façade would throw that away. Do not build on them: they may
 // change shape when the protocol does. Call the clients.
+//
+// This comment is the whole boundary. There is no plan to split the package or
+// release it as its own module, so nothing enforces the layering: an outsider
+// building on a DTO gets no compiler error, only this paragraph.
 //
 // # Why one connection per domain
 //
