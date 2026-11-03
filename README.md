@@ -340,4 +340,18 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos -count=1 -run Li
 要长期钉住就写 `@<commit>`。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面几条命令都跑一遍——
 离那张表里的主张近，别只跑离线的那条。
 
+不拆 module 不等于别人要为整个 sweet 买单：`go get` 下的是整仓，编译进去的只有你 import 的那条链。
+只用 nacos 时参与编译的是 `nacos` 与 `gen` 两个包，`registry`/`gateway`/`server` 一行都不进二进制，
+第三方依赖也只有 `grpc` 自己那一组（`x/net`、`x/sys`、`x/text`、`genproto`、`protobuf` 都是它的依赖）。
+这三句不用信声明，在自己的模块里跑：
+
+```
+go list -deps github.com/javahongxi/sweet/nacos | grep javahongxi/sweet   # 只有 gen 与 nacos 两行
+go build -o /tmp/app . && go tool nm /tmp/app | grep -o 'javahongxi/sweet/[a-z0-9_]*' | sort | uniq -c
+```
+
+真正的代价在另一处：`go.mod` 的 require 列表是整仓共享的。今天全仓只依赖 `grpc`，所以是零；哪天
+`gateway` 或 `server` 引入新的第三方库，它会进每一个"只用 nacos"的人的 module graph，即使仍然不进
+他的二进制。
+
 &copy; [hongxi.org](http://hongxi.org)
