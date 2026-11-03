@@ -10,16 +10,26 @@
   和"上下线真的生效"这两件事。
 - **面向**：要接 Nacos 3.x 的 Go 服务；以及想知道"手写命名协议客户端到底要处理什么"的人
   （协议层与适配层的取舍写在 `registry/nacos/nacos.go` 与 `nacos/conn.go` 的注释里）。
-- **不做**：HTTP 传输、配置中心、鉴权与 TLS 配置面。
+- **不做**：HTTP 传输、配置的写路径（发布/删除走 Nacos 自己的 admin HTTP 口，不在本库）、TLS 配置面
+  （连 Nacos 那条 gRPC 走明文，`nacos/conn.go` 里写死 `insecure`）。
 
 ## 要求与兼容
 
 - Go ≥ 1.27（`go.mod` 声明 `go 1.27.3`）
 - 唯一第三方依赖：`google.golang.org/grpc v1.84.0`（`google.golang.org/protobuf` 是它自身的依赖，不算第二个库）
 - 内置的反射与健康服务同样来自 `grpc-go`（`google.golang.org/grpc/reflection`、`.../health`），依赖清单不因它们变长
-- Nacos 3.x。ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC**
+- Nacos 3.x，**只在 3.2.3 上验过**（钉的是本地 checkout 的 tag 与 commit，写在 `nacos/doc.go` 顶部）。
+  ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC**
 - 连接地址是 SDK gRPC 口：`9848 = mainPort(8848) + 1000`，不是 HTTP 的 8848
-- 服务端鉴权需关闭（`nacos.core.auth.enabled=false`）
+- 服务端**开鉴权也能连**。凭据走 `Options.Access`（`AccessGetter`），注入在**每个请求**的
+  `Metadata.headers` 上——建连时服务端对 `ServerCheckRequest` 直接 return、不进 handler 也不进 filter 链
+  （`GrpcRequestAcceptor.java:106-115`），校验点在每次派发上（`RequestHandler.handleRequest:45-56`）。
+  包内自带 `PasswordAccess`（HTTP 登录，默认路径 `/v3/auth/user/login`，token 缓存 + TTL 窗口内刷新 +
+  被 403 作废后重取一次）和 `StaticAccess`（直接给 header）。两半都在真 3.2.3 上读过：不带 `Access`
+  时握手仍成功、config 查询落 `ErrDenied`；带 `PasswordAccess` 时路由热更新全程不重启
+  （读数在 `doc/nacos-sdk-hardening.md` 的判据 10 那节）
+- 但**连真实例的那轮自证测试不配凭据**（只读 `NACOS_GRPC_ADDR`），所以跑它的时候服务端要
+  `nacos.core.auth.enabled=false`；开鉴权的那轮是手工在隔离实例上做的，见上一条
 - 用嵌入式 Derby 时它是单实例锁：再启一个 standalone 会报 `XSDB6`；正确停法是 `bin/shutdown.sh`，进程存活时不要删 `db.lck`
 
 ## 五分钟跑通
@@ -305,11 +315,28 @@ ok  	github.com/javahongxi/sweet/sweettest	0.352s
 NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos ./interoptest -count=1
 ```
 
+**换了 Nacos 服务端版本**（升级实例、或改成你线上那套）时，先跑这六条——它们是直接把线级事实
+交给真服务端核对的那批，不要凭据、不含 3 分钟空载探针，也不含要人手动重启服务的 drill：
+
+```
+NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos -count=1 -run Live
+```
+
+选中的是 `TestLiveSetupHandshakeIsAcknowledged`（握手能力表）、`TestLiveUnaryServerCheck`、
+`TestLiveSetupIsNotTornDownByCallerTimeout`、`TestLiveProbeChannelFacts`（探针通道事实）、
+`TestLiveRegisterQueryDeregister`、`TestLiveWatchSeedsAndPushes`。这份清单用
+`go test -list 'Live' ./nacos ./registry/nacos` 核过，不连服务端也能核对。
+
+不设 `-run` 的那条是全量：会多花 3 分钟空载（`TestIdleRegistrationSurvives`），并带上
+`interoptest` 里那条经 Nacos 发现第三方 grpc-go 服务端的 `TestSweetClientDiscoversNativeServer`
+（它不叫 `Live`，所以 `-run Live` 那轮不含它）。对端是 harbor 的那四条要另给 `SWEET_HARBOR_ADDR`
+（`nacos/harbor_test.go` 两条 + `registry/nacos/harbor_test.go` 两条）。
+
 ## 版本
 
 没有语义化 tag，`go get` 拿到的是 pseudo-version，例如
 `v0.0.0-20261027193012-b3fc07f6887d`；`@latest` 也解析到默认分支的这个 pseudo-version（实测）。
-要长期钉住就写 `@<commit>`。升级 `grpc-go` 之后把上面两条命令都跑一遍——离那条表里的主张近，
-别只跑离线的那条。
+要长期钉住就写 `@<commit>`。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面几条命令都跑一遍——
+离那张表里的主张近，别只跑离线的那条。
 
 &copy; [hongxi.org](http://hongxi.org)
