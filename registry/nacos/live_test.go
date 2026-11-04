@@ -57,24 +57,47 @@ func TestLiveRegisterQueryDeregister(t *testing.T) {
 		t.Fatalf("Expose: %v", err)
 	}
 
-	got, err := reg.Query(ctx, service)
-	if err != nil {
-		t.Fatalf("query after register: %v", err)
-	}
-	if len(got) != 1 || got[0].Port != port {
-		t.Fatalf("query returned %v, want exactly the registered instance", got)
-	}
-
-	unreg()
+	// A fresh registration is not visible to a query at the instant the register
+	// call returns. Measured on a live 3.2.3: register → visible took 305ms and
+	// 310ms for two services that did not exist beforehand, and 0s for one that
+	// already did. So "query once and assert" was green only when the server
+	// happened to carry leftover state from an earlier run — which is how this test
+	// used to pass. Poll for appearance the same way the deregistration below polls
+	// for disappearance; "graceful" is not symmetric, but visibility lag is.
+	registeredAt := time.Now()
+	appearedAt := time.Time{}
+	var lastErr error
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		got, err = reg.Query(ctx, service)
+		got, err := reg.Query(ctx, service)
+		if err != nil {
+			lastErr = err // a transient query error must not decide the outcome
+		} else if len(got) == 1 && got[0].Port == port {
+			appearedAt = time.Now()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if appearedAt.IsZero() {
+		t.Fatalf("the registered instance never became visible within 10s (service %s, port %d, last query error: %v)",
+			service, port, lastErr)
+	}
+	t.Logf("register → visible in %s", appearedAt.Sub(registeredAt).Round(10*time.Millisecond))
+
+	unreg()
+	goneDeadline := time.Now().Add(10 * time.Second)
+	var last []registry.Instance
+	for time.Now().Before(goneDeadline) {
+		got, err := reg.Query(ctx, service)
 		if err == nil && len(got) == 0 {
 			return
 		}
+		if err == nil {
+			last = got
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("instance still present after deregister: %v", got)
+	t.Fatalf("instance still present after deregister: %v", last)
 }
 
 // TestLiveWatchSeedsAndPushes proves the push path: Watch must return the

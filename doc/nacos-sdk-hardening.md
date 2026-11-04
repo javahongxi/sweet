@@ -464,6 +464,19 @@ calls=175 failures=0 ([]) state-updates=6 convergence=[561.135375ms 557.764917ms
 **② `-run Live` 六条**（握手能力表、一元 ServerCheck、setup 不被调用方超时拆掉、探针通道事实、
 注册/查询/注销、订阅种子与推送）：对真服务端全 PASS。
 
+其中 `TestLiveRegisterQueryDeregister` 那条**当时的绿是借来的**，同日单独修了：它 `Expose` 之后只查
+一次就断言，而真服务端把一条新注册变成可见有延迟——量过：两个此前不存在的服务 `register → visible`
+分别是 305ms 与 310ms，一个已存在的是 0s。所以它只在服务端残留着上一轮状态时才稳过；一旦注册表干净
+（我们把探针服务都清掉之后）就稳定红。修法是把同文件里"注销后消失"那半已有的轮询**镜像到"出现"这一侧**，
+并在轮询中容忍瞬时查询错误（只记最后一次，失败时一起打出来）。可证伪也当场验了：把期望端口改成
+`port+1` 再跑，10.04s 红在 `never became visible within 10s (… last query error: <nil>)`——
+`<nil>` 说明查询一直成功、只是永远等不到那个实例，正是这条断言该有的反应。改回后 `-count=3` 全绿
+（`register → visible in 0s` / `630ms`）。
+
+同一类毛病在这里有两次了（另一次是 `TestReconnectAfterServerRestart` 的假绿）。共同点：**断言的
+成立条件依赖服务端状态，而不是依赖被测行为**。判据应该写成"先观察到不该成立的东西不成立，再观察到
+它成立"，两边都要轮询，不能一头轮询一头只查一次。
+
 **③ ConnectReset**（服务端赶连接 → ack → 换节点 → 重放）。触发方式记下来，下次不用重新找：
 `POST /nacos/v3/admin/core/loader/reloadClient?connectionId=<SDK connectionId>`
 （`ServerLoaderControllerV3.java:117`，类级映射是 `NACOS_ADMIN_CORE_CONTEXT_V3 + "/loader"`）。
