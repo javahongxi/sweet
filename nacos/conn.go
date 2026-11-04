@@ -483,24 +483,34 @@ type ackBody struct {
 func (c *sdkConn) Pushes() <-chan Push { return c.pushes }
 
 func (c *sdkConn) offer(p Push) {
+	// The send stays inside pushMu: Close closes the channel under this same lock,
+	// and a send that starts after the lock is released can overlap the close — the
+	// race the detector flags, and unrecovered a "send on closed channel" panic
+	// that readLoop's guard swallows as a spurious stream loss. select/default
+	// never blocks, so holding the lock costs nothing.
+	// See doc/nacos-sdk-hardening.md §关停与投递必须串行.
 	c.pushMu.Lock()
-	ready := !c.closed.Load()
+	dropped := false
+	if !c.closed.Load() {
+		select {
+		case c.pushes <- p:
+		default:
+			dropped = true
+		}
+	}
 	c.pushMu.Unlock()
-	if !ready {
+
+	if !dropped {
 		return
 	}
-	select {
-	case c.pushes <- p:
-	default:
-		// A full buffer means the consumer stalled. Dropping one push is
-		// recoverable for naming (the next change re-pushes); blocking would
-		// stall the read loop and therefore keepalive too. Counted and reported
-		// because for config a dropped notify means a value that stays stale in
-		// silence.
-		c.pushDropped.Add(1)
-		if c.OnPushDropped != nil {
-			go c.OnPushDropped(p)
-		}
+	// A full buffer means the consumer stalled. Dropping one push is
+	// recoverable for naming (the next change re-pushes); blocking would
+	// stall the read loop and therefore keepalive too. Counted and reported
+	// because for config a dropped notify means a value that stays stale in
+	// silence.
+	c.pushDropped.Add(1)
+	if c.OnPushDropped != nil {
+		go c.OnPushDropped(p)
 	}
 }
 

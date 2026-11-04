@@ -379,3 +379,35 @@ len-1 唤醒通道"，溢出丢掉的就是已被更新值取代的旧值，"丢
 这轮不动它：那要改 `Updates()` 的契约、`registry/nacos` 的扇出，还会碰到那三条每条都买过单的
 不变式（重放、`streamLost` 的连接身份、`publish` 内建重放），风险和上面这二十行完全不对等。
 记在这里是为了下次别把它当成新发现。
+
+### 关停与投递必须串行（2026-11-04，竞态修复）
+
+**现象。** `go test -race -count=20 ./nacos/` 里 `TestPushDroppedIsReported` 红，失败文本是
+`testing.go:1867: race detected during execution of test`（所以耗时只有 0.01s——它不是断言不稳，
+是竞态被抽样撞中）。两处栈：
+
+```
+Write  sdkConn.Close()  nacos/conn.go:755   ← ConfigClient.Close ← 测试的 defer c.Close()
+Read   sdkConn.offer()  nacos/conn.go:493   ← sdkConn.readLoop(:327) ← openStream(:279)
+```
+
+**根因。** `offer` 的锁纪律断在检查与发送之间：拿 `pushMu` 读 `closed`、**放锁**、再
+`c.pushes <- p`；而 `Close` 在同一把锁下 `close(c.pushes)`。于是 close 与 send 之间没有
+happens-before。这是上一轮把 `Conn.closed` 改成 `atomic.Bool`（双锁等于没锁那件事）之后**剩下的
+另一半**——标志位原子了，检查与发送仍然跨锁。
+
+**比竞态本身更值得记的一条。** 那个窗口真跑起来是 `panic: send on closed channel`，而
+`readLoop` 头上有 `defer c.guard("readLoop")`，于是 panic 被吞成"丢流"→ 重连 → 重放。也就是说
+一次正常关停会伪装成一次没来由的连接抖动并丢掉一条推送。竞态检测器报出来，反而是这件好事。
+
+**修法。** 发送留在 `pushMu` 里（`select/default` 永不阻塞，所以持锁不花钱），`dropped` 出锁之后再
+计数与回调。`Close` 与 `offer` 由此串行：要么 offer 看见已关闭直接返回，要么发送先完成再 close。
+
+**测试。** 新增 `nacos/offer_close_test.go` 的 `TestOfferVersusCloseIsSerialized`：8 轮，每轮
+`dialConn` 出一条真连接，16 个 goroutine 各投 200 发，`Close` 并发落在中间。带一个排空者
+`for range c.Pushes()`——**没有它，绝大多数 offer 会走 `default` 分支（缓冲满），而那条分支本来就不会
+竞争，测试就测不到出事的那条路**。末尾再补 100 发"关闭之后投"，钉住契约是空操作而不是 panic。
+
+证伪与实证都过了：修前这条测试 0.836s 必红，报出的正是同一签名的 `DATA RACE`（`Close` 于 `:755`
+对 `offer` 于 `:493`）；修后 `-race -count=10` 全绿，原先那条 `TestPushDroppedIsReported` 在
+`-count=20` 下也不再冒红。窗口宽度没有量——它是调度决定的，能钉的是"不再重叠"。
