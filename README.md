@@ -328,8 +328,19 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos -count=1 -run Li
 `TestLiveRegisterQueryDeregister`、`TestLiveWatchSeedsAndPushes`。这份清单用
 `go test -list 'Live' ./nacos ./registry/nacos` 核过，不连服务端也能核对。
 
-不设 `-run` 的那条是全量：会多花 3 分钟空载（`TestIdleRegistrationSurvives`），并带上
-`interoptest` 里那条经 Nacos 发现第三方 grpc-go 服务端的 `TestSweetClientDiscoversNativeServer`
+快速验证核心功能（跳过 3 个长时测试，约 4-5 秒完成）：
+
+```
+NACOS_GRPC_ADDR=127.0.0.1:9848 go test -short ./nacos ./registry/nacos ./interoptest -count=1
+```
+
+`-short` 模式跳过的测试：`TestIdleRegistrationSurvives`（≥3 分钟空载探针）、
+`TestReconnectAfterServerRestart`（≤6 分钟，需手动重启 Nacos）、
+`TestRollingRestartDrill`（~2 分钟，需预编译服务端二进制）。这三个测试设计为长时间运行，
+用于深度验证保活、重连、滚动重启等场景，日常开发用 `-short` 即可。
+
+不设 `-run` 也不加 `-short` 的那条是全量：会多花 3 分钟空载（`TestIdleRegistrationSurvives`），
+并带上 `interoptest` 里那条经 Nacos 发现第三方 grpc-go 服务端的 `TestSweetClientDiscoversNativeServer`
 （它不叫 `Live`，所以 `-run Live` 那轮不含它）。对端是 harbor 的那四条要另给 `SWEET_HARBOR_ADDR`
 （`nacos/harbor_test.go` 两条 + `registry/nacos/harbor_test.go` 两条）。
 

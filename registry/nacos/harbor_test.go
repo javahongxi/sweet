@@ -40,13 +40,27 @@ func runAgainstBackend(t *testing.T, addr string) {
 		t.Fatalf("Expose: %v", err)
 	}
 
-	got, err := reg.Query(ctx, service)
-	if err != nil {
-		t.Fatalf("Query: %v", err)
+	// Poll for visibility: a fresh registration is not instantly queryable on
+	// a real Nacos server (measured 305ms/310ms latency on 3.2.3).
+	registeredAt := time.Now()
+	appearedAt := time.Time{}
+	var lastErr error
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := reg.Query(ctx, service)
+		if err != nil {
+			lastErr = err
+		} else if len(got) == 1 && got[0].Port == port {
+			appearedAt = time.Now()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if len(got) != 1 || got[0].Port != port {
-		t.Fatalf("Query returned %v, want the single registered instance", got)
+	if appearedAt.IsZero() {
+		t.Fatalf("the registered instance never became visible within 10s (service %s, port %d, last query error: %v)",
+			service, port, lastErr)
 	}
+	t.Logf("register → visible in %s", appearedAt.Sub(registeredAt).Round(10*time.Millisecond))
 
 	// Subscribe must return a snapshot without a separate query.
 	watchCtx, watchCancel := context.WithCancel(ctx)
@@ -67,7 +81,7 @@ func runAgainstBackend(t *testing.T, addr string) {
 	// Deregistration must be visible, which is the counterpart of "the
 	// instance's liveness is the connection".
 	unreg()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline = time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if got, err := reg.Query(ctx, service); err == nil && len(got) == 0 {
 			break

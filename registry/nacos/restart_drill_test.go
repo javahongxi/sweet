@@ -38,6 +38,9 @@ import (
 //	NACOS_GRPC_ADDR=127.0.0.1:9848 SWEET_SERVER_BIN=/tmp/sweet-server \
 //	  go test ./registry/nacos -run RollingRestart -v
 func TestRollingRestartDrill(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
 	addr := os.Getenv("NACOS_GRPC_ADDR")
 	bin := os.Getenv("SWEET_SERVER_BIN")
 	if addr == "" || bin == "" {

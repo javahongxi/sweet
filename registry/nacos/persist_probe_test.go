@@ -20,6 +20,9 @@ import (
 //
 // Run it with SWEET_LIVE_MINUTES=5 (or any minute count) to make it bite.
 func TestIdleRegistrationSurvives(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
 	addr := os.Getenv(envAddr)
 	if addr == "" {
 		t.Skipf("set %s", envAddr)
@@ -72,6 +75,9 @@ func TestIdleRegistrationSurvives(t *testing.T) {
 // and with it the ephemeral instance, or queries fail while the client is
 // reconnecting). Only then is "it came back" evidence of the replay.
 func TestReconnectAfterServerRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
 	if os.Getenv("SWEET_RESTART_DRILL") == "" {
 		t.Skip("set SWEET_RESTART_DRILL=1, then restart Nacos when prompted")
 	}
