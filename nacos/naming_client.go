@@ -78,7 +78,9 @@ type NamingOptions struct {
 	Servers []string
 
 	// Namespace and GroupName are the identity fields every naming request carries
-	// (AbstractNamingRequest.java:30-34). Empty namespace means public.
+	// (AbstractNamingRequest.java:30-34). An empty Namespace is normalised to
+	// "public" by NewNamingClient, exactly as the official client does, because the
+	// server rejects a request whose namespace field is absent.
 	Namespace string
 	GroupName string
 
@@ -122,6 +124,14 @@ func NewNamingClient(opts NamingOptions) (*NamingClient, error) {
 	}
 	if opts.GroupName == "" {
 		opts.GroupName = "DEFAULT_GROUP"
+	}
+	// The official client normalises an unset namespace to "public" before it ever
+	// builds a request (InitUtils.java:86-87 → UtilAndComs.DEFAULT_NAMESPACE_ID), so
+	// the field is always on the wire. Doing it here rather than leaving the field
+	// empty matters: `namespace,omitempty` drops an empty value entirely, and a live
+	// 3.2.3 then NPEs on the null (naming/core/v2/pojo/Service.java:115).
+	if opts.Namespace == "" {
+		opts.Namespace = "public"
 	}
 
 	labels := map[string]string{"source": "sdk", "module": "naming"}

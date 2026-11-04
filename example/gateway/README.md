@@ -30,7 +30,8 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
 `-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
 `-routes.dataId`、`-routes.group`、`-route-cache`（把最后一次被接受的路由表留在盘上，
-冷启动时兜底；默认空 = 不碰磁盘）、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant）。
+冷启动时兜底；默认空 = 不碰磁盘）、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant；
+不设时库按官方客户端的做法把它规范成 `public` 再发，而不是把字段整个省掉）。
 
 `direct` 那一档是给你只想验线格式、不掺进发现时用的：
 

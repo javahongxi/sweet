@@ -480,6 +480,37 @@ func TestNamingClientLabelsConnectionNaming(t *testing.T) {
 	}
 }
 
+// TestNamingClientPutsNamespaceOnTheWire pins the identity field the server
+// insists on. The official client normalises an unset namespace to "public"
+// (InitUtils.java:86-87 → UtilAndComs.DEFAULT_NAMESPACE_ID) and sends that value,
+// so the field is never absent on the wire. sweet's DTO carried
+// `namespace,omitempty`, which dropped an unset namespace entirely — and a live
+// 3.2.3 then answers the first Register with errorCode=500,
+// `Cannot invoke "String.equals(Object)" because "this.namespace" is null`
+// (naming/core/v2/pojo/Service.java:115). registry/nacos never hit it because the
+// adapter had been quietly filling "public" for the library.
+func TestNamingClientPutsNamespaceOnTheWire(t *testing.T) {
+	stub := newNamingStub()
+	addr := startNamingStub(t, stub)
+	n := quickNamingClient(t, NamingOptions{Addr: addr}) // no namespace: the case that used to vanish
+	mustReady(t, n, 5*time.Second)
+
+	if err := n.Register(context.Background(), "sweet.example.v1.Namespace", testInstance(20555)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	stub.mu.Lock()
+	regs := append([]InstanceRequest(nil), stub.regs...)
+	stub.mu.Unlock()
+	if len(regs) == 0 {
+		t.Fatal("the stub recorded no InstanceRequest")
+	}
+	if regs[0].Namespace != "public" {
+		t.Errorf("InstanceRequest.namespace = %q, want %q — an unset namespace must go on the wire as public, not be omitted",
+			regs[0].Namespace, "public")
+	}
+}
+
 // TestNewNamingClientRejectsBadOptions keeps the constructor's contract: it
 // fails on structure only, never on reachability.
 func TestNewNamingClientRejectsBadOptions(t *testing.T) {

@@ -262,6 +262,18 @@ func (s *configStub) bidi(stream grpc.BidiStreamingServer[gen.Payload, gen.Paylo
 				}
 			}
 		case note := <-s.push:
+			// Faithful to the real server: a notify carries the tenant the config
+			// lives under, which is the tenant the client listened with —
+			// NamespaceUtil.java:44-49 turns a blank tenant into namespaceDefaultId
+			// ("public", = Constants.DEFAULT_NAMESPACE_ID) and AsyncNotifyService:170
+			// sends task.getTenant(). A scripted push that leaves Tenant empty gets it
+			// filled from the recorded listen, so the stub cannot teach a client to key
+			// its watchers on a value no server ever sends.
+			if note.Tenant == "" {
+				if listened := s.tenantListenedFor(note.DataID, note.Group); listened != "" {
+					note.Tenant = listened
+				}
+			}
 			if err := stream.Send(frame(TypeConfigChangeNotifyRequest, note)); err != nil {
 				return err
 			}
@@ -280,6 +292,27 @@ func (s *configStub) Kill() {
 	defer s.mu.Unlock()
 	close(s.kill)
 	s.kill = make(chan struct{})
+}
+
+// tenantListenedFor reports the tenant the client asked to listen under for this
+// key, or "" when it never listened for it. The push branch of bidi uses it to fill
+// a scripted notify that left Tenant empty, because the real server echoes the
+// listener's own tenant back.
+func (s *configStub) tenantListenedFor(dataID, group string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.listens {
+		var req ConfigBatchListenRequest
+		if _, err := unmarshal(p, &req); err != nil {
+			continue
+		}
+		for _, c := range req.ConfigListenContexts {
+			if c.DataID == dataID && c.Group == group && c.Tenant != "" {
+				return c.Tenant
+			}
+		}
+	}
+	return ""
 }
 
 func startConfigStub(t *testing.T, s *configStub) string {
@@ -394,8 +427,8 @@ func TestConfigQueryRoundTrip(t *testing.T) {
 	if got.Content != `{"routes":[]}` || got.MD5 != "md5-seed" {
 		t.Fatalf("Query = %+v, want the scripted content and md5", got)
 	}
-	if got.Tenant != "" {
-		t.Errorf("Tenant = %q, want the public namespace", got.Tenant)
+	if got.Tenant != "public" {
+		t.Errorf("Tenant = %q, want the normalised public namespace — NewConfigClient fills it the way the official client does", got.Tenant)
 	}
 
 	bodies := stub.rawBodies("ConfigQueryRequest")
@@ -409,6 +442,30 @@ func TestConfigQueryRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(bodies[0], `"headers"`) {
 		t.Errorf("headers must not ride in the body (GrpcUtils.java:108-113): %s", bodies[0])
+	}
+}
+
+// TestConfigClientPutsTenantOnTheWire is the config-domain twin of
+// TestNamingClientPutsNamespaceOnTheWire: the official client also normalises an
+// unset namespace to "public" before it becomes the config domain's tenant
+// (ClientBasicParamUtil.java:148-149), so `tenant` is a value on the wire rather
+// than an absent key. Unlike naming, a live 3.2.3 tolerates the missing field —
+// this is about sending the same shape as every other client, not about a crash.
+func TestConfigClientPutsTenantOnTheWire(t *testing.T) {
+	stub := newConfigStub(`{"routes":[]}`, "md5-seed")
+	addr := startConfigStub(t, stub)
+	c := newTestConfigClient(t, addr) // no Tenant set
+
+	if _, err := c.Query(context.Background(), ConfigKey{DataID: "routes.json", Group: "DEFAULT_GROUP"}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	bodies := stub.rawBodies("ConfigQueryRequest")
+	if len(bodies) != 1 {
+		t.Fatalf("server saw %d ConfigQueryRequest frames, want 1", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"tenant":"public"`) {
+		t.Errorf("request body %s must carry tenant=\"public\" — an unset namespace is normalised, not omitted", bodies[0])
 	}
 }
 

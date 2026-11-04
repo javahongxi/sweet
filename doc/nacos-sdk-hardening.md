@@ -484,7 +484,7 @@ calls=175 failures=0 ([]) state-updates=6 convergence=[561.135375ms 557.764917ms
 完成了。把顺序钉死的是单元测试里那条扣住 replay 钩子的断言（改前 0.00s 必红）。这里读到的是"真服务端
 赶连接时，注册确实被重放到新连接上、服务端仍列着它"。
 
-**④ 顺手撞出来的一个真缺口（未修，等定夺）。** `NamingOptions.Namespace` 的注释写着"Empty namespace
+**④ 撞出来的一个真缺口：namespace 空值整个不发。** `NamingOptions.Namespace` 的注释写着"Empty namespace
 means public"，但真 3.2.3 上第一次 `Register` 就被拒：
 
 ```
@@ -495,9 +495,57 @@ nacos: request refused: register registerInstance sweet.example.v1.ResetProbe
 机制在 `naming_types.go:51/63/75/110`——`Namespace string json:"namespace,omitempty"`，空值被
 `omitempty` 整个省掉，服务端那个字段是 null 而不是空串，于是 NPE。复现 2/2。
 `registry/nacos` 之所以一直没撞上，是它自己在 `nacos.go:102-103` 把空 Namespace 兜成了 `"public"`——
-**适配层补的洞，库层没补**，而库的注释还把"空＝public"当契约写给了外人。三个候选：在
-`NewNamingClient` 里默认成 `public`；或去掉 `omitempty` 把空串真的发出去（服务端收空串会不会同样炸，
-没测）；或把注释改成"必须显式给 namespace"。这是行为/契约改动，没动。
+**适配层补的洞，库层没补**，而库的注释还把"空＝public"当契约写给了外人。
+
+**定案与修法（2026-11-04）：库层兜成 `"public"`，两个域一起做。** 依据不是我们挑了一个写法，而是
+官方客户端就是这么做的：`InitUtils.java:86-87` 把空 namespace 兜成 `UtilAndComs.DEFAULT_NAMESPACE_ID`
+（`:40` = `"public"`），`ClientBasicParamUtil.java:148-149` 对 config 的 tenant 做同一件事
+（`Constants.java:191` 也是 `"public"`），然后 `NamingGrpcClientProxy.java:280` 等把这个值原样放进每个
+请求。所以另外两个候选被证据否掉：**去掉 `omitempty` 发空串**＝造一个官方客户端从来没走过的形状，
+而跨语言互通是这个包的主证；**改注释要求调用方显式给**＝把官方已经替用户做的事推给外人，还会让
+`registry/nacos` 现有的用法（不带 namespace）变成"文档说能用其实不能用"。
+
+落下来的四处：`NewNamingClient` 在 `GroupName` 默认旁边加 namespace 默认（两者同构）；
+`NewConfigClient` 同样兜 `Tenant`；`registry/nacos` 那两行兜底删掉（库兜了它就是死代码，注释留一句
+说明它以前是适配层在替库做事）；两个 Options 的注释改成实况。
+
+**桩不忠实这一条也顺手补了。** 改完 `TestConfigWatchPullsAfterNotify` 红了一句"no update after the
+notify"——不是客户端坏了，是桩在教错的形状：它把脚本化的 notify 原样发出，`Tenant` 留空，而真服务端
+回的是**监听者自己上报的那个 tenant**（`NamespaceUtil.java:44-49` 把空串规范成 `namespaceDefaultId`，
+`AsyncNotifyService.java:170` 发 `task.getTenant()`）。客户端的 watcher 键现在是 `"public"`，
+推来的却是 `""`，查不到就不回调——桩如果不忠实，"测不出来"会一路伪装成"没坏"。改成：脚本没给 tenant
+时，桩从已记录的 listen 里取该键的 tenant 填上（`config_test.go` 的 `tenantListenedFor`）。
+`TestConfigQueryRoundTrip` 里那句 `got.Tenant != ""` 也跟着改成 `"public"`——它原先断言的正是这个错形状。
+
+**真机闭环（同一天，同一台 3.2.3）**：改前用空 namespace 跑那个探针是 `errorCode=500` NPE（2/2）；
+改后同一条命令 `NAMESPACE=`（空）跑通——`21:52:31.707 registered: server sees 1 host(s)`，同一次运行里
+ConnectReset 也再走了一遍（`.037` 新 connectionId、`handshakes=2`、注册重放回来）。单元测试这边
+两条请求形状断言先红后绿：`InstanceRequest.namespace == "public"`、请求体里必须出现
+`"tenant":"public"`（改前桩看到的 body 是 `{"dataId":"routes.json","group":"DEFAULT_GROUP"}`，
+`tenant` 这个键根本不存在——那条红字就是缺口本身的形状）。
+
+**config 的真机 Watch→notify 全链路也跑了**（这条桩证明不了——回显 tenant 的正是桩本人）。经 v3
+admin 口发布 `DEFAULT_GROUP/sweet-tenant-probe.json`（`namespaceId=public`），客户端不设 `Tenant`，
+`Watch` 之后再改一次表：
+
+```
++0.0s callback: content={"v":1} md5=a191475ae2bf7db9c7e320f7da455bbb tenant="public"
++0.0s published v2; waiting for notify → pull → callback
++0.1s callback: content={"v":2} md5=554a7f6757030bc85dc45e129076ef94 tenant="public"
+OK: 2 callbacks; the watcher keyed on tenant="public" was found by the server's notify
++0.2s query a missing key -> ErrNotFound=true
++0.2s cleanup: probe config deleted
+```
+
+两个读数值得单独记。`tenant="public"` 是**服务端回给客户端的**，不是我们填的——这正是桩必须改成
+回显监听者 tenant 的原因；seed 那行的 md5 与 v3 admin 口读回的 `a191475ae2bf7db9c7e320f7da455bbb`
+逐字相同，两边算的是同一个 MD5。探针自己踩了一次坑：发布后立刻查会拿到 not found——服务端的发布
+与读缓存不是同一瞬间，第一版探针就死在这儿（那是探针在和服务端赛跑，不是客户端 bug）；改成先经
+admin 口按 md5 确认 v1 可读再起 Watch。v2 那一步**故意不等**可读再等回调：notify 是发布那一刻发出的，
+先等可读会让客户端的回拉撞上服务端还没 dump 完，把唯一一次 notify 吞掉。
+
+跑完善后核过：探针配置已删（admin 口回 `Config not exist`），三个探针服务
+`ResetProbe`/`RestartDrill`/`RollingDrill` 在实例表里都不在了（临时实例随连接消失）。
 
 **⑤ `TestReconnectAfterServerRestart`：先发现它是假绿，再把它修成能绿的。**
 

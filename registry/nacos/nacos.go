@@ -99,9 +99,9 @@ func New(opts Options) (*Registry, error) {
 	if opts.ServerAddr == "" && len(opts.Servers) == 0 {
 		return nil, errors.New("nacos: Options.ServerAddr or Servers required")
 	}
-	if opts.Namespace == "" {
-		opts.Namespace = "public"
-	}
+	// Namespace is not filled here: NewNamingClient normalises an empty one to
+	// "public" the way the official client does, and this used to be the adapter
+	// quietly doing the library's job.
 	if opts.GroupName == "" {
 		opts.GroupName = "DEFAULT_GROUP"
 	}

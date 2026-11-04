@@ -68,7 +68,8 @@ type ConfigOptions struct {
 	Servers []string
 
 	// Tenant is the namespace id, and it is the field config calls "tenant"
-	// (naming calls the same thing "namespace"). Empty means public.
+	// (naming calls the same thing "namespace"). An empty Tenant is normalised to
+	// "public" by NewConfigClient, as the official client does.
 	Tenant string
 
 	// Labels are sent in ConnectionSetupRequest. Defaults to
@@ -125,6 +126,14 @@ func NewConfigClient(opts ConfigOptions) (*ConfigClient, error) {
 			return nil, errors.New("nacos: ConfigOptions.Addr or Servers required")
 		}
 		addrs = []string{opts.Addr}
+	}
+	// Same normalisation as the naming domain: the official client turns an unset
+	// namespace into "public" before it becomes the config request's tenant
+	// (ClientBasicParamUtil.java:148-149), so the field goes on the wire as a value
+	// instead of being dropped by `omitempty`. Unlike naming, a live 3.2.3 tolerates
+	// the absent field — this is about matching every other client's shape.
+	if opts.Tenant == "" {
+		opts.Tenant = "public"
 	}
 	labels := map[string]string{"source": "sdk", "module": "config", "appName": "sweet"}
 	for k, v := range opts.Labels {
