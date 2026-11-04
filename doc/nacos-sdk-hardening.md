@@ -325,9 +325,9 @@ sentinel"这条层次**只由 `nacos/doc.go` 那段注释维持**——没有包
 1. README「能力与边界」表此前整张只有命名域，读者会以为这库不做配置——加了配置读侧那一行
    （主张/测试/真机读数三列，读数出自 `doc/nacos-config-routes.md`，并写明写路径不经本库）。
 2. `Updates()` 的通道契约写进注释与 `doc.go`：一条通道服务所有订阅（按 `ServiceInfo.Name`
-   自己分流）、缓冲 16、满了只有一条 Debug 日志。顺带订正两处旧注释说错的话——它们写着"丢弃会计数并上报"，
-   而 `PushDropped()` 与 `OnPushDropped` 盯的是**连接层那条推送缓冲**（`conn.offer`），
-   `updates` 溢出既不计数也不回调。这条差异必须写明白，否则 `PushDropped()==0` 会被读成"什么都没丢"。
+   自己分流）、缓冲 16。当时顺带订正了两处旧注释说错的话——它们写着"丢弃会计数并上报"，而
+   `PushDropped()` 与 `OnPushDropped` 盯的是**连接层那条推送缓冲**（`conn.offer`），
+   `updates` 溢出既不计数也不回调。**这条不对称下一节就补掉了**，见「第二道缓冲已补计数与回调」。
 3. 清掉骨架抽取留下的孤儿注释：批量删函数的脚本把搬去 `lifecycle.go` 的方法的**注释头**剩在了原文件里
    （`config_client.go` 10 块、共 27 行：`budget`/`dialFor`/`reconnectOnce`/`publish`/`WaitReady`/
    `PushDropped`/`Handshakes`/`streamLost`/`ConnectionID`（重复两遍）/`nextBackoff`/`supervise`；
@@ -337,3 +337,45 @@ sentinel"这条层次**只由 `nacos/doc.go` 那段注释维持**——没有包
    删之前逐条确认完整版已在 `lifecycle.go` 里（配置域那条独有的"listen 表按 connectionId 建键"
    被 `lifecycle.go` 的泛化说法覆盖，没有丢信息）。`nacos/conn.go` 里 `dialConn` 头顶还写着
    `Dial prepares…`，是导出面收敛那轮的旧名字，一并改。
+
+### 第二道缓冲已补计数与回调（2026-11-03）
+
+`updates`（16 槽）溢出原先只有一条 `LevelDebug` 日志，而默认 handler 是 Info——等于静默丢，
+和 E 项「缓冲满不再静默丢」的规矩冲突。那条规矩的理由对命名域一字不改地成立：丢一份
+`ServiceInfo`，视图就旧到下次变更。有人会说这是调用方不排空的编程错误、库不该替它计数，但
+连接层那条缓冲溢出同样是下游慢造成的，库已经计了——只计一半才是不一致。
+
+补法按最小面来：drop 分支里 `updateDropped.Add(1)`，并把**原始帧**交给已有的
+`Options.OnPushDropped`（`push` 就在那个 `for range` 的作用域里，所以零新 API；调用方
+`DecodeNotify` 一次就知道是哪个服务掉了）。回调走 `go`，与 `conn.offer` 同一形状——不能同步调，
+否则一个卡住的回调会反过来堵住唯一的推送消费者，把第二道缓冲的问题升级成第一道。
+
+**计数没有折进 `PushDropped()`**，这是这轮唯一值得吵的决定。`PushDropped()` 读的是*当前连接*
+的数（`lifecycle.PushDropped` → `conn.pushDropped`），换一条流就归零；而这里丢掉的列表在重连
+之后**仍然是丢掉的**。两个生命周期不同的数合成一个，注释就得写成"两条缓冲之和，其中一条随
+重连归零"——那是把新困惑留给读者。于是多一个访问器：`UpdateDropped()` 挂在 `NamingClient`
+上而不是 `lifecycle` 上，因为配置域没有第二道缓冲，挂上去只会给 `ConfigClient` 一个恒为 0 的方法。
+
+三条测试在 `naming_client_test.go` 末尾。**先写测试再实现**：`UpdateDropped` 还不存在时
+`go test` 直接编译失败，那个失败就是规格。
+
+- `TestUpdateDroppedIsReported`：不排空灌 24 条，断言**恰好** 8 次丢弃，且回调收到 8 个原始帧、
+  `DecodeNotify` 解得出服务名。取精确值而不是"至少一次"，是因为这个消费者从不阻塞、连接层那条
+  64 槽缓冲填不上，能丢东西的只有 `updates`。
+- `TestUpdateDroppedZeroWhenDrained`：负对照。同样 24 条但一直排空 ⇒ `UpdateDropped()==0`
+  且 `PushDropped()==0`。
+- `TestUpdateDroppedSurvivesReconnect`：`Kill()` 换一条流之后计数不归零——钉的就是上面那个
+  "为什么不折进 `PushDropped()`"。
+
+断言能被证伪这件事单独验过：把 `Add(1)` 改成 `Add(0)`、回调条件改成 `if false` 再跑，
+第一条与第三条 8 秒超时变红，负对照仍然绿（正是它该有的表现），然后恢复原状。
+
+### 故意没做的那层：per-service 最新值
+
+更彻底的修法是改语义而不是补报警器。对服务列表来说，队列里存着三份旧列表本来就是错的——
+官方客户端也是 per-service 缓存 + 监听读最新。把 `updates` 换成"每个服务只留最新一份 + 一根
+len-1 唤醒通道"，溢出丢掉的就是已被更新值取代的旧值，"丢"本身不再是信息损失。
+
+这轮不动它：那要改 `Updates()` 的契约、`registry/nacos` 的扇出，还会碰到那三条每条都买过单的
+不变式（重放、`streamLost` 的连接身份、`publish` 内建重放），风险和上面这二十行完全不对等。
+记在这里是为了下次别把它当成新发现。

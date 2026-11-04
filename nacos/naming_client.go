@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,7 +43,14 @@ type NamingClient struct {
 	registrations map[string]*regIntent
 	subscriptions map[string]*subIntent
 	updates       chan ServiceInfo
-	closed        bool
+
+	// updateDropped counts lists discarded because nobody was draining Updates().
+	// It lives on the client rather than on the connection on purpose: a list lost
+	// to a full buffer is still lost after a reconnect, so the number must survive
+	// the stream being replaced — see UpdateDropped.
+	updateDropped atomic.Int64
+
+	closed bool
 }
 
 // regIntent is one instance this client wants published.
@@ -291,14 +299,20 @@ func (n *NamingClient) Query(ctx context.Context, service string) (ServiceInfo, 
 // than one service demuxes by ServiceInfo.Name; registry/nacos' watcher fan-out is
 // the in-repo example. Buffered 16, and only one goroutine may drain it.
 //
-// When that consumer stalls the buffer fills and the excess push is dropped with a
-// Debug log line ("update channel full; dropping a push"). Note which counter that
-// does NOT move: PushDropped and Options.OnPushDropped watch the connection's own
-// push buffer, which overflows for a different reason (the consumer blocked, e.g. on
-// an ack), so PushDropped()==0 is not proof nothing was lost. The consumer here never
-// blocks on this buffer, so the ack path keeps running; the cost lands on freshness —
-// a missed list means a stale view until the next change.
+// When that consumer stalls, the excess list is dropped rather than blocking the
+// ack path, and it is not dropped in silence: UpdateDropped counts those drops and
+// Options.OnPushDropped receives the raw frame the channel refused. The list is
+// still gone — a missed one means a stale view until the next change — so the
+// actionable response to either signal is to Query that service again.
 func (n *NamingClient) Updates() <-chan ServiceInfo { return n.updates }
+
+// UpdateDropped counts instance lists discarded because nobody was draining
+// Updates(). It is deliberately separate from PushDropped rather than folded into
+// it: that one reads the *current connection's* overflow counter and resets when
+// the stream is replaced, while a list lost here stays lost across a reconnect.
+// "Have I lost anything since I started" is this number; "is the connection I am
+// on healthy right now" is PushDropped.
+func (n *NamingClient) UpdateDropped() int64 { return n.updateDropped.Load() }
 
 // Subscribed lists the services with a live subscription intent. It exists so
 // the snapshot fallback's central claim — "a stale list was handed out *and* the
@@ -506,11 +520,16 @@ func (n *NamingClient) consumePushes(conn *sdkConn, gen int64) {
 		select {
 		case n.updates <- info:
 		default:
-			// A stalled consumer must not block the ack path. This drop is NOT the
-			// one PushDropped()/OnPushDropped report — those count overflows of the
-			// connection's own push buffer (see Updates) — so the Debug log is the
-			// only signal that a service list was lost here.
+			// A stalled consumer must not block the ack path, and must not lose the
+			// list in silence either: count it on the client (a dropped list is still
+			// dropped after a reconnect) and hand the raw frame to the same hook the
+			// connection's own buffer uses, so a caller can decode *which* service
+			// went stale instead of just that something was lost.
+			n.updateDropped.Add(1)
 			n.log("update channel full; dropping a push", "service", info.Name)
+			if n.opts.OnPushDropped != nil {
+				go n.opts.OnPushDropped(push)
+			}
 		}
 	}
 }

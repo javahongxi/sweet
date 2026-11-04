@@ -501,3 +501,161 @@ func TestNewNamingClientRejectsBadOptions(t *testing.T) {
 		t.Fatal("WaitReady must report the unreachable list")
 	}
 }
+
+// --- the second buffer: Updates() overflow ----------------------------------
+
+// The naming path has two buffers, and only one of them used to be reported:
+// the connection's push channel (64 slots, counted in sdkConn.offer and handed to
+// Options.OnPushDropped) and Updates() (16 slots). A full Updates() dropped the
+// excess with a Debug log, which the default Info handler never shows — so a
+// caller could lose a service list and read PushDropped()==0 as "nothing was
+// lost". These three tests pin the fix: reported, counted on the client, and
+// counted in a way that survives the reconnect that follows.
+
+// TestUpdateDroppedIsReported is the hardening rule for push buffers — a full
+// buffer must not drop in silence — applied to the second one. Nobody drains
+// Updates(), so 24 notifications leave exactly 8 drops, and each drop must reach
+// Options.OnPushDropped carrying the raw frame the consumer refused.
+//
+// The number is exact rather than "at least one" because this consumer never
+// blocks: the connection's own 64-slot buffer cannot fill while it is running, so
+// the only thing that can lose a frame here is Updates().
+func TestUpdateDroppedIsReported(t *testing.T) {
+	s := newNamingStub()
+	addr := startNamingStub(t, s)
+
+	dropped := make(chan Push, 64)
+	n := quickNamingClient(t, NamingOptions{
+		Addr:          addr,
+		OnPushDropped: func(p Push) { dropped <- p },
+	})
+	mustReady(t, n, 2*time.Second)
+
+	const service = "sweet.example.v1.Greeter"
+	if _, err := n.Subscribe(context.Background(), service); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	const total = 24
+	for i := 0; i < total; i++ {
+		if err := s.PushNotify(service, []Instance{testInstance(20501 + i)}); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+	}
+
+	want := int64(total - 16)
+	waitWithin(t, 8*time.Second, "all 24 notifications to land and 8 to be dropped", func() bool {
+		return n.UpdateDropped() == want
+	})
+	if got := n.UpdateDropped(); got != want {
+		t.Fatalf("UpdateDropped() = %d, want %d", got, want)
+	}
+
+	// The callback has to hand back something actionable: the raw frame must still
+	// decode, because that is how a caller learns *which* service went stale.
+	for i := int64(0); i < want; i++ {
+		select {
+		case p := <-dropped:
+			note, derr := DecodeNotify(p)
+			if derr != nil {
+				t.Fatalf("dropped push %d is not a decodable notify: %v", i, derr)
+			}
+			if got := note.ServiceName(); got != service {
+				t.Errorf("dropped push %d names %q, want %q", i, got, service)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("OnPushDropped reported %d of %d drops", i, want)
+		}
+	}
+}
+
+// TestUpdateDroppedZeroWhenDrained is the negative control the rule depends on:
+// the same 24 notifications against a consumer that keeps up must produce zero
+// drops. If this one ever goes non-zero, the test above is measuring its own
+// harness instead of the drop path.
+func TestUpdateDroppedZeroWhenDrained(t *testing.T) {
+	s := newNamingStub()
+	addr := startNamingStub(t, s)
+
+	n := quickNamingClient(t, NamingOptions{Addr: addr})
+	mustReady(t, n, 2*time.Second)
+
+	const service = "sweet.example.v1.Greeter"
+	if _, err := n.Subscribe(context.Background(), service); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	got := make(chan ServiceInfo, 64)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case info := <-n.Updates():
+				got <- info
+			case <-stop:
+				return
+			}
+		}
+	}()
+	defer close(stop)
+
+	const total = 24
+	for i := 0; i < total; i++ {
+		if err := s.PushNotify(service, []Instance{testInstance(20601 + i)}); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+	}
+
+	waitWithin(t, 8*time.Second, "the draining consumer to receive all 24 lists", func() bool {
+		return len(got) == total
+	})
+	if d := n.UpdateDropped(); d != 0 {
+		t.Errorf("UpdateDropped() = %d with a consumer keeping up, want 0", d)
+	}
+	if p := n.PushDropped(); p != 0 {
+		t.Errorf("PushDropped() = %d, want 0 — the connection buffer should never fill here", p)
+	}
+}
+
+// TestUpdateDroppedSurvivesReconnect pins why this counter is not folded into
+// PushDropped(). That one reads the *current connection's* number and therefore
+// resets when the stream is replaced; a list lost to a full Updates() stays lost
+// across the reconnect, so the owner's view is still stale and the number must
+// still say so. Two buffers with two lifetimes cannot share one counter without
+// the reader having to know which one it is looking at.
+func TestUpdateDroppedSurvivesReconnect(t *testing.T) {
+	s := newNamingStub()
+	addr := startNamingStub(t, s)
+
+	n := quickNamingClient(t, NamingOptions{Addr: addr})
+	mustReady(t, n, 2*time.Second)
+
+	const service = "sweet.example.v1.Greeter"
+	if _, err := n.Subscribe(context.Background(), service); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	before := n.Handshakes()
+
+	const total = 24
+	for i := 0; i < total; i++ {
+		if err := s.PushNotify(service, []Instance{testInstance(20701 + i)}); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+	}
+	waitWithin(t, 8*time.Second, "the overflow to be counted", func() bool {
+		return n.UpdateDropped() > 0
+	})
+	lost := n.UpdateDropped()
+	if lost == 0 {
+		t.Fatal("no drops recorded; nothing to check survival of")
+	}
+
+	s.Kill()
+	waitWithin(t, 8*time.Second, "a fresh handshake after the stream was killed", func() bool {
+		return n.Handshakes() > before
+	})
+
+	if got := n.UpdateDropped(); got != lost {
+		t.Errorf("UpdateDropped() = %d after reconnect, want %d — a lost list is still lost", got, lost)
+	}
+}
