@@ -73,6 +73,11 @@ type lifecycle struct {
 	lost       chan struct{}
 	lastErr    error
 	attempt    int
+	// published is what WaitReady vouches for: set after onReady and a replay that
+	// returned nil, cleared whenever the connection is replaced or retired. The
+	// connection itself becomes current earlier than this, because replay has to be
+	// able to use it.
+	published bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -170,7 +175,9 @@ func (l *lifecycle) publish(conn *sdkConn, addr string) {
 	gen := l.generation
 	l.lastErr = nil
 	l.attempt = 0
-	l.broadcastLocked()
+	// Not ready yet: the connection is current so replay can use it, but no
+	// caller is told until the intents are actually on it. See WaitReady.
+	l.published = false
 	l.mu.Unlock()
 
 	l.serversList.MarkHealthy(addr)
@@ -179,16 +186,26 @@ func (l *lifecycle) publish(conn *sdkConn, addr string) {
 	}
 	l.logFn("connected", "addr", addr, "connectionId", conn.ConnectionID())
 	l.onReady(conn, gen)
-	if l.replay == nil {
-		return
+	if l.replay != nil {
+		if err := l.replay(); err != nil {
+			// The intents are not on this node, so this connection cannot serve them:
+			// retire it and let the supervisor try again rather than keep a
+			// healthy-looking connection the server knows nothing about.
+			l.logFn("replay failed; retiring the connection", "err", err)
+			l.streamLost(conn)
+			return
+		}
 	}
-	if err := l.replay(); err != nil {
-		// The intents are not on this node, so this connection cannot serve them:
-		// retire it and let the supervisor try again rather than keep a
-		// healthy-looking connection the server knows nothing about.
-		l.logFn("replay failed; retiring the connection", "err", err)
-		l.streamLost(conn)
+
+	// Only now is this connection worth waiting on: it is current, its consumer is
+	// running, and the intents it must carry are on it. The identity check keeps a
+	// superseded generation from vouching for itself.
+	l.mu.Lock()
+	if l.conn == conn {
+		l.published = true
+		l.broadcastLocked()
 	}
+	l.mu.Unlock()
 }
 
 // switchTo moves to a specific address now, which is what ConnectResetRequest
@@ -223,6 +240,7 @@ func (l *lifecycle) streamLost(dead *sdkConn) {
 		return
 	}
 	l.conn, l.addr = nil, ""
+	l.published = false
 	l.generation++
 	l.broadcastLocked()
 	l.mu.Unlock()
@@ -298,15 +316,19 @@ func (l *lifecycle) nextBackoff() time.Duration {
 
 // --- state readers, shared by both domains ---
 
-// WaitReady blocks until a handshaked connection exists, ctx ends, or Close runs.
+// WaitReady blocks until a connection is current *and* its intents have been
+// applied on it (onReady plus a replay that returned nil), until ctx ends, or
+// until Close runs. A connection whose replay failed is never vouched for: it is
+// retired and the supervisor tries again.
+//
 // The error wraps ErrUnavailable and names the list plus the last failure, so a
 // caller can log *why* it is degraded instead of "it didn't connect".
 func (l *lifecycle) WaitReady(ctx context.Context) error {
 	for {
 		l.mu.Lock()
-		conn, sig, msg := l.conn, l.signal, l.lastErr
+		conn, sig, msg, published := l.conn, l.signal, l.lastErr, l.published
 		l.mu.Unlock()
-		if conn != nil && conn.Ready() {
+		if published && conn != nil && conn.Ready() {
 			return nil
 		}
 		select {
@@ -429,6 +451,7 @@ func (l *lifecycle) closeConn() error {
 	l.mu.Lock()
 	conn := l.conn
 	l.conn, l.addr = nil, ""
+	l.published = false
 	l.broadcastLocked()
 	l.mu.Unlock()
 	if conn == nil {

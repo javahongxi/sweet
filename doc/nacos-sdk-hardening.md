@@ -411,3 +411,36 @@ happens-before。这是上一轮把 `Conn.closed` 改成 `atomic.Bool`（双锁�
 证伪与实证都过了：修前这条测试 0.836s 必红，报出的正是同一签名的 `DATA RACE`（`Close` 于 `:755`
 对 `offer` 于 `:493`）；修后 `-race -count=10` 全绿，原先那条 `TestPushDroppedIsReported` 在
 `-count=20` 下也不再冒红。窗口宽度没有量——它是调度决定的，能钉的是"不再重叠"。
+
+### WaitReady 的语义收紧（2026-11-04）
+
+**根因。** `publish` 原来在锁内就 `broadcastLocked()`，出锁之后才 `onReady` 与 `replay`。于是
+`WaitReady` 会在意图还没落上去时就返回 nil——"被发布的连接必然带着意图"这句话在 `WaitReady`
+返回的那一刻并不成立。`TestLifecycleKeepsRetryingUntilTheServerAnswers` 那 2%–3% 的红就是这一条
+的抽样表现（它假定 `WaitReady` 回来时钩子已经跑过）。基线数字：`e18376f` 9/480、`41db317` 4/240、
+`122e5ab` 7/240、本次改动前 8/240——**早于今天所有改动**，中途我怀疑过是 Tier 1 引入的，扩样之后
+被自己的数据推翻（`e18376f` 那个 0/240 是运气）。
+
+**做法。** `lifecycle` 加一个 `published`：连接成为 current 时置 false，`onReady` + 一次返回 nil 的
+`replay` 之后置 true；`streamLost` 与 `closeConn` 清零。`WaitReady` 的谓词改成
+`published && conn != nil && conn.Ready()`；广播挪到最后，并加身份检查 `l.conn == conn`，
+免得被取代的 generation 给自己发凭证。replay 失败时不广播，直接 retire 交给 supervisor 重试。
+
+**为什么连接要提前 current。** `replay` 自己要用 `liveConn()` 把注册与重订阅发出去，所以
+"能用"必然早于"可担保"。`liveConn()` 因此**保持宽松**——它是"我现在能不能发请求"的门，
+不是"意图都落了吗"的门；后者是 `WaitReady` 的职责。把两者混成一个谓词会直接把 replay 锁死。
+
+**影响面。** 非测试调用点只有 `example/gateway/main.go:228` 的 `cfg.WaitReady`。config 的 replay
+在没有 watcher 时走 `listen(nil)`，`config_client.go:335` 直接返回 nil，所以不会自锁或卡启动。
+
+**测试（规格先行）。** 新增两条，都在改之前 0.00s 必红、之后 `-count=2` 绿：
+
+- `TestWaitReadyWaitsForReplay`：把 replay 钩子扣住不放，`WaitReady` 必须超时返回错误。
+  扣住钩子而不是等计数器，是为了把断言变成**顺序**问题而不是赛跑问题。
+- `TestWaitReadyDoesNotReportReadyWhenReplayFails`：第一次 replay 注定失败并被扣住，`WaitReady`
+  不得为它发凭证；释放后必须成功，且 `replays ≥ 2`、`currentConn()` 仍 Ready。
+
+**收益可量化。** 那条老 flake 归零：`-race -count=40` 连跑六轮 = 240 次迭代，0 失败。
+
+**没做的。** 真机最外环没跑——这条改的正是重连重放的时序，按纪律单元测试替代不了它。
+restart drill 与 ConnectReset 都需要你那套 8848 加人工重启，等你安排。

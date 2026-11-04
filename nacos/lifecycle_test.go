@@ -247,3 +247,123 @@ func TestLifecycleBackoffGrowsCapsAndJitters(t *testing.T) {
 		t.Error("no jitter across 80 draws — a fleet would retry in lockstep")
 	}
 }
+
+// --- what WaitReady is allowed to claim ------------------------------------
+
+// TestWaitReadyWaitsForReplay tightens the contract to match the invariant
+// publish documents: "a connection that is current has the intents applied to it".
+// Before this, publish installed the connection and woke WaitReady *before*
+// onReady and replay ran, so a caller that obeyed WaitReady could act on a node
+// that had not been told anything yet.
+//
+// The replay hook blocks here, which pins the ordering deterministically instead
+// of racing for a counter to increment: while replay has not returned, WaitReady
+// must not say ready.
+func TestWaitReadyWaitsForReplay(t *testing.T) {
+	stub := &probeStub{}
+	addr := startProbeStub(t, stub)
+	l, spy, done := newSpyLifecycle(t, []string{addr}, 0)
+	defer done()
+
+	inReplay := make(chan struct{}, 1)
+	release := make(chan struct{})
+	l.replay = func() error {
+		spy.mu.Lock()
+		spy.replays++
+		spy.mu.Unlock()
+		select {
+		case inReplay <- struct{}{}:
+		default:
+		}
+		<-release // hold publish open while the intents are being applied
+		return nil
+	}
+
+	go l.start()
+
+	select {
+	case <-inReplay:
+	case <-time.After(8 * time.Second):
+		t.Fatal("replay never started; nothing to hold the ready signal behind")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := l.WaitReady(ctx); err == nil {
+		close(release)
+		t.Fatal("WaitReady returned nil while replay was still in flight — the caller would believe the intents are on this node when they are not")
+	}
+
+	close(release)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel2()
+	if err := l.WaitReady(ctx2); err != nil {
+		t.Fatalf("WaitReady after the replay completed: %v", err)
+	}
+	if _, replays, ready := spy.counts(); replays == 0 || ready == 0 {
+		t.Errorf("counts after WaitReady: ready=%d replays=%d, want both non-zero", ready, replays)
+	}
+}
+
+// TestWaitReadyDoesNotReportReadyWhenReplayFails is the other half: a replay that
+// fails retires the connection, so that generation must never be reported as
+// ready, and the supervisor has to land a connection whose replay actually
+// succeeded before WaitReady returns nil.
+//
+// The first attempt is held inside the hook until the test releases it, so the
+// assertion is about ordering rather than about winning a race against the retry
+// backoff.
+func TestWaitReadyDoesNotReportReadyWhenReplayFails(t *testing.T) {
+	stub := &probeStub{}
+	addr := startProbeStub(t, stub)
+	l, spy, done := newSpyLifecycle(t, []string{addr}, 0)
+	defer done()
+
+	firstEntered := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	l.replay = func() error {
+		spy.mu.Lock()
+		spy.replays++
+		n := spy.replays
+		spy.mu.Unlock()
+		if n == 1 {
+			select {
+			case firstEntered <- struct{}{}:
+			default:
+			}
+			<-releaseFirst
+			return errors.New("spy: replay refused")
+		}
+		return nil
+	}
+
+	go l.start()
+
+	select {
+	case <-firstEntered:
+	case <-time.After(8 * time.Second):
+		t.Fatal("the first replay never started")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := l.WaitReady(ctx); err == nil {
+		close(releaseFirst)
+		t.Fatal("WaitReady vouched for a connection whose replay is known to fail")
+	}
+
+	close(releaseFirst)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	if err := l.WaitReady(ctx2); err != nil {
+		t.Fatalf("WaitReady should succeed once a replay lands: %v", err)
+	}
+	if _, replays, _ := spy.counts(); replays < 2 {
+		t.Errorf("replays = %d, want at least 2 (one refusal then a success)", replays)
+	}
+	if c, _ := l.currentConn(); c == nil || !c.Ready() {
+		t.Error("WaitReady returned ready for a connection that is not current")
+	}
+}
