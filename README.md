@@ -129,7 +129,7 @@ if err := srv.Listen(); err != nil { ... }   // 同步点：返回 nil 后 Addr(
 defer srv.Stop()                             // 注销 → 等 drain → GracefulStop
 ```
 
-两个容易踩的点：`Serve()` 是阻塞的；注册发生在开始 accept **之前**，所以对端不会解析到一个还没就绪的地址。
+两个容易踩的点：`Serve()` 是阻塞的；注册发生在开始 accept **之前**，所以那一小段窗口里对端能解析到一个**连得上、但没人读**的地址——调用挂到自己的 deadline 报 `DEADLINE_EXCEEDED`（不是 connection refused），`grpc.Serve` 起来后同一条 `ClientConn` 立刻成功。次序保持现状是定案，实测与 go-zero / dubbo-go / jaws 的对照见 `doc/service-publish-order.md`。
 
 ### 客户端
 

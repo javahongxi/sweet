@@ -196,8 +196,14 @@ func (s *Server) ServiceName() string {
 
 // Serve listens, exposes the instance, and blocks until Stop is called.
 //
-// Registration happens before the listener starts accepting, so a peer can
-// never resolve an address that is not yet ready to serve.
+// Expose runs before grpc.Serve starts accepting, so a peer can resolve this
+// instance while the port is bound but nobody is reading yet: the TCP handshake
+// completes into the kernel's backlog, the call waits for a server preface that
+// cannot arrive yet, and it ends at its deadline with DEADLINE_EXCEEDED rather
+// than a fast "connection refused". Once Serve runs the same ClientConn succeeds
+// without re-dialling. Keeping this order is a settled decision; the measurement
+// and the go-zero / dubbo-go / jaws comparison are in
+// doc/service-publish-order.md.
 func (s *Server) Serve() error {
 	lis, err := net.Listen("tcp", s.opts.Address)
 	if err != nil {
@@ -236,10 +242,10 @@ func (s *Server) Serve() error {
 	names := append([]string(nil), s.names...)
 	s.mu.Unlock()
 
-	// Statuses move to SERVING before peers are told the instance exists, and
-	// this still happens before grpc.Serve starts accepting, so there is no
-	// window in which a probe could observe SERVING for an address that refuses
-	// connections — nor NOT_SERVING for one that is already answering.
+	// SERVING is set after Expose and before grpc.Serve, so a probe in this window
+	// hangs like any other call rather than reading a status (see Serve). Stop() is
+	// not the mirror image: it flips to NOT_SERVING while the socket is still
+	// answering, so in-flight calls finish during the drain.
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	for _, name := range names {
 		s.health.SetServingStatus(name, healthpb.HealthCheckResponse_SERVING)
