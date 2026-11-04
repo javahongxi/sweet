@@ -622,7 +622,8 @@ func TestUpdateDroppedZeroWhenDrained(t *testing.T) {
 // resets when the stream is replaced; a list lost to a full Updates() stays lost
 // across the reconnect, so the owner's view is still stale and the number must
 // still say so. Two buffers with two lifetimes cannot share one counter without
-// the reader having to know which one it is looking at.
+// the reader having to know which one it is looking at. Both halves are asserted
+// here: this number survives, the connection's resets.
 func TestUpdateDroppedSurvivesReconnect(t *testing.T) {
 	s := newNamingStub()
 	addr := startNamingStub(t, s)
@@ -657,5 +658,12 @@ func TestUpdateDroppedSurvivesReconnect(t *testing.T) {
 
 	if got := n.UpdateDropped(); got != lost {
 		t.Errorf("UpdateDropped() = %d after reconnect, want %d — a lost list is still lost", got, lost)
+	}
+
+	// The other half of why these are two numbers: the connection's own counter
+	// belongs to the connection, so the new one starts clean. If this ever reads
+	// non-zero, the buffers are no longer separable and folding them would be fine.
+	if got := n.PushDropped(); got != 0 {
+		t.Errorf("PushDropped() = %d on the fresh connection, want 0 — the two counters would no longer have different lifetimes", got)
 	}
 }
