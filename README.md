@@ -179,7 +179,7 @@ call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传
 | 重试走 gRPC 原生 service config，sweet 不自带重试旋钮 | `TestNativeRetryAppliesThroughSweetDial` + 负对照 `TestWithoutRetryConfigTheInjectionSticks` | 配 retryPolicy 时服务端看到 3 次尝试、调用成功；不配时只看到 1 次并直接把 UNAVAILABLE 抛给调用方（grpc-go 对 UNAVAILABLE 不做透明重试） |
 | 手写 `ServiceDesc` 与生成码一样会走服务端一元拦截器 | `TestUnaryHandlerInvokesTheInterceptor` | grpc-go 把拦截器链交给 desc 的 handler 去调用；手写 desc 若丢弃第 4 个参数，服务端一元拦截器会全部静默失效 |
 | Nacos 不可达时的快照回落，**默认关** | `TestWatchFallsBackToSnapshot` + 负对照 `TestWatchWithoutSnapshotDirStillFails` | 设了 `SnapshotDir` 才在冷拨号或订阅失败时投递带 age 的旧列表并回调通知；不设时同一场景仍然报错。另有真停掉本机 Nacos 的冷启动端到端（见「注册中心不可达时」）|
-| 配置的**读侧**：notify 只带 key，客户端回拉内容并用新 md5 重新 listen；重连后 re-listen | `TestConfigWatchPullsAfterNotify`、`TestListenResponseStaleSubsetIsPulled`、`TestConfigReplayAfterReconnect`（`nacos/config_test.go`） | 真机（本地 3.2.3、`9848`，一次运行、全程未重启）发布 2 条路由表后 2s 报 `applied 2 route(s)`；同一天补跑验的是删除方向——表 A 换表 C 后旧路径 404、新路径 200，且"配置本来不存在 → 首次发布"也会被 notify→回拉→装上。读数在 `doc/nacos-config-routes.md`。**写路径不经本库**：Nacos 3.x 已移除 v1 HTTP 口，发布/删除走 `/nacos/v3/admin/cs/config`（参数名 `groupName`）|
+| 配置的**读侧**：notify 只带 key，客户端回拉内容并用新 md5 重新 listen；重连后 re-listen | `TestConfigWatchPullsAfterNotify`、`TestListenResponseStaleSubsetIsPulled`、`TestConfigReplayAfterReconnect`（`nacos/config_client_test.go`） | 真机（本地 3.2.3、`9848`，一次运行、全程未重启）发布 2 条路由表后 2s 报 `applied 2 route(s)`；同一天补跑验的是删除方向——表 A 换表 C 后旧路径 404、新路径 200，且"配置本来不存在 → 首次发布"也会被 notify→回拉→装上。读数在 `doc/nacos-config-routes.md`。**写路径不经本库**：Nacos 3.x 已移除 v1 HTTP 口，发布/删除走 `/nacos/v3/admin/cs/config`（参数名 `groupName`）|
 
 ## 标准工具能直接看见它
 

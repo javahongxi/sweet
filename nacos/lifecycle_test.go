@@ -12,7 +12,7 @@ import (
 
 // The skeleton is where the hard-won connection rules now live, so the rules are
 // tested here once rather than re-proved per domain. The domain suites
-// (config_test.go, naming_client_test.go) keep their own end-to-end coverage;
+// (config_client_test.go, naming_client_test.go) keep their own end-to-end coverage;
 // what these pin is behaviour that must be identical for both.
 
 // lcSpy counts what the lifecycle's hooks did, so assertions read the skeleton's

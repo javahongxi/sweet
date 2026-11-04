@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,4 +139,41 @@ func startProbeStub(t *testing.T, s *probeStub) string {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	return lis.Addr().String()
+}
+
+// --- package-wide test helpers ----------------------------------------------
+//
+// These live here rather than in a domain's test file because every suite in the
+// package uses them: auth_test.go, naming_client_test.go, config_client_test.go.
+// Keeping them in one harness file is what stops "which file owns waitWithin" from
+// being decided by whoever added it first.
+
+func itoa(n int) string {
+	b, _ := json.Marshal(n)
+	return strings.Trim(string(b), `"`)
+}
+
+func closeQuietly(ch chan struct{}) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
+func waitForCond(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	waitWithin(t, 3*time.Second, what, cond)
+}
+
+// waitWithin polls cond until it holds or the budget runs out. Assertions in this
+// package are about ordering and side effects that land asynchronously, so a bare
+// sleep would either flake or hide a real failure behind a long wait.
+func waitWithin(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }

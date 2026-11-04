@@ -2,7 +2,6 @@ package nacos
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -366,33 +365,6 @@ func serveConfigStub(t *testing.T, lis net.Listener, s *configStub) *grpc.Server
 	t.Cleanup(srv.Stop)
 	t.Cleanup(func() { closeQuietly(s.kill) })
 	return srv
-}
-
-func itoa(n int) string {
-	b, _ := json.Marshal(n)
-	return strings.Trim(string(b), `"`)
-}
-
-func closeQuietly(ch chan struct{}) {
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
-func waitForCond(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	waitWithin(t, 3*time.Second, what, cond)
-}
-
-func waitWithin(t *testing.T, budget time.Duration, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(budget)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
 }
 
 func newTestConfigClient(t *testing.T, addr string) *ConfigClient {

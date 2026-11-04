@@ -514,8 +514,14 @@ notify"——不是客户端坏了，是桩在教错的形状：它把脚本化�
 回的是**监听者自己上报的那个 tenant**（`NamespaceUtil.java:44-49` 把空串规范成 `namespaceDefaultId`，
 `AsyncNotifyService.java:170` 发 `task.getTenant()`）。客户端的 watcher 键现在是 `"public"`，
 推来的却是 `""`，查不到就不回调——桩如果不忠实，"测不出来"会一路伪装成"没坏"。改成：脚本没给 tenant
-时，桩从已记录的 listen 里取该键的 tenant 填上（`config_test.go` 的 `tenantListenedFor`）。
+时，桩从已记录的 listen 里取该键的 tenant 填上（`tenantListenedFor`）。
 `TestConfigQueryRoundTrip` 里那句 `got.Tenant != ""` 也跟着改成 `"public"`——它原先断言的正是这个错形状。
+
+同日把 `nacos/config_test.go` 改名成 `config_client_test.go`：源文件叫 `config_client.go`，测试却按
+域名缩写命名，而命名侧早就是 `naming_client.go` ↔ `naming_client_test.go`。顺手把寄住在这个域文件里
+的四个全包共用小工具（`waitWithin`/`waitForCond`/`itoa`/`closeQuietly`，`auth_test.go` 与
+`naming_client_test.go` 都在用）搬进共享 harness 文件 `probestub_test.go`——否则"域名+角色"的错位只是
+换了个位置：一个域名的文件里住着全包的地基。
 
 **真机闭环（同一天，同一台 3.2.3）**：改前用空 namespace 跑那个探针是 `errorCode=500` NPE（2/2）；
 改后同一条命令 `NAMESPACE=`（空）跑通——`21:52:31.707 registered: server sees 1 host(s)`，同一次运行里
