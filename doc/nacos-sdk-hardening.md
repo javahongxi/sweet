@@ -444,3 +444,91 @@ happens-before。这是上一轮把 `Conn.closed` 改成 `atomic.Bool`（双锁�
 
 **没做的。** 真机最外环没跑——这条改的正是重连重放的时序，按纪律单元测试替代不了它。
 restart drill 与 ConnectReset 都需要你那套 8848 加人工重启，等你安排。
+（下一节把这些读数补上了。）
+
+### 真机最外环已跑（2026-11-04，本地 Nacos 3.2.3 单节点 9848）
+
+收紧之后补的外环读数，全部取自同一次运行、同一台服务端（pid 49060，
+`nacos.core.auth.enabled=false`、`nacos.core.auth.admin.enabled=false`）。
+
+**① rolling restart drill**（`registry/nacos/restart_drill_test.go`，provider 由测试自己起停）：
+
+```
+round 0: took down 21001, converged to the survivor 21002 in 561.135542ms
+round 1: took down 21002, converged to the survivor 21003 in 557.764917ms
+calls=175 failures=0 ([]) state-updates=6 convergence=[561.135375ms 557.764917ms]
+```
+
+`-race` 开、PASS 5.67s。`failures=0` 是不漂的那半，`calls` 随运行次数变。
+
+**② `-run Live` 六条**（握手能力表、一元 ServerCheck、setup 不被调用方超时拆掉、探针通道事实、
+注册/查询/注销、订阅种子与推送）：对真服务端全 PASS。
+
+**③ ConnectReset**（服务端赶连接 → ack → 换节点 → 重放）。触发方式记下来，下次不用重新找：
+`POST /nacos/v3/admin/core/loader/reloadClient?connectionId=<SDK connectionId>`
+（`ServerLoaderControllerV3.java:117`，类级映射是 `NACOS_ADMIN_CORE_CONTEXT_V3 + "/loader"`）。
+**POST 必须带 Content-Type**——`http.Post(url, "", nil)` 会被 Spring 顶回来：
+`Invalid mime type "": 'mimeType' must not be empty`。单节点列表下 `redirectAddress` 为空 ⇒ 原地重建。
+读数（毫秒级，同一次运行）：
+
+```
+21:02:25.526 connected  connectionId=1793797345523_127.0.0.1_62438   replayed registrations=0
+21:02:25.527 registered: server sees 1 host(s) after 0s
+21:02:25.532 server asked this connection to reset; moving to another node  recommended=:
+21:02:25.536 connected  connectionId=1793797345534_127.0.0.1_62440
+21:02:25.537 replayed registrations=1
+21:02:25.541 WaitReady after switch returned in 0s; server hosts=1 instance-present=true
+```
+
+一句限定：`WaitReady after switch returned in 0s` **不能**当作"收紧生效"的证据——问的时候切换已经
+完成了。把顺序钉死的是单元测试里那条扣住 replay 钩子的断言（改前 0.00s 必红）。这里读到的是"真服务端
+赶连接时，注册确实被重放到新连接上、服务端仍列着它"。
+
+**④ 顺手撞出来的一个真缺口（未修，等定夺）。** `NamingOptions.Namespace` 的注释写着"Empty namespace
+means public"，但真 3.2.3 上第一次 `Register` 就被拒：
+
+```
+nacos: request refused: register registerInstance sweet.example.v1.ResetProbe
+(errorCode=500): Cannot invoke "String.equals(Object)" because "this.namespace" is null
+```
+
+机制在 `naming_types.go:51/63/75/110`——`Namespace string json:"namespace,omitempty"`，空值被
+`omitempty` 整个省掉，服务端那个字段是 null 而不是空串，于是 NPE。复现 2/2。
+`registry/nacos` 之所以一直没撞上，是它自己在 `nacos.go:102-103` 把空 Namespace 兜成了 `"public"`——
+**适配层补的洞，库层没补**，而库的注释还把"空＝public"当契约写给了外人。三个候选：在
+`NewNamingClient` 里默认成 `public`；或去掉 `omitempty` 把空串真的发出去（服务端收空串会不会同样炸，
+没测）；或把注释改成"必须显式给 namespace"。这是行为/契约改动，没动。
+
+**⑤ `TestReconnectAfterServerRestart`：先发现它是假绿，再把它修成能绿的。**
+
+原测试（`registry/nacos/persist_probe_test.go`）只等"实例还在"：`Expose` 之后每 5 秒 `Query` 一次，
+只要返回同一个 port 就判 recovered。可是什么都不重启时注册当然还在——实测它 **5.02s 就 PASS**
+（Nacos 进程 `etime` 未变、9848 一直在听，作为对照证据）。也就是说这条测试无法区分"服务端把连接
+拿走之后客户端重放成功"与"什么都没发生"，而 README 拿它当"服务端重启后重连并重放"的钉子——那根
+钉子当时是空的。人手动重启最快也要十几秒，测试早就返回了，所以"由人重启"这个流程本身也保证不了
+重启落在断言窗口里。
+
+改成两段，第一段必须先**观察到消失**（`Query` 报错或返回 0 个实例；每次探测用自己的短 ctx，
+否则共享 ctx 的 deadline 会和"消失"长得一模一样；`context.DeadlineExceeded`/`Canceled` 明确不算
+消失），第二段才等它带着同一个 port 回来——期间没人再调 `Expose`，所以回来只能是重放。
+证伪跑过了：**不重启时修后的测试 FAIL 在 180.32s**，文本就是"never observed the registration
+disappearing — the server was not restarted, so this run cannot tell a successful replay from
+nothing happening"。
+
+真跑（2026-11-04，同一台 3.2.3，`-race`）。重启用的是安全姿势：`kill <pid>`（SIGTERM），
+**不碰 `bin/shutdown.sh`**——它那句 `pgrep -f nacos.nacos` 会全机杀 Nacos；启动前先 `cd` 进安装目录，
+否则 `derby.log` 与 `logs/` 会被写进当前仓库根目录。时间线：
+
+```
+21:20:30  SIGTERM -> pid 49060        21:20:32  进程退出、9848 closed
+21:20:32.189  loss observed: query failed: nacos: server unavailable ... on cooldown
+              (last error: ... transport: Error while dialing: dial tcp 127.0.0.1:9848: connect: connection refused)
+21:20:40  9848 open again（新 pid 71728，中断约 10 秒）
+21:20:48  recovered 16s after the loss: registration replayed automatically
+          (instances=[{127.0.0.1 50015 100 map[]}])
+--- PASS: TestReconnectAfterServerRestart (44.08s)
+```
+
+重启后另跑了一遍 `-run Live` 六条确认服务端健康（`nacos` ok 4.590s、`registry/nacos` ok 2.746s），
+drill 起过的 provider 进程与端口都无残留。derby 里的配置这次没数（上次核过 2248 条无损），
+如果要精确核对得走 v3 管理口读一遍——本轮没做，标在这里。

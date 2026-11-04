@@ -170,8 +170,8 @@ call option、keepalive）通过 `Dial` 与 `Options.ServerOptions` 原样透传
 | 建连：先一元 `ServerCheckRequest` 拿 connectionId，再开 bidi | `TestLiveSetupHandshakeIsAcknowledged`（`nacos/integration_test.go`） | 拿回服务端能力表 |
 | 保活探针与死流检测 | `TestLiveProbeChannelFacts`（`nacos/detect_test.go`） | 一元通道有应答、bidi 流上无人应答，两条都断言 |
 | ephemeral 实例的活性＝那条 bidi 连接 | `TestIdleRegistrationSurvives`（`registry/nacos/persist_probe_test.go`） | 空载 3 分钟 12 次探测，实例始终在 |
-| 服务端重启后重连并重放注册与订阅 | `TestReconnectAfterServerRestart`（同上文件） | 手动跑：要 `SWEET_RESTART_DRILL=1` 并由人重启 Nacos，否则 skip——它不在自动跑的那轮里 |
-| 优雅上下线：先注销、再 drain、再停止 accept | `TestRollingRestartDrill`（`registry/nacos/restart_drill_test.go`） | `calls=180 failures=0`，收敛 559.5ms / 611.1ms |
+| 服务端重启后重连并**重放注册** | `TestReconnectAfterServerRestart`（同上文件） | 手动跑（`SWEET_RESTART_DRILL=1`，否则 skip），2026-11-04 真机跑过：SIGTERM 重启那套 3.2.3，约 10 秒后 9848 回来；客户端 `21:20:32.189` 观察到注册消失，**16 秒后注册自己回来**，期间没人再调 `Expose`。这条测试原先只等"实例还在"、不重启也 5s 通过，现在要求先观察到消失（见 `doc/nacos-sdk-hardening.md`）|
+| 优雅上下线：先注销、再 drain、再停止 accept | `TestRollingRestartDrill`（`registry/nacos/restart_drill_test.go`） | `failures=0` 是不漂的那半；`calls` 随运行次数变（记录时 `calls=180`、收敛 559.5ms / 611.1ms，2026-11-04 复跑 `calls=175`、收敛 561.14ms / 557.76ms）|
 | 长命 goroutine 里的 panic 不拖垮进程 | `TestGuardConvertsPanicToStreamLoss`（`nacos/panic_guard_test.go`） | panic→hook 收到原因，`Ready()` 转 false，重握手后 `Epoch()≥2` |
 | 错误可分类 | `TestCauseStaysClassifiableThroughWrapping`（`nacos/errors_test.go`） | 三层包装后 Unavailable / Canceled 都取得到 |
 | 与改不了的 grpc-go 桩互通 | `TestNativeClientCallsSweetServer`、`TestNativeServerAcceptsGeneratedStreamViaSweet`、`TestSweetClientDiscoversNativeServer`（`interoptest/`） | stock `grpc.health.v1.Health` 的一元与生成式流方法都通，两个方向都测 |
