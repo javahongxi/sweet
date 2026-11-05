@@ -21,6 +21,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/javahongxi/sweet/client"
 	"github.com/javahongxi/sweet/registry"
@@ -36,6 +37,56 @@ func plural(n int, noun string) string {
 		return "1 " + noun
 	}
 	return strconv.Itoa(n) + " " + noun + "s"
+}
+
+// unaryInterceptor logs method, duration, and status for every unary client call.
+func unaryInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply any,
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	start := time.Now()
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	duration := time.Since(start)
+
+	code := "OK"
+	if err != nil {
+		if s, ok := status.FromError(err); ok {
+			code = s.Code().String()
+		} else {
+			code = "UNKNOWN"
+		}
+	}
+	log.Printf("[unary] %s duration=%v code=%s", method, duration, code)
+	return err
+}
+
+// streamInterceptor logs method for every streaming client call.
+func streamInterceptor(
+	ctx context.Context,
+	desc *grpc.StreamDesc,
+	cc *grpc.ClientConn,
+	method string,
+	streamer grpc.Streamer,
+	opts ...grpc.CallOption,
+) (grpc.ClientStream, error) {
+	start := time.Now()
+	s, err := streamer(ctx, desc, cc, method, opts...)
+	duration := time.Since(start)
+
+	code := "OK"
+	if err != nil {
+		if s, ok := status.FromError(err); ok {
+			code = s.Code().String()
+		} else {
+			code = "UNKNOWN"
+		}
+	}
+	log.Printf("[streaming] %s duration=%v code=%s", method, duration, code)
+	return s, err
 }
 
 func main() {
@@ -89,7 +140,13 @@ func main() {
 		log.Fatalf("unknown -registry %q", *registryKind)
 	}
 
-	conn, err := client.Dial(reg, *service, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Client interceptors are passed as grpc.DialOption: unary for request/response,
+	// stream for bidirectional and server/client streaming methods.
+	conn, err := client.Dial(reg, *service,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(unaryInterceptor),
+		grpc.WithChainStreamInterceptor(streamInterceptor),
+	)
 	if err != nil {
 		log.Fatalf("client.Dial: %v", err)
 	}

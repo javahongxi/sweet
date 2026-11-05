@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -132,6 +133,50 @@ func (greeter) GreetAll(stream pb.Greeter_GreetAllServer) error {
 	}
 }
 
+// unaryInterceptor logs method, duration, and status code for every unary RPC.
+func unaryInterceptor(
+	ctx context.Context,
+	req any,
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (any, error) {
+	start := time.Now()
+	resp, err := handler(ctx, req)
+	duration := time.Since(start)
+
+	code := codes.OK
+	if err != nil {
+		if s, ok := status.FromError(err); ok {
+			code = s.Code()
+		}
+	}
+	log.Printf("[unary] %s duration=%v code=%s",
+		info.FullMethod, duration, code)
+	return resp, err
+}
+
+// streamInterceptor logs method and duration for every streaming RPC.
+func streamInterceptor(
+	srv any,
+	ss grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler,
+) error {
+	start := time.Now()
+	err := handler(srv, ss)
+	duration := time.Since(start)
+
+	code := codes.OK
+	if err != nil {
+		if s, ok := status.FromError(err); ok {
+			code = s.Code()
+		}
+	}
+	log.Printf("[streaming] %s duration=%v code=%s",
+		info.FullMethod, duration, code)
+	return err
+}
+
 func main() {
 	listen := flag.String("listen", "127.0.0.1:20001", "address to listen on")
 	advertise := flag.String("advertise", "", "address reported to the registry (default: -listen)")
@@ -167,6 +212,12 @@ func main() {
 		Weight:      *weight,
 		Registry:    reg,
 		DrainDelay:  200 * time.Millisecond,
+		// Interceptors are passed as grpc.ServerOptions: unary for request/response,
+		// stream for bidirectional and server/client streaming methods.
+		ServerOptions: []grpc.ServerOption{
+			grpc.ChainUnaryInterceptor(unaryInterceptor),
+			grpc.ChainStreamInterceptor(streamInterceptor),
+		},
 	})
 	if err != nil {
 		log.Fatalf("server.New: %v", err)
