@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/javahongxi/sweet/gen"
@@ -55,10 +56,19 @@ func TestProbeBidiFramesDumpsEverythingReceived(t *testing.T) {
 	}
 	defer c.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := c.openStream(); err != nil {
-		t.Fatalf("openStream: %v", err)
+	// Do not use openStream here: it starts readLoop, and a gRPC stream must
+	// have only one receiver. This raw probe owns the stream so it can inspect
+	// the setup ack that readLoop would otherwise consume internally. The stream
+	// context also releases a blocked RecvMsg without leaving a goroutine behind.
+	cs, err := c.cc.NewStream(ctx, &grpc.StreamDesc{
+		StreamName:    "requestBiStream",
+		ServerStreams: true,
+		ClientStreams: true,
+	}, methodBidi)
+	if err != nil {
+		t.Fatalf("open raw stream: %v", err)
 	}
 	setup := ConnectionSetupRequest{ClientVersion: clientVersion, Tenant: "public",
 		Labels: map[string]string{"source": "sdk", "module": "naming"}}
@@ -66,33 +76,21 @@ func TestProbeBidiFramesDumpsEverythingReceived(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := c.send(p); err != nil {
+	if err := cs.SendMsg(p); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		var frame gen.Payload
-		rctx, rcancel := context.WithTimeout(ctx, time.Second)
-		_ = rctx
-		cs := c.stream
-		rcancel()
-		if cs == nil {
-			break
-		}
-		done := make(chan error, 1)
-		go func() { done <- cs.RecvMsg(&frame) }()
-		select {
-		case err := <-done:
-			if err != nil {
+		if err := cs.RecvMsg(&frame); err != nil {
+			if ctx.Err() != nil {
+				t.Log("probe window closed: no further frame")
+			} else {
 				t.Logf("recv ended: %v", err)
-				return
 			}
-			meta, _ := json.Marshal(frame.GetMetadata())
-			t.Logf("frame: metadata=%s body=%s", meta, frame.GetBody().GetValue())
-		case <-time.After(2 * time.Second):
-			t.Log("no further frame within 2s")
 			return
 		}
+		meta, _ := json.Marshal(frame.GetMetadata())
+		t.Logf("frame: metadata=%s body=%s", meta, frame.GetBody().GetValue())
 	}
 }
 

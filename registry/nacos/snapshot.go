@@ -151,11 +151,11 @@ func hostOf(in registry.Instance, hosts []naming.Instance) naming.Instance {
 // subscription intent is kept so the reconnect loop re-subscribes and replaces it,
 // and the staleness is announced rather than hidden.
 //
-// The caller must have already appended ch to r.watchers for this service.
-func (r *Registry) serveStaleOnFailure(ctx context.Context, serviceName string, ch chan []registry.Instance, cause error) error {
+// The caller must have already appended w to r.watchers for this service.
+func (r *Registry) serveStaleOnFailure(ctx context.Context, serviceName string, w *watcher, cause error) error {
 	insts, age, ok := r.snapshot(serviceName)
 	if !ok {
-		r.dropWatcher(serviceName, ch)
+		r.dropWatcher(serviceName, w)
 		return fmt.Errorf("nacos: subscribe %s: %w", serviceName, cause)
 	}
 
@@ -168,11 +168,11 @@ func (r *Registry) serveStaleOnFailure(ctx context.Context, serviceName string, 
 	if r.opts.OnSnapshotFallback != nil {
 		r.opts.OnSnapshotFallback(serviceName, insts, age)
 	}
-	select {
-	case ch <- insts:
-	case <-ctx.Done():
-		r.dropWatcher(serviceName, ch)
-		return ctx.Err()
+	// Cache and fan out through the same path as a live subscribe response so
+	// watchers that joined during the failed call also receive the snapshot.
+	r.deliver(serviceName, insts, false)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }

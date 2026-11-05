@@ -2,8 +2,10 @@ package nacos
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -143,6 +145,101 @@ func TestLiveWatchSeedsAndPushes(t *testing.T) {
 		}
 	}
 	t.Fatal("no push observed after a registration")
+}
+
+// TestLiveWatchSharedSnapshotAndCancellation exercises the adapter contract
+// against Nacos itself: a later watcher gets the latest pushed view, cancelling
+// it leaves its sibling subscribed, and cancelling the last watcher clears the
+// shared subscription intent.
+func TestLiveWatchSharedSnapshotAndCancellation(t *testing.T) {
+	reg, err := New(Options{ServerAddr: liveAddr(t)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer reg.Close()
+
+	service := fmt.Sprintf("sweet.example.v1.LiveWatchShared.%d", time.Now().UnixNano())
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	first, err := reg.Watch(firstCtx, service)
+	if err != nil {
+		t.Fatalf("first Watch: %v", err)
+	}
+	select {
+	case seed := <-first:
+		if len(seed) != 0 {
+			t.Fatalf("initial snapshot for a new service = %v, want empty", seed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("first Watch delivered no initial snapshot")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	port1 := freePort(t)
+	unreg1, err := reg.Expose(ctx, service, instanceAt(port1))
+	if err != nil {
+		t.Fatalf("first Expose: %v", err)
+	}
+	defer unreg1()
+	waitForLiveInstance(t, first, port1)
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	second, err := reg.Watch(secondCtx, service)
+	if err != nil {
+		t.Fatalf("second Watch: %v", err)
+	}
+	// No second wire subscription or extra push is needed: this list must come
+	// from the view cached while the first watcher received its push.
+	waitForLiveInstance(t, second, port1)
+	cancelSecond()
+	requireWatcherClosed(t, second)
+	waitForWatchers(t, reg, service, 1)
+	if !slices.Contains(reg.client.Subscribed(), service) {
+		t.Fatal("cancelling one watcher cleared the surviving watcher's subscription")
+	}
+
+	port2 := freePort(t)
+	unreg2, err := reg.Expose(ctx, service, instanceAt(port2))
+	if err != nil {
+		t.Fatalf("second Expose: %v", err)
+	}
+	defer unreg2()
+	waitForLiveInstance(t, first, port2)
+
+	cancelFirst()
+	requireWatcherClosed(t, first)
+	waitForWatchers(t, reg, service, 0)
+	deadline := time.Now().Add(5 * time.Second)
+	for slices.Contains(reg.client.Subscribed(), service) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if slices.Contains(reg.client.Subscribed(), service) {
+		t.Fatal("last watcher cancellation left a live subscription intent")
+	}
+}
+
+func waitForLiveInstance(t *testing.T, ch <-chan []registry.Instance, port int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	var last []registry.Instance
+	for time.Now().Before(deadline) {
+		select {
+		case insts, ok := <-ch:
+			if !ok {
+				t.Fatalf("watcher closed while waiting for port %d", port)
+			}
+			last = insts
+			for _, in := range insts {
+				if in.Port == port {
+					return
+				}
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatalf("no snapshot or push contained port %d within 15s; last list = %v", port, last)
 }
 
 func instanceAt(port int) registry.Instance {
