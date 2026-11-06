@@ -5,6 +5,9 @@
 传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。
 
 sweet 内置 HTTP-to-gRPC 网关，支持从 Nacos 动态加载路由配置并自动发现后端服务实例。
+网关支持 path/query/body 绑定、已编译 protobuf descriptor 自动类型解析、unary/server-streaming、
+响应 metadata 白名单与 NDJSON `result/error` 信封；设计取舍见 `doc/grpc-gateway-adaptation.md`，
+运行示例见 `example/gateway/README.md`。
 
 ## 是什么 / 不是什么
 
@@ -287,6 +290,7 @@ after hold  <= "Hello, sweet!"
 - `example/greeter/README.md`——proto 生成码的 Go 调 Go，四种形态；末尾有它和 helloworld 的
   逐项对照表，两份代码的差别只有"手写 vs 生成"。
 - `example/jaws-wire/README.md`——Go 客户端调 Java 服务端（jaws 的 wire provider），跨语言实测。
+- `doc/grpc-gateway-adaptation.md`——grpc-gateway 功能调研、Sweet 的转码协议选择与后续路线。
 - 反方向的样例在 jaws 仓库：`jaws-samples/jaws-sample-wire-sweet`，jaws 的 wire 客户端经 Nacos
   发现并调用 sweet 起的 grpc-go 服务。
 - 取舍写在代码注释里，两处最值钱：`registry/nacos/nacos.go` 的文件头（ephemeral 这一条路径的

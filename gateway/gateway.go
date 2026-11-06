@@ -15,20 +15,19 @@
 //     in band when 200 is already committed — see serveStream. Client streaming
 //     and bidi need a duplex transport (WebSocket, or SSE plus a second POST)
 //     and are not half-implemented here.
-//   - No protoc plugin, no generated proxy. Message types are always Go: either
-//     a route carries its own constructors (Handle) or it names a service and
-//     method that Options.Services resolves (ApplyRoutes). A route table can
-//     therefore be data — published from a config centre — while every type
-//     behind it stays compiled and assertable from this package's own tests,
-//     instead of living in generated code nobody reads. It is the same trade
-//     sweet makes in gen/: generate messages, keep the method table in Go.
+//   - No protoc plugin, no generated proxy. A route either carries its own
+//     constructors (Handle), or ApplyRoutes resolves its method from an explicit
+//     Options.Services override or the process's compiled protobuf descriptors.
+//     Generated Go message types are preferred, with dynamic protobuf messages
+//     as a fallback. A route table can therefore be data published from a config
+//     centre without requiring provider-side reflection or descriptor files.
 //   - No new dependency. JSON to protobuf goes through protojson, and
 //     google.golang.org/protobuf is already required by the generated stubs.
 //   - Routing is a table lookup, not http.ServeMux. ServeMux answers an
 //     unmatched method with its own plain-text 405 that cannot be replaced, and
 //     an edge that speaks two error formats is an edge nobody debugs. Exact
-//     path matching is also all a gRPC route needs: a method is one operation,
-//     so there is nothing for a wildcard to say.
+//     paths use a map fast path; single-segment {field} templates cover path
+//     parameters without introducing a general-purpose HTTP router.
 package gateway
 
 import (
@@ -45,6 +44,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/javahongxi/sweet/client"
@@ -53,11 +53,11 @@ import (
 
 // Route is one HTTP endpoint mapped onto one gRPC method.
 type Route struct {
-	// Method is the HTTP method to match, e.g. "POST". One method per route: an
-	// RPC is one operation, and letting GET reach the same method would mean
-	// inventing a second encoding for query strings.
+	// Method is the HTTP method to match, e.g. "POST". Each route selects one
+	// method and one body/path/query binding for its RPC.
 	Method string
-	// Path is matched exactly, e.g. "/v1/greeter/greet".
+	// Path is a literal path or a template whose {field} variables each occupy
+	// one complete segment, e.g. "/v1/users/{name}".
 	Path string
 	// Service is the name handed to the registry. It is a lookup key and
 	// nothing else — it need not equal the gRPC service name inside FullMethod,
@@ -77,14 +77,25 @@ type Route struct {
 	// transport (WebSocket or SSE plus a second POST), and a half-built duplex
 	// endpoint is worse than an absent one.
 	ServerStream bool
+	// Body selects the request binding. Nil preserves the original whole-body
+	// behaviour; "" means path/query only, "*" means the whole message, and a
+	// field path such as "book" or "input.book" binds just that field.
+	Body *string
+	// ResponseBody optionally selects one response field instead of the whole
+	// reply. It applies to unary responses and every server-streaming frame.
+	ResponseBody string
 	// NewRequest and NewReply construct the message types. They are functions
 	// rather than values because every call needs a fresh message: one shared
 	// instance would let concurrent requests decode into each other.
 	NewRequest func() proto.Message
 	NewReply   func() proto.Message
+
+	pattern        *pathTemplate
+	bodyFields     fieldPath
+	responseFields fieldPath
 }
 
-func (r Route) validate() error {
+func (r *Route) validate() error {
 	switch {
 	case r.Method == "":
 		return errors.New("gateway: route needs an HTTP method")
@@ -101,6 +112,35 @@ func (r Route) validate() error {
 	case r.NewRequest == nil || r.NewReply == nil:
 		return fmt.Errorf("gateway: route %s %s needs both message constructors", r.Method, r.Path)
 	}
+	pattern, err := parsePathTemplate(r.Path)
+	if err != nil {
+		return fmt.Errorf("gateway: route %s %s: %w", r.Method, r.Path, err)
+	}
+	requestDescriptor := r.NewRequest().ProtoReflect().Descriptor()
+	if pattern.templated() {
+		if err := pattern.bind(requestDescriptor); err != nil {
+			return fmt.Errorf("gateway: route %s %s: %w", r.Method, r.Path, err)
+		}
+		r.pattern = pattern
+	}
+	if r.Body != nil {
+		body := *r.Body
+		r.Body = &body
+		switch body {
+		case "", "*":
+		default:
+			r.bodyFields, err = resolveFieldPath(requestDescriptor, body)
+			if err != nil {
+				return fmt.Errorf("gateway: route %s %s: body: %w", r.Method, r.Path, err)
+			}
+		}
+	}
+	if r.ResponseBody != "" {
+		r.responseFields, err = resolveFieldPath(r.NewReply().ProtoReflect().Descriptor(), r.ResponseBody)
+		if err != nil {
+			return fmt.Errorf("gateway: route %s %s: responseBody: %w", r.Method, r.Path, err)
+		}
+	}
 	return nil
 }
 
@@ -110,12 +150,9 @@ type Options struct {
 	Registry registry.Registry
 
 	// Services maps a gRPC service name — the part of RouteSpec.FullMethod
-	// before the method, e.g. "sweet.example.v1.Greeter" — to the Go message
-	// types of its methods. Only ApplyRoutes consults it; routes declared with
-	// Handle carry their own constructors.
-	//
-	// This is what lets a route table live in a config centre: the mapping is
-	// data, the types stay compiled.
+	// before the method, e.g. "sweet.example.v1.Greeter" — to explicit message
+	// constructors. ApplyRoutes prefers this override when present; otherwise it
+	// resolves the method from compiled descriptors. Handle does not consult it.
 	Services map[string]ServiceTypes
 
 	// RouteCacheFile, when set, keeps every table accepted by ApplyRoutes on disk
@@ -162,6 +199,11 @@ type Options struct {
 	// is always dropped, and why.
 	ForwardHeaders []string
 
+	// ForwardResponseHeaders and ForwardResponseTrailers are explicit allowlists
+	// for backend metadata exposed to the HTTP caller. Both default to empty.
+	ForwardResponseHeaders  []string
+	ForwardResponseTrailers []string
+
 	// VerboseErrors surfaces the backend's status message at the edge. Off by
 	// default: a gateway faces whoever can reach it, and an internal status
 	// string is the information leak nobody scheduled a fix for.
@@ -184,10 +226,11 @@ type Gateway struct {
 	// service, and a grpc.ClientConn is meant to be shared and long-lived —
 	// re-dialling per request would discard the connection the resolver just
 	// worked to establish.
-	mu     sync.Mutex
-	routes []Route
-	byPath map[string]*entry
-	conns  map[string]*grpc.ClientConn
+	mu       sync.Mutex
+	routes   []Route
+	byPath   map[string]*entry
+	patterns []Route
+	conns    map[string]*grpc.ClientConn
 
 	httpSrv *http.Server
 	lis     net.Listener
@@ -219,15 +262,27 @@ func (g *Gateway) Handle(r Route) error {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	e := g.byPath[r.Path]
-	if e == nil {
-		e = &entry{byMethod: map[string]Route{}}
-		g.byPath[r.Path] = e
+	if r.pattern.templated() {
+		for _, existing := range g.patterns {
+			if existing.Method == r.Method && existing.pattern.key() == r.pattern.key() {
+				return fmt.Errorf("gateway: equivalent route template %s %s is already registered", r.Method, r.Path)
+			}
+		}
+		g.patterns = append(g.patterns, r)
+		sort.SliceStable(g.patterns, func(i, j int) bool {
+			return g.patterns[i].pattern.literals > g.patterns[j].pattern.literals
+		})
+	} else {
+		e := g.byPath[r.Path]
+		if e == nil {
+			e = &entry{byMethod: map[string]Route{}}
+			g.byPath[r.Path] = e
+		}
+		if _, dup := e.byMethod[r.Method]; dup {
+			return fmt.Errorf("gateway: route %s %s is already registered", r.Method, r.Path)
+		}
+		e.byMethod[r.Method] = r
 	}
-	if _, dup := e.byMethod[r.Method]; dup {
-		return fmt.Errorf("gateway: route %s %s is already registered", r.Method, r.Path)
-	}
-	e.byMethod[r.Method] = r
 	g.routes = append(g.routes, r)
 	return nil
 }
@@ -255,9 +310,33 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	g.mu.Lock()
-	e := g.byPath[p]
+	var route Route
+	var pathValues map[string]string
+	matched := false
+	allowedSet := make(map[string]struct{})
+	if e := g.byPath[p]; e != nil {
+		if candidate, ok := e.byMethod[r.Method]; ok {
+			route, matched = candidate, true
+		}
+		for method := range e.byMethod {
+			allowedSet[method] = struct{}{}
+		}
+	}
+	if !matched {
+		for _, candidate := range g.patterns {
+			values, ok := candidate.pattern.match(p)
+			if !ok {
+				continue
+			}
+			allowedSet[candidate.Method] = struct{}{}
+			if candidate.Method == r.Method {
+				route, pathValues, matched = candidate, values, true
+				break
+			}
+		}
+	}
 	g.mu.Unlock()
-	if e == nil {
+	if !matched && len(allowedSet) == 0 {
 		// A -1 code number says what happened: the request never became an RPC,
 		// so no gRPC status exists to report. Callers can tell a missing route
 		// from a service that answered NOT_FOUND without parsing prose.
@@ -265,10 +344,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("no route for %s %s", r.Method, p), -1)
 		return
 	}
-	route, ok := e.byMethod[r.Method]
-	if !ok {
-		allowed := make([]string, 0, len(e.byMethod))
-		for m := range e.byMethod {
+	if !matched {
+		allowed := make([]string, 0, len(allowedSet))
+		for m := range allowedSet {
 			allowed = append(allowed, m)
 		}
 		sort.Strings(allowed)
@@ -283,7 +361,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("%s is not allowed on %s; try %s", r.Method, p, strings.Join(allowed, " or ")), -1)
 		return
 	}
-	g.serve(w, r, route)
+	g.serve(w, r, route, pathValues)
 }
 
 // ListenAndServe binds addr and serves until Shutdown. Addr reports the bound
@@ -358,14 +436,14 @@ func (g *Gateway) conn(service string) (*grpc.ClientConn, error) {
 // serve is the whole request path: decode, invoke, encode. Nothing in it is
 // specific to any service — the lookup name, the gRPC method and the message
 // types all come from the route table.
-func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, rt Route) {
+func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, rt Route, pathValues map[string]string) {
 	if rt.ServerStream {
-		g.serveStream(w, r, rt)
+		g.serveStream(w, r, rt, pathValues)
 		return
 	}
 
 	req := rt.NewRequest()
-	if err := decodeRequest(r.Body, req, g.opts.AllowUnknownFields); err != nil {
+	if err := decodeRequest(r, rt, pathValues, req, g.opts.AllowUnknownFields); err != nil {
 		// The caller's JSON is wrong, so this is InvalidArgument by
 		// construction. Letting it reach the RPC would produce a confusing
 		// error from a service that never saw the bytes.
@@ -384,21 +462,29 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, rt Route) {
 	}
 
 	reply := rt.NewReply()
-	if err := conn.Invoke(ctx, rt.FullMethod, req, reply); err != nil {
+	var responseHeader, responseTrailer metadata.MD
+	err = conn.Invoke(ctx, rt.FullMethod, req, reply,
+		grpc.Header(&responseHeader), grpc.Trailer(&responseTrailer))
+	copyResponseHeaders(w.Header(), responseHeader, g.opts.ForwardResponseHeaders)
+	declaredTrailers := declareResponseTrailers(w.Header(), r, g.opts.ForwardResponseTrailers)
+	if err != nil {
 		writeStatus(w, err, g.opts.VerboseErrors)
+		writeResponseTrailers(w.Header(), responseTrailer, declaredTrailers)
 		return
 	}
 
 	// Encode before committing headers. Marshalling a valid message can still
 	// fail, and the body is the only place a 500 can still be told from a 200.
-	body, err := marshalReply(reply)
+	body, err := marshalResponse(reply, rt.responseFields)
 	if err != nil {
 		writeStatus(w, err, g.opts.VerboseErrors)
+		writeResponseTrailers(w.Header(), responseTrailer, declaredTrailers)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+	writeResponseTrailers(w.Header(), responseTrailer, declaredTrailers)
 }
 
 // ndjsonContentType is the media type a streaming answer carries: one JSON
@@ -434,14 +520,12 @@ const ndjsonContentType = "application/x-ndjson"
 // HTTP trailers would be the protocol-native place for that, but a trailer is
 // invisible to curl without --trailer and unreadable from a browser's fetch
 // body, so the failure would silently look like a successful truncated stream.
-// The in-band key is "error", which is the one collision risk this encoding has:
-// a reply message with a top-level field named error is indistinguishable from a
-// terminal line. Naming that field something else in the IDL is the fix; the
-// alternative — wrapping every frame — would change the shape of the success
-// path to serve a rare failure.
-func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, rt Route) {
+// Success records are {"result":...} and terminal errors are {"error":...}.
+// The two envelopes keep a reply's own top-level error field unambiguous, while
+// retaining the in-band terminal error that browsers and curl can actually see.
+func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, rt Route, pathValues map[string]string) {
 	req := rt.NewRequest()
-	if err := decodeRequest(r.Body, req, g.opts.AllowUnknownFields); err != nil {
+	if err := decodeRequest(r, rt, pathValues, req, g.opts.AllowUnknownFields); err != nil {
 		writeStatus(w, err, g.opts.VerboseErrors)
 		return
 	}
@@ -474,18 +558,32 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, rt Route) 
 	// do not forward Flush, at the cost of the real-time property.
 	flusher, _ := w.(http.Flusher)
 	committed := false
+	metadataReady := false
+	var declaredTrailers map[string]string
+	prepareResponse := func() {
+		if metadataReady {
+			return
+		}
+		metadataReady = true
+		header, _ := stream.Header()
+		copyResponseHeaders(w.Header(), header, g.opts.ForwardResponseHeaders)
+		declaredTrailers = declareResponseTrailers(w.Header(), r, g.opts.ForwardResponseTrailers)
+	}
 
 	for {
 		frame := rt.NewReply()
 		err := stream.RecvMsg(frame)
+		prepareResponse()
 		if err == nil {
-			data, merr := marshalReply(frame)
+			data, merr := marshalStreamResult(frame, rt.responseFields)
 			if merr != nil {
 				if !committed {
 					writeStatus(w, merr, g.opts.VerboseErrors)
+					writeResponseTrailers(w.Header(), stream.Trailer(), declaredTrailers)
 					return
 				}
 				writeInBandError(w, flusher, merr, g.opts.VerboseErrors)
+				writeResponseTrailers(w.Header(), stream.Trailer(), declaredTrailers)
 				return
 			}
 			if !committed {
@@ -511,14 +609,17 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, rt Route) 
 				w.Header().Set("Content-Type", ndjsonContentType)
 				w.WriteHeader(http.StatusOK)
 			}
+			writeResponseTrailers(w.Header(), stream.Trailer(), declaredTrailers)
 			return
 		}
 
 		if !committed {
 			writeStatus(w, err, g.opts.VerboseErrors)
+			writeResponseTrailers(w.Header(), stream.Trailer(), declaredTrailers)
 			return
 		}
 		writeInBandError(w, flusher, err, g.opts.VerboseErrors)
+		writeResponseTrailers(w.Header(), stream.Trailer(), declaredTrailers)
 		return
 	}
 }

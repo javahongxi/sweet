@@ -42,8 +42,9 @@ go run ./example/gateway -registry=direct -endpoints 127.0.0.1:20001
 ## 路由表来自配置中心（`-routes=nacos`）
 
 默认 `embedded`：两条路由写在 Go 里，开箱可跑。加上 `-routes=nacos` 之后，路由表变成一个
-Nacos 配置项——**映射是数据，消息类型仍然是编译期的 Go**（`gateway.Options.Services` 那张表）。
-格式与契约的来由见 `doc/nacos-config-routes.md`。
+Nacos 配置项——**映射是数据，消息类型与流式基数来自网关进程内已编译的 protobuf descriptor**，
+不再要求填写 `gateway.Options.Services`；该表仍保留为显式覆盖入口。格式与契约见
+`doc/nacos-config-routes.md`，设计取舍见 `doc/grpc-gateway-adaptation.md`。
 
 发布表（Nacos 3.x 的管理口是 v3，参数名是 `groupName`，不是 v1 那套 `group`）：
 
@@ -56,6 +57,21 @@ curl -s -X POST 'http://127.0.0.1:8848/nacos/v3/admin/cs/config' \
 
 go run ./example/gateway -routes=nacos -listen 127.0.0.1:20112
 ```
+
+路由还支持 path/query/body 绑定。例如下面这条 GET 路由从路径取 `name`，从 query 取其余未绑定
+字段，并只返回响应的 `message` 字段：
+
+```json
+{"method":"GET","path":"/v1/greeter/{name}","service":"sweet.example.v1.Greeter",
+ "fullMethod":"/sweet.example.v1.Greeter/Greet","body":"","responseBody":"message"}
+```
+
+`body` 缺省或为 `"*"` 时表示整个 JSON 请求体，`""` 表示仅 path/query，`"name"` 这类字段路径
+表示只绑定该字段。路径变量目前只支持 `{field}` / `{a.b}` 单段形式；`serverStream` 可由 descriptor
+自动推导。流式成功帧当前为 `{"result":{...}}`，提交 200 后的终错为 `{"error":{...}}`。
+
+下文保留了 2026-11-02 等日期的历史真机日志；协议示例已按当前实现改写，本次升级没有把旧真机
+运行重新执行一遍，验证范围是网关端到端单元测试与离线全量测试。
 
 实测（2026-11-02，本地 Nacos 3.2.3，同一次运行、同一端口 20112，全程没重启网关）。
 先只发一条一元路由：
@@ -81,9 +97,9 @@ $ curl -s localhost:20112/v1/greeter/greet -d '{"name":"web"}'
 2026-11-02 20:46:56   POST /v1/greeter/greet-stream -> /sweet.example.v1.Greeter/GreetStream via sweet.example.v1.Greeter
 
 $ curl -sN localhost:20112/v1/greeter/greet-stream -d '{"name":"web","times":3}'
-{"message":"Hello #1, web!"}
-{"message":"Hello #2, web!"}
-{"message":"Hello #3, web!"}
+{"result":{"message":"Hello #1, web!"}}
+{"result":{"message":"Hello #2, web!"}}
+{"result":{"message":"Hello #3, web!"}}
 ```
 
 第三发是这一节真正要验的那件事——**坏表不能把线上表带走**。故意发一条指向未注册方法的路由：
@@ -262,9 +278,9 @@ Content-Type: application/x-ndjson
 Date: Thu, 29 Oct 2026 19:20:57 GMT
 Transfer-Encoding: chunked
 
-{"message":"Hello #1, web!"}
-{"message":"Hello #2, web!"}
-{"message":"Hello #3, web!"}
+{"result":{"message":"Hello #1, web!"}}
+{"result":{"message":"Hello #2, web!"}}
+{"result":{"message":"Hello #3, web!"}}
 
 == B stream zero frames ==
 HTTP/1.1 200 OK
@@ -285,7 +301,7 @@ Content-Length: 88
 ```
 
 行数以 200 帧那一发核过：`curl -sN … -d '{"name":"web","times":200}'` 落地 `lines=200`，首行
-`{"message":"Hello #1, web!"}`，末行 `{"message":"Hello #200, web!"}`。
+`{"result":{"message":"Hello #1, web!"}}`，末行 `{"result":{"message":"Hello #200, web!"}}`。
 
 **A** 是这一节的主题：一帧一行、`application/x-ndjson`、`Transfer-Encoding: chunked`。
 
@@ -326,9 +342,8 @@ http: superfluous response.WriteHeader call from github.com/javahongxi/sweet/gat
 
 - **客户端流与双向流**。服务端流已经做了（NDJSON、逐帧 flush、带内终错）；反过来的两种形态需要一个双工
   传输——WebSocket，或 SSE 配第二个 POST——半成品入口比没有入口更坏。
-- **带内错误行的键名冲突**。流一旦吐过帧，终错就只能写成 `{"error":{…}}` 这一行。所以 IDL 里如果有
-  哪个回复消息带一个顶层字段恰好叫 `error`，它和错误行就分不开了。宁可接受这个约束也没给每帧套外壳：
-  为一类少见的失败把成功路径的形状改掉，是更贵的取舍。
+- **流客户端必须识别信封**。成功帧统一为 `{"result":…}`，终错为 `{"error":…}`，因此响应消息
+  自己带顶层 `error` 字段也不会混淆。这是相对旧版裸成功消息帧的破坏性协议调整，调用方需同步升级。
 - **传输安全**。`DialOptions` 不默认填凭据：一个面向外部的 HTTP 入口若悄悄用明文连后端，是没人
   会去看的那种 bug，所以凭据必须由调用方写明（这个例子写的是 insecure）。
 - **鉴权**。网关自己不校验 token，只按白名单把 header 转成 metadata；`authorization` 默认**不**转发，
@@ -338,7 +353,7 @@ http: superfluous response.WriteHeader call from github.com/javahongxi/sweet/gat
 
 ## 测试与边界
 
-网关的行为全部由 `gateway/` 包自己的测试钉住，`go test -race ./gateway/` 全绿：
+网关的行为全部由 `gateway/` 包自己的测试钉住，`go test ./gateway/` 全绿：
 
 | 想验的事 | 测试 |
 | --- | --- |
@@ -357,6 +372,9 @@ http: superfluous response.WriteHeader call from github.com/javahongxi/sweet/gat
 | 调用方的 deadline 优先于网关的兜底 | `TestDeadlinePropagation` |
 | 没有可用实例 → 503 | `TestNoInstancesIs503` |
 | header→metadata 白名单、`-bin` 转码、敏感头不外泄 | `TestForwardedHeaderPolicy`、`TestForwardedHeadersReachTheProvider` |
+| path/query/body、descriptor 自动解析与响应字段 | `TestCompiledDescriptorBindsPathQueryAndResponseBody`、`TestBodyFieldAndQueryBinding` |
+| repeated/map/enum/WKT 与 int64 精度 | `TestPopulateQueryScalarCollectionsAndWellKnownTypes`、`TestBodyCollectionsNestedPathAndResponseInt64` |
+| 响应 Header/Trailer 白名单与流式 result 信封 | `TestUnaryResponseMetadataAllowlistAndTrailers`、`TestStreamResponseMetadataAndResultEnvelope` |
 | 一个服务一条连接，不是每条路由一条 | `TestConnectionsAreSharedPerService` |
 | 响应字段名保持 proto 拼写 | `TestReplyShapeIsStable` |
 | 真实服务器上不再出现重复 WriteHeader | `TestRealServerErrorLogStaysClean` |

@@ -1,15 +1,16 @@
 # 网关路由外置：Nacos 配置域客户端（手写）
 
-范围说明与验收判据。做完即冻结，不加东西。
+范围说明与验收判据。文中“本轮”“冻结”指 2026-11-02 的配置域客户端阶段；后续网关转码升级
+已在 `doc/grpc-gateway-adaptation.md` 中单独决策，历史验收记录保留，不伪装成新做的真机测试。
 
 ## 目标
 
-sweet 的 HTTP→gRPC 网关今天每条路由都在 Go 里声明（`gateway/gateway.go` 的 `Route`
-带 `NewRequest`/`NewReply` 两个闭包）。本改动把**策略**（HTTP 方法/路径 → 注册中心查找名
-→ gRPC 方法、是否服务端流）外置到 Nacos 配置，**类型**仍留在 Go：按 gRPC 服务名注册一张
-消息工厂表。效果是「给已接入的服务加一条 HTTP 映射」变成改配置、不重编网关。
+sweet 的 HTTP→gRPC 网关最初每条路由都在 Go 里声明（`gateway/gateway.go` 的 `Route`
+带 `NewRequest`/`NewReply` 两个闭包）。配置域阶段把**策略**（HTTP 方法/路径 → 注册中心查找名
+→ gRPC 方法、是否服务端流）外置到 Nacos，**类型**仍留在 Go。后续升级进一步支持从进程内
+已编译 descriptor 自动取得类型与流式基数，因此通常连 `Options.Services` 消息工厂表也不必填写。
 
-reflection / descriptor 那条路（连类型也不用编译）**不在本轮**，见「不做」。
+这不要求 provider 开启 reflection，也不加载 descriptor 文件；Proto 的 Go 包必须链接进网关进程。
 
 ## 契约锚点（nacos @3.2.3，本地 checkout，`git describe` = 3.2.3）
 
@@ -37,13 +38,15 @@ reflection / descriptor 那条路（连类型也不用编译）**不在本轮**�
   的 `accessToken`（或 `username`/`password`），**每请求校验**；未开鉴权时跳过
   （`RemoteRequestAuthFilter.java:84-86`）。
 
-## 不做
+## 原阶段不做（历史范围）
 
 1. 不引 `nacos-sdk-go`；不引 YAML/TOML——配置格式用 JSON + `encoding/json`。
-2. 不做 reflection / descriptor 动态消息（那是第二步，且优先 descriptor 文件）。
+2. 原阶段不做 reflection / descriptor 动态消息；后续已实现的是**进程内已编译 descriptor**，
+   不是服务端 reflection，也不是 descriptor 文件。
 3. 不实现写回：`ConfigPublishRequest` / `ConfigRemoveRequest` 不做，只读。
 4. 不做 fuzzy watch、灰度(beta) 配置、`encryptedDataKey` 解密、多 dataId 聚合。
-5. 不改路由匹配语义：仍是精确路径 + 单方法，通配/前缀匹配不做。
+5. 原阶段不改路由匹配语义；后续仅增加 `{field}` / `{a.b}` 单段路径变量，仍不做 `*`、`**`
+   通配或前缀匹配。
 6. 不动 naming 侧任何行为；不给 config 与 naming 共用连接（官方即两条）。
 7. 新增文档不挂门面 README。
 
@@ -52,13 +55,18 @@ reflection / descriptor 那条路（连类型也不用编译）**不在本轮**�
 dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间走 `-namespace`：
 
 ```json
-{"routes":[{"method":"POST","path":"/v1/greeter/greet","service":"greeter-provider",
-  "fullMethod":"/sweet.example.v1.Greeter/Greet","serverStream":false}]}
+{"routes":[
+  {"method":"POST","path":"/v1/greeter/greet","service":"greeter-provider",
+   "fullMethod":"/sweet.example.v1.Greeter/Greet","body":"*"},
+  {"method":"GET","path":"/v1/greeter/{name}","service":"greeter-provider",
+   "fullMethod":"/sweet.example.v1.Greeter/GreetStream","body":"","responseBody":"message"}
+]}
 ```
 
-`service` 是注册中心查找名（与 gRPC 服务名可以不同，jaws 服务就是 `jaws/<FQN>`）；
-消息类型由 `gateway.Options.Services` 那张表（`map[服务名]ServiceTypes`，键是方法名）
-按 `fullMethod` 解析出来。
+`service` 是注册中心查找名（与 gRPC 服务名可以不同，jaws 服务就是 `jaws/<FQN>`）；消息类型
+优先取 `Options.Services` 显式覆盖，未配置时按 `fullMethod` 从已编译 descriptor 解析，流式基数
+也自动推导。`body` 缺省兼容旧表的整请求体行为，`"*"` 显式整包，`""` 仅 path/query，字段路径
+则绑定局部 body；`responseBody` 选择响应字段。所有字段路径在换表前校验，失败仍整批拒绝。
 
 ## 关键语义决定
 
@@ -179,8 +187,8 @@ $ curl -s localhost:20116/v1/greeter/greet -d '{"name":"still-cold"}'
 （`TestAckClassIsARegisteredPayload`），并把 `ConnectResetRequest → EmptyResponse` 这种
 字符串规则推不出来的情形写进注释。
 
-## 冻结
+## 原阶段冻结结论
 
-以上七条达成即冻结：不加 fuzzy watch、不加写回、不加 descriptor/reflection、不把 config 与
-naming 合并成一条连接。第二步（类型也不用编译）另开，且优先 descriptor 文件。
+上述配置域阶段达成后冻结的是：不加 fuzzy watch、不加写回、不把 config 与 naming 合并成一条连接。
+后续 descriptor 与 HTTP 绑定升级没有改变这些边界；配置写路径仍由 Nacos admin API 或控制台负责。
 

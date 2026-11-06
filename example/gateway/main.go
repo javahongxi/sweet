@@ -10,9 +10,9 @@
 // POST), and a half-built duplex endpoint is worse than an absent one.
 //
 // The route table can also come from Nacos' config domain, which is the point of
-// -routes=nacos: the mapping HTTP path → gRPC method becomes data an operator
-// edits, while the message types stay compiled Go (Options.Services). The
-// gateway then applies a new table without a restart, and refuses a bad one
+// -routes=nacos: the HTTP binding becomes data an operator edits, while method
+// types and streaming cardinality come from the compiled protobuf descriptors.
+// The gateway applies a new table without a restart, and refuses a bad one
 // without touching the live one.
 //
 // Run it after starting the provider, e.g.
@@ -28,8 +28,8 @@
 // To drive the table from a config centre instead (see doc/nacos-config-routes.md
 // for the format and the contract it rests on):
 //
-//	curl -s -X POST 'http://127.0.0.1:8848/nacos/v1/cs/configs' \
-//	  -d dataId=sweet-gateway-routes.json -d group=DEFAULT_GROUP \
+//	curl -s -X POST 'http://127.0.0.1:8848/nacos/v3/admin/cs/config' \
+//	  -d dataId=sweet-gateway-routes.json -d groupName=DEFAULT_GROUP \
 //	  --data-urlencode 'content={"routes":[{"method":"POST","path":"/v1/greeter/greet",
 //	    "service":"sweet.example.v1.Greeter","fullMethod":"/sweet.example.v1.Greeter/Greet"}]}'
 //	go run ./example/gateway -routes=nacos
@@ -116,22 +116,9 @@ func main() {
 		DialOptions:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
 		RequestTimeout: *timeout,
 		VerboseErrors:  *verbose,
-		// The compiled half of a config-driven table: what a route in Nacos may
-		// name. Only the two methods this gateway can actually serve are listed,
-		// so a table asking for client streaming is refused at apply time with
-		// "method not registered" rather than half-served as a unary call.
-		Services: map[string]gateway.ServiceTypes{
-			pb.Greeter_ServiceDesc.ServiceName: {
-				"Greet": {
-					Request: func() proto.Message { return &pb.GreetRequest{} },
-					Reply:   func() proto.Message { return &pb.GreetReply{} },
-				},
-				"GreetStream": {
-					Request: func() proto.Message { return &pb.GreetRequest{} },
-					Reply:   func() proto.Message { return &pb.GreetReply{} },
-				},
-			},
-		},
+		// Nacos routes resolve their types from greeterpb's compiled descriptors.
+		// Options.Services remains available as an explicit override for users
+		// whose message constructors need custom behaviour.
 		RouteCacheFile:   *routeCache,
 		RouteCacheSource: *routesGroup + "/" + *routesDataID,
 		OnRouteCache: func(err error) {

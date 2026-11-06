@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +66,35 @@ func TestRouteCacheRoundTrip(t *testing.T) {
 	}
 	if rec := post(t, g2, `{"name":"cold"}`); rec.Code != http.StatusOK {
 		t.Fatalf("restored gateway: status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRouteCacheRoundTripPreservesHTTPBindings(t *testing.T) {
+	b := newBackend(t, "greeter")
+	path := filepath.Join(t.TempDir(), "routes.cache.json")
+	spec := greetSpec("/v1/cache/{name}")
+	spec.Method = http.MethodGet
+	spec.Body = stringPointer("")
+	spec.ResponseBody = "message"
+
+	g := newCacheGateway(t, b, path)
+	if err := g.ApplyRoutes([]RouteSpec{spec}); err != nil {
+		t.Fatalf("ApplyRoutes: %v", err)
+	}
+	g2 := newCacheGateway(t, b, path)
+	applied, _, err := g2.RestoreRoutes()
+	if err != nil || !applied {
+		t.Fatalf("RestoreRoutes = (%v, %v)", applied, err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/cache/cold", nil)
+	rec := httptest.NewRecorder()
+	g2.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "\"Hello, cold!|\"" {
+		t.Fatalf("restored binding: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	restored := g2.Routes()[0]
+	if restored.Body == nil || *restored.Body != "" || restored.ResponseBody != "message" {
+		t.Fatalf("bindings lost in cache: body=%v responseBody=%q", restored.Body, restored.ResponseBody)
 	}
 }
 

@@ -6,23 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
 )
 
-// RouteSpec is the data form of a Route: everything a route table can say
-// without naming a Go type. The message constructors stay in Go, registered
-// per service in Options.Services, because a config file cannot carry a
-// func() proto.Message and pretending otherwise would mean generating or
-// discovering types at runtime — which is the reflection route this package
-// deliberately does not take (see doc/nacos-config-routes.md, 不做 #2).
+// RouteSpec is the data form of a Route. Method types come from explicit
+// Options.Services overrides or the compiled protobuf descriptors already
+// linked into the gateway process; the config itself never names a Go type.
 type RouteSpec struct {
-	Method       string `json:"method"`
-	Path         string `json:"path"`
-	Service      string `json:"service"`
-	FullMethod   string `json:"fullMethod"`
-	ServerStream bool   `json:"serverStream,omitempty"`
+	Method       string  `json:"method"`
+	Path         string  `json:"path"`
+	Service      string  `json:"service"`
+	FullMethod   string  `json:"fullMethod"`
+	ServerStream bool    `json:"serverStream,omitempty"`
+	Body         *string `json:"body,omitempty"`
+	ResponseBody string  `json:"responseBody,omitempty"`
 }
 
 // MessageTypes constructs the two messages of one gRPC method. Fresh instances
@@ -82,19 +82,26 @@ func (g *Gateway) resolve(s RouteSpec) (Route, error) {
 	if err != nil {
 		return Route{}, fmt.Errorf("gateway: route %s %s: %w", s.Method, s.Path, err)
 	}
-	types, ok := g.opts.Services[service]
-	if !ok {
-		return Route{}, fmt.Errorf("gateway: route %s %s: gRPC service %q is not registered in Options.Services",
-			s.Method, s.Path, service)
-	}
-	mt, ok := types[method]
-	if !ok {
-		names := make([]string, 0, len(types))
-		for m := range types {
-			names = append(names, m)
+	var mt MessageTypes
+	serverStream := s.ServerStream
+	if types, ok := g.opts.Services[service]; ok {
+		var found bool
+		mt, found = types[method]
+		if !found {
+			names := make([]string, 0, len(types))
+			for m := range types {
+				names = append(names, m)
+			}
+			return Route{}, fmt.Errorf("gateway: route %s %s: method %q of service %q is not registered (known: %s)",
+				s.Method, s.Path, method, service, strings.Join(names, ", "))
 		}
-		return Route{}, fmt.Errorf("gateway: route %s %s: method %q of service %q is not registered (known: %s)",
-			s.Method, s.Path, method, service, strings.Join(names, ", "))
+	} else {
+		var err error
+		mt, serverStream, err = compiledMethod(service, method)
+		if err != nil {
+			return Route{}, fmt.Errorf("gateway: route %s %s: %w", s.Method, s.Path, err)
+		}
+		serverStream = serverStream || s.ServerStream
 	}
 	if mt.Request == nil || mt.Reply == nil {
 		return Route{}, fmt.Errorf("gateway: route %s %s: service %q method %q has no message constructors",
@@ -105,7 +112,9 @@ func (g *Gateway) resolve(s RouteSpec) (Route, error) {
 		Path:         s.Path,
 		Service:      s.Service,
 		FullMethod:   s.FullMethod,
-		ServerStream: s.ServerStream,
+		ServerStream: serverStream,
+		Body:         s.Body,
+		ResponseBody: s.ResponseBody,
 		NewRequest:   mt.Request,
 		NewReply:     mt.Reply,
 	}
@@ -148,10 +157,22 @@ func splitFullMethod(full string) (service, method string, err error) {
 func (g *Gateway) ApplyRoutes(specs []RouteSpec) error {
 	routes := make([]Route, 0, len(specs))
 	byPath := make(map[string]*entry, len(specs))
+	patterns := make([]Route, 0)
+	seenTemplates := make(map[string]struct{})
 	for _, s := range specs {
 		r, err := g.resolve(s)
 		if err != nil {
 			return err
+		}
+		if r.pattern.templated() {
+			key := r.Method + " " + r.pattern.key()
+			if _, dup := seenTemplates[key]; dup {
+				return fmt.Errorf("gateway: equivalent route template %s %s appears twice in one table", r.Method, r.Path)
+			}
+			seenTemplates[key] = struct{}{}
+			patterns = append(patterns, r)
+			routes = append(routes, r)
+			continue
 		}
 		e := byPath[r.Path]
 		if e == nil {
@@ -164,9 +185,13 @@ func (g *Gateway) ApplyRoutes(specs []RouteSpec) error {
 		e.byMethod[r.Method] = r
 		routes = append(routes, r)
 	}
+	sort.SliceStable(patterns, func(i, j int) bool {
+		return patterns[i].pattern.literals > patterns[j].pattern.literals
+	})
 
 	g.mu.Lock()
 	g.byPath = byPath
+	g.patterns = patterns
 	g.routes = routes
 	g.mu.Unlock()
 	// Only after the swap: the cache must never hold a table this gateway refused.

@@ -51,6 +51,11 @@ type testGreeter struct {
 //     HTTP side without a second RPC.
 func (testGreeter) Greet(ctx context.Context, in *pb.GreetRequest) (*pb.GreetReply, error) {
 	name := in.GetName()
+	if strings.HasPrefix(name, "meta") {
+		_ = grpc.SetHeader(ctx, metadata.Pairs(
+			"x-backend", "unary", "x-secret", "do-not-expose", "x-backend-bin", string([]byte{0, 1, 2})))
+		grpc.SetTrailer(ctx, metadata.Pairs("x-end", "unary-done", "x-secret-end", "hidden"))
+	}
 	if strings.HasPrefix(name, "fail:") {
 		raw := strings.TrimPrefix(name, "fail:")
 		n, err := strconv.Atoi(raw)
@@ -96,6 +101,10 @@ func (testGreeter) Greet(ctx context.Context, in *pb.GreetRequest) (*pb.GreetRep
 // successful stream, and the gateway must not turn that into an internal error.
 func (testGreeter) GreetStream(in *pb.GreetRequest, stream pb.Greeter_GreetStreamServer) error {
 	name := in.GetName()
+	if strings.HasPrefix(name, "meta") {
+		_ = stream.SendHeader(metadata.Pairs("x-backend", "stream", "x-secret", "do-not-expose"))
+		stream.SetTrailer(metadata.Pairs("x-end", "stream-done"))
+	}
 
 	switch {
 	case strings.HasPrefix(name, "fail:"):
@@ -899,15 +908,18 @@ func TestServerStreamEmitsOneLinePerFrame(t *testing.T) {
 		t.Fatalf("%d lines, want 3: %#v", len(got), got)
 	}
 	for i, line := range got {
-		var out map[string]any
-		if err := json.Unmarshal([]byte(line), &out); err != nil {
+		var envelope struct {
+			Result map[string]any `json:"result"`
+			Error  any            `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
 			t.Fatalf("line %d is not one JSON object (%q): %v", i+1, line, err)
 		}
 		want := fmt.Sprintf("Hello #%d, web!", i+1)
-		if out["message"] != want {
-			t.Errorf("line %d message = %v, want %q", i+1, out["message"], want)
+		if envelope.Result["message"] != want {
+			t.Errorf("line %d result.message = %v, want %q", i+1, envelope.Result["message"], want)
 		}
-		if _, isErr := out["error"]; isErr {
+		if envelope.Error != nil {
 			t.Errorf("line %d is an error line in a successful stream: %s", i+1, line)
 		}
 	}

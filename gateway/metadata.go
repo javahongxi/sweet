@@ -44,6 +44,7 @@ var neverForward = map[string]bool{
 	"te":                  true,
 	"trailer":             true,
 	"proxy-connection":    true,
+	"proxy-authenticate":  true,
 	"proxy-authorization": true,
 	"host":                true,
 	"expect":              true,
@@ -119,4 +120,90 @@ func isPrintableASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// copyResponseHeaders exposes only explicitly allowed backend metadata. The
+// same framing and alphabet rules apply in both directions: a gRPC server is
+// not a trusted source of arbitrary HTTP response headers.
+func copyResponseHeaders(header http.Header, md metadata.MD, allowed []string) {
+	for _, name := range allowed {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if !isGRPCKey(key) || neverForward[key] || strings.HasPrefix(key, "grpc-") {
+			continue
+		}
+		values, ok := responseMetadataValues(md, key)
+		if !ok {
+			continue
+		}
+		headerName := http.CanonicalHeaderKey(key)
+		header.Del(headerName)
+		for _, value := range values {
+			header.Add(headerName, value)
+		}
+	}
+}
+
+// declareResponseTrailers returns the metadata-key to HTTP-trailer-name mapping
+// that was actually announced. net/http only treats a post-WriteHeader Set as a
+// trailer when its name was declared first, so announcing and writing must use
+// this same map rather than two independently filtered lists.
+func declareResponseTrailers(header http.Header, r *http.Request, allowed []string) map[string]string {
+	if !acceptsTrailers(r) {
+		return nil
+	}
+	mapping := make(map[string]string)
+	var names []string
+	for _, name := range allowed {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if !isGRPCKey(key) || neverForward[key] || strings.HasPrefix(key, "grpc-") {
+			continue
+		}
+		trailerName := http.CanonicalHeaderKey("Grpc-Trailer-" + key)
+		mapping[key] = trailerName
+		names = append(names, trailerName)
+	}
+	if len(names) > 0 {
+		header.Set("Trailer", strings.Join(names, ", "))
+	}
+	return mapping
+}
+
+func writeResponseTrailers(header http.Header, md metadata.MD, declared map[string]string) {
+	for key, trailerName := range declared {
+		values, ok := responseMetadataValues(md, key)
+		if !ok {
+			continue
+		}
+		header[trailerName] = values
+	}
+}
+
+func responseMetadataValues(md metadata.MD, key string) ([]string, bool) {
+	values := md.Get(key)
+	if len(values) == 0 {
+		return nil, false
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.HasSuffix(key, "-bin") {
+			result = append(result, base64.StdEncoding.EncodeToString([]byte(value)))
+			continue
+		}
+		if !isPrintableASCII(value) {
+			return nil, false
+		}
+		result = append(result, value)
+	}
+	return result, true
+}
+
+func acceptsTrailers(r *http.Request) bool {
+	for _, line := range r.Header.Values("TE") {
+		for _, value := range strings.Split(line, ",") {
+			if strings.EqualFold(strings.TrimSpace(value), "trailers") {
+				return true
+			}
+		}
+	}
+	return false
 }
