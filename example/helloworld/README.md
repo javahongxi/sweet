@@ -54,6 +54,14 @@ Ack        == 1 frame from 3 requests
 nacos 那一发除了首两行（`resolved ... through nacos registry`、服务端 `registry=nacos`）之外，
 逐帧与收尾行完全相同，不再重贴。
 
+## 优雅下线
+
+`Ctrl-C`（或 `kill`）掉服务端后再拨一次，能看到优雅下线的结果——实例先注销、客户端随即拿不到地址：
+
+```text
+Ping: rpc error: code = Unavailable desc = name resolver error: produced zero addresses
+```
+
 ## 输出为什么长这样
 
 每收到一帧打一行（`<=` 带帧号），`==` 那行只在服务端**正常关闭**流之后出现。这跟

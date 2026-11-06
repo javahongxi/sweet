@@ -3,7 +3,7 @@
 `example/helloworld` 两侧都是**手写**的 `grpc.ServiceDesc`，消息用 `wrapperspb.StringValue`；
 `example/jaws-wire` 用的是生成码，但对端是 Java、只有客户端侧。缺的那一半是：
 **自己写 proto → protoc 生成 → 生成的 `Greeter_ServiceDesc` 挂上 sweet server、生成的
-`NewGreeterClient` 通过 sweet 拨号**，两端都是本仓库的 Go 代码。顶层 README「用法」里那两段
+`NewGreeterClient` 通过 sweet 拨号**，两端都是本仓库的 Go 代码。顶层 README「代码示例」里那两段
 片段（`srv.Register(&pb.Greeter_ServiceDesc, impl)` 与 `pb.NewGreeterClient(conn)`）到这一篇
 才有跑得通的实现。
 
@@ -65,8 +65,9 @@ GreetAll    == 1 frame from 3 requests
 
 一元与服务端流的入参是 `-name` / `-times`，两种流式的入参是 `-names`（一个名字一帧）。另有
 `-snapshot <dir>`（冷启动遇到不可达的 Nacos 时回落到上次落盘的实例列表，默认不设即完全不读写
-文件）与 `-hold <秒>`（跑完挂住一段时间再调一发，用来看回落是否自愈），两者的实测在顶层 README
-「注册中心不可达时」一节。
+文件）与 `-hold <秒>`（跑完挂住一段时间再调一发，用来看回落是否自愈），两者的实测见
+[Nacos 快照回落](../../doc/nacos-snapshot.md)。
+
 `-times 1` 时流里只有一帧，收尾行也跟着变单数：
 
 ```
