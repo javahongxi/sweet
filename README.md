@@ -5,8 +5,8 @@
 传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。
 
 sweet 内置 HTTP-to-gRPC 网关，支持从 Nacos 动态加载路由配置并自动发现后端服务实例。
-网关支持 path/query/body 绑定、已编译 protobuf descriptor 自动类型解析、unary/server-streaming、
-响应 metadata 白名单与 NDJSON `result/error` 信封；设计取舍见 `doc/grpc-gateway-adaptation.md`，
+网关支持 path/query/body 绑定、已编译或 FileDescriptorSet 文件 descriptor 自动类型解析、
+unary/server-streaming、响应 metadata 白名单与 NDJSON `result/error` 信封；设计取舍见 `doc/grpc-gateway-adaptation.md`，
 运行示例见 `example/gateway/README.md`。
 
 ## 是什么 / 不是什么

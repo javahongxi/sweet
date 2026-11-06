@@ -79,20 +79,28 @@ FieldMask、wrapper、Struct/Value。未知 body/query 字段默认返回 400，
  "fullMethod":"/sweet.example.v1.Greeter/GreetStream","body":"","responseBody":"message"}
 ```
 
-### 4.2 已编译 descriptor 自动解析
+### 4.2 已编译与文件 descriptor 自动解析
 
 `ApplyRoutes` 按以下顺序解析方法：
 
 1. 如果 `Options.Services` 显式配置了该 gRPC service，沿用其中的构造器，保持定制与兼容；
-2. 否则按 `FullMethod` 在 `protoregistry.GlobalFiles` 查 service/method descriptor；
-3. 优先通过 `protoregistry.GlobalTypes` 创建生成的 Go 消息，缺少生成类型时用 `dynamicpb`；
-4. 从 method descriptor 自动得到 server-streaming 属性，旧配置中的 `serverStream:true` 仍可保留。
+2. 否则查 `Options.DescriptorFiles` 构建的私有 registry，文件定义优先于已编译定义；
+3. 文件中没有该 service 时，再按 `FullMethod` 查 `protoregistry.GlobalFiles`；
+4. 文件中的消息始终使用 `dynamicpb`，避免文件 schema 与生成 Go 类型版本不一致；已编译 descriptor
+   则优先通过 `protoregistry.GlobalTypes` 创建生成的 Go 消息，缺少生成类型时才用 `dynamicpb`；
+5. 从 method descriptor 自动得到 server-streaming 属性，旧配置中的 `serverStream:true` 仍可保留。
 
-这里的“自动注册”指使用**网关进程已经链接的 Proto descriptor**，不是调用 provider 的 reflection 服务，
-也不是读取 FileDescriptorSet。后端可以关闭 reflection；网关的 Proto Go 包则必须被 import 链接进二进制。
-client/bidi streaming、未知方法和所有绑定字段错误都在换表前拒绝，不留下半张新表。
+已编译模式不要求 provider 开启 reflection，但 Proto Go 包必须链接进网关。文件模式接受二进制
+`FileDescriptorSet`，应使用 `protoc --include_imports` 生成；因此新 service 的 descriptor 进入已配置文件后，
+不需要重新编译网关，也不需要 provider 开启 reflection。
 
-`Handle` 的显式构造器 API 不变。descriptor 文件加载是另一个配置与生命周期问题，本次没有顺手加入。
+每次 `ApplyRoutes` 都重新读取文件并用 `protodesc.NewFiles` 构建私有 registry，不写入
+`protoregistry.GlobalFiles`。文件读取、依赖解析、方法查找和 HTTP 绑定全部成功后路由才原子生效；失败不污染
+其他 Gateway，也不改变线上表。实现不 watch 文件系统，更新文件后由下一次 Nacos 路由发布、显式
+`ApplyRoutes` 或 `RestoreRoutes` 触发重载。缓存只保存路由，不内嵌 descriptor，因此恢复时文件仍需可用。
+
+client/bidi streaming、未知方法和所有绑定字段错误都在换表前拒绝，不留下半张新表。`Handle` 的显式构造器
+API 不变，也不读取 `DescriptorFiles`。
 
 ### 4.3 响应 metadata
 
@@ -141,7 +149,7 @@ hop-by-hop/framing 字段和 `grpc-*` 保留字段不会因写进白名单而放
 本次不做：
 
 - protoc 代码生成架构或 grpc-gateway runtime 依赖；
-- descriptor 文件、服务端 reflection 动态发现；
+- 服务端 reflection 动态发现、Nacos 直接分发二进制 descriptor 内容；
 - `*`/`**` 路径、method override、form fallback、XML、HTTP client/bidi streaming；
 - 默认转发 Authorization、默认忽略未知字段；
 - 通用 Marshaler 注册、可插拔错误详情、`Grpc-Timeout`；
@@ -156,13 +164,14 @@ hop-by-hop/framing 字段和 `grpc-*` 保留字段不会因写进白名单而放
 2. 在保持 5xx 屏蔽的前提下评估 `google.rpc.Status.details` 和自定义错误处理器；
 3. 从同一规范化路由表与 descriptor 生成 OpenAPI，避免 Proto、Nacos 配置和文档三处漂移；
 4. 增加标准 gRPC health check 的 HTTP 适配和 OpenTelemetry 示例；
-5. 只有出现真实配置需求时，再考虑 `*`/`**` 路径与 descriptor 文件，不提前扩大协议面。
+5. 只有出现真实配置需求时，再考虑 `*`/`**` 路径，不提前扩大协议面。
 
 ## 7. 验证设计
 
 网关测试使用真实 sweet server、direct registry 和生成的 Greeter stub，验证自动构造的消息能与标准
-生成服务端互操作；复杂字段通过测试内动态 descriptor 覆盖，不修改生成的 pb。响应 Trailer 使用真实
-HTTP server 验证，避免只看 `ResponseRecorder` 的伪语义。坏配置同时断言线上表与缓存不被替换。
+生成服务端互操作；复杂字段通过测试内动态 descriptor 覆盖，不修改生成的 pb。descriptor 文件测试额外验证
+文件独有的新 service、文件替换后的重载、私有 registry 隔离和缓存恢复。响应 Trailer 使用真实 HTTP server
+验证，避免只看 `ResponseRecorder` 的伪语义。坏配置同时断言线上表与缓存不被替换。
 
 验证命令：
 

@@ -7,10 +7,11 @@
 
 sweet 的 HTTP→gRPC 网关最初每条路由都在 Go 里声明（`gateway/gateway.go` 的 `Route`
 带 `NewRequest`/`NewReply` 两个闭包）。配置域阶段把**策略**（HTTP 方法/路径 → 注册中心查找名
-→ gRPC 方法、是否服务端流）外置到 Nacos，**类型**仍留在 Go。后续升级进一步支持从进程内
-已编译 descriptor 自动取得类型与流式基数，因此通常连 `Options.Services` 消息工厂表也不必填写。
+→ gRPC 方法、是否服务端流）外置到 Nacos，**类型**仍留在 Go。后续升级支持从进程内已编译 descriptor
+或 `Options.DescriptorFiles` 自动取得类型与流式基数，因此通常连 `Options.Services` 消息工厂表也不必填写。
 
-这不要求 provider 开启 reflection，也不加载 descriptor 文件；Proto 的 Go 包必须链接进网关进程。
+两种方式都不要求 provider 开启 reflection。已编译模式要求 Proto Go 包链接进网关；文件模式使用二进制
+`FileDescriptorSet`，可以引入当前二进制从未链接过的 service。
 
 ## 契约锚点（nacos @3.2.3，本地 checkout，`git describe` = 3.2.3）
 
@@ -41,8 +42,8 @@ sweet 的 HTTP→gRPC 网关最初每条路由都在 Go 里声明（`gateway/gat
 ## 原阶段不做（历史范围）
 
 1. 不引 `nacos-sdk-go`；不引 YAML/TOML——配置格式用 JSON + `encoding/json`。
-2. 原阶段不做 reflection / descriptor 动态消息；后续已实现的是**进程内已编译 descriptor**，
-   不是服务端 reflection，也不是 descriptor 文件。
+2. 原阶段不做 reflection / descriptor 动态消息；后续已实现**进程内已编译 descriptor**和二进制
+   `FileDescriptorSet` 文件，仍未实现服务端 reflection。
 3. 不实现写回：`ConfigPublishRequest` / `ConfigRemoveRequest` 不做，只读。
 4. 不做 fuzzy watch、灰度(beta) 配置、`encryptedDataKey` 解密、多 dataId 聚合。
 5. 原阶段不改路由匹配语义；后续仅增加 `{field}` / `{a.b}` 单段路径变量，仍不做 `*`、`**`
@@ -64,9 +65,29 @@ dataId 默认 `sweet-gateway-routes.json`，group `DEFAULT_GROUP`，命名空间
 ```
 
 `service` 是注册中心查找名（与 gRPC 服务名可以不同，jaws 服务就是 `jaws/<FQN>`）；消息类型
-优先取 `Options.Services` 显式覆盖，未配置时按 `fullMethod` 从已编译 descriptor 解析，流式基数
-也自动推导。`body` 缺省兼容旧表的整请求体行为，`"*"` 显式整包，`""` 仅 path/query，字段路径
-则绑定局部 body；`responseBody` 选择响应字段。所有字段路径在换表前校验，失败仍整批拒绝。
+优先取 `Options.Services` 显式覆盖，其后依次查 descriptor 文件和已编译 descriptor，流式基数也自动推导。
+`body` 缺省兼容旧表的整请求体行为，`"*"` 显式整包，`""` 仅 path/query，字段路径则绑定局部 body；
+`responseBody` 选择响应字段。所有字段路径在换表前校验，失败仍整批拒绝。
+
+### Descriptor 文件
+
+`Options.DescriptorFiles`（示例命令的 `-descriptors`，逗号分隔）配置网关本地的二进制
+`FileDescriptorSet` 路径。生成方式：
+
+```sh
+protoc -I example/greeter --include_imports \
+  --descriptor_set_out=/tmp/sweet-greeter.pb greeter.proto
+go run ./example/gateway -routes=nacos -descriptors=/tmp/sweet-greeter.pb
+```
+
+每次 `ApplyRoutes` 都重新读取所有文件，构建私有 registry，再解析并校验整张路由表。文件定义的 service
+使用 `dynamicpb`，优先于同名的已编译定义；文件没有的 service 才回退到已编译 descriptor。文件不会注册进
+全局 registry。新增 service 时，将新 descriptor 部署到已经配置的文件路径，再发布或重放路由即可，无需
+重新编译网关；新增一个启动时未配置的文件路径仍属于进程配置变更。
+
+实现不 watch 文件系统。运维上应先写临时文件再原子 rename，然后触发路由应用，避免读取到半份文件。
+文件缺失、依赖不完整、定义冲突或路由校验失败都会整批拒绝，线上表不变。路由缓存不内嵌 descriptor，
+冷启动恢复时这些文件必须仍然存在且与缓存路由兼容。
 
 ## 关键语义决定
 

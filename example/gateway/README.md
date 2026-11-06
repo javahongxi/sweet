@@ -29,7 +29,8 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 `-endpoints`（只在 `direct` 时用）、`-service`（注册中心里的查找名）、`-timeout`（调用方没给
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
 `-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
-`-routes.dataId`、`-routes.group`、`-route-cache`（把最后一次被接受的路由表留在盘上，
+`-routes.dataId`、`-routes.group`、`-descriptors`（逗号分隔的二进制 FileDescriptorSet 文件）、
+`-route-cache`（把最后一次被接受的路由表留在盘上，
 冷启动时兜底；默认空 = 不碰磁盘）、`-namespace`（Nacos 命名空间，配置域里那个字段叫 tenant；
 不设时库按官方客户端的做法把它规范成 `public` 再发，而不是把字段整个省掉）。
 
@@ -42,7 +43,7 @@ go run ./example/gateway -registry=direct -endpoints 127.0.0.1:20001
 ## 路由表来自配置中心（`-routes=nacos`）
 
 默认 `embedded`：两条路由写在 Go 里，开箱可跑。加上 `-routes=nacos` 之后，路由表变成一个
-Nacos 配置项——**映射是数据，消息类型与流式基数来自网关进程内已编译的 protobuf descriptor**，
+Nacos 配置项——**映射是数据，消息类型与流式基数来自已编译或文件中的 protobuf descriptor**，
 不再要求填写 `gateway.Options.Services`；该表仍保留为显式覆盖入口。格式与契约见
 `doc/nacos-config-routes.md`，设计取舍见 `doc/grpc-gateway-adaptation.md`。
 
@@ -69,6 +70,26 @@ go run ./example/gateway -routes=nacos -listen 127.0.0.1:20112
 `body` 缺省或为 `"*"` 时表示整个 JSON 请求体，`""` 表示仅 path/query，`"name"` 这类字段路径
 表示只绑定该字段。路径变量目前只支持 `{field}` / `{a.b}` 单段形式；`serverStream` 可由 descriptor
 自动推导。流式成功帧当前为 `{"result":{...}}`，提交 200 后的终错为 `{"error":{...}}`。
+
+### 用 descriptor 文件接入新服务（`-descriptors`）
+
+如果 Proto 没有链接进网关，可以生成自包含的二进制 `FileDescriptorSet`：
+
+```sh
+protoc -I example/greeter --include_imports \
+  --descriptor_set_out=/tmp/sweet-greeter.pb greeter.proto
+
+go run ./example/gateway -routes=nacos \
+  -descriptors=/tmp/sweet-greeter.pb -listen 127.0.0.1:20112
+```
+
+多个文件用逗号分隔。每次路由 `ApplyRoutes` 都重新读取文件；文件里的消息用 `dynamicpb` 构造，不需要生成
+Go 代码或 import pb。把新 service 的 descriptor 更新到已经配置的文件后，再发布/重放路由即可生效，
+不需要重新编译网关。文件路径本身仍是启动配置，新增路径需要修改启动参数。
+
+库不 watch 文件系统，也不通过 Nacos 分发 descriptor 二进制。部署时先写临时文件再原子 rename，随后触发
+路由应用；文件或依赖损坏会拒绝整次换表并保留旧路由。路由缓存只存路由，不存 descriptor，冷启动恢复时
+`-descriptors` 指向的文件仍需可用。详细优先级和隔离语义见 `doc/nacos-config-routes.md`。
 
 下文保留了 2026-11-02 等日期的历史真机日志；协议示例已按当前实现改写，本次升级没有把旧真机
 运行重新执行一遍，验证范围是网关端到端单元测试与离线全量测试。

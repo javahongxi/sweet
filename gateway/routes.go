@@ -10,11 +10,12 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 // RouteSpec is the data form of a Route. Method types come from explicit
-// Options.Services overrides or the compiled protobuf descriptors already
-// linked into the gateway process; the config itself never names a Go type.
+// Options.Services overrides, DescriptorFiles, or compiled protobuf descriptors;
+// the route config itself never names a Go type.
 type RouteSpec struct {
 	Method       string  `json:"method"`
 	Path         string  `json:"path"`
@@ -71,7 +72,7 @@ func ParseRouteSpecs(data []byte) ([]RouteSpec, error) {
 // resolve turns one spec into a Route, binding it to the registered message
 // types. Every failure is an error naming the spec, so a bad line in a table of
 // forty is diagnosable from the log alone.
-func (g *Gateway) resolve(s RouteSpec) (Route, error) {
+func (g *Gateway) resolve(s RouteSpec, files *protoregistry.Files) (Route, error) {
 	if s.Method != "" {
 		// net/http hands r.Method to ServeHTTP upper-cased, so a table written
 		// with "post" would never match. Normalising here is the difference
@@ -97,7 +98,7 @@ func (g *Gateway) resolve(s RouteSpec) (Route, error) {
 		}
 	} else {
 		var err error
-		mt, serverStream, err = compiledMethod(service, method)
+		mt, serverStream, err = resolveMethod(files, service, method)
 		if err != nil {
 			return Route{}, fmt.Errorf("gateway: route %s %s: %w", s.Method, s.Path, err)
 		}
@@ -155,12 +156,16 @@ func splitFullMethod(full string) (service, method string, err error) {
 // be long-lived, and closing one because a route moved would penalise the next
 // caller with a cold reconnect.
 func (g *Gateway) ApplyRoutes(specs []RouteSpec) error {
+	files, err := loadDescriptorFiles(g.opts.DescriptorFiles)
+	if err != nil {
+		return err
+	}
 	routes := make([]Route, 0, len(specs))
 	byPath := make(map[string]*entry, len(specs))
 	patterns := make([]Route, 0)
 	seenTemplates := make(map[string]struct{})
 	for _, s := range specs {
-		r, err := g.resolve(s)
+		r, err := g.resolve(s, files)
 		if err != nil {
 			return err
 		}

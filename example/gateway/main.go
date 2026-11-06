@@ -11,7 +11,7 @@
 //
 // The route table can also come from Nacos' config domain, which is the point of
 // -routes=nacos: the HTTP binding becomes data an operator edits, while method
-// types and streaming cardinality come from the compiled protobuf descriptors.
+// types and streaming cardinality come from compiled or file-based descriptors.
 // The gateway applies a new table without a restart, and refuses a bad one
 // without touching the live one.
 //
@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -72,6 +73,7 @@ func main() {
 	routesFrom := flag.String("routes", "embedded", "embedded | nacos — where the route table comes from")
 	routesDataID := flag.String("routes.dataId", "sweet-gateway-routes.json", "config dataId holding the route table")
 	routesGroup := flag.String("routes.group", "DEFAULT_GROUP", "config group of the route table")
+	descriptors := flag.String("descriptors", "", "comma-separated binary FileDescriptorSet files, reloaded on every route apply")
 	routeCache := flag.String("route-cache", "", "keep the last accepted route table in this file and restore it "+
 		"at cold start when the config centre is unreachable; empty (the default) disables disk I/O, "+
 		"same switch as the registry snapshot directory")
@@ -112,11 +114,11 @@ func main() {
 	// dialled its backends in plaintext would hide that choice in the one place
 	// nobody looks. This example is local, so plaintext is what it says.
 	gw, err := gateway.New(gateway.Options{
-		Registry:       reg,
-		DialOptions:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		RequestTimeout: *timeout,
-		VerboseErrors:  *verbose,
-		// Nacos routes resolve their types from greeterpb's compiled descriptors.
+		Registry:        reg,
+		DialOptions:     []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		RequestTimeout:  *timeout,
+		VerboseErrors:   *verbose,
+		DescriptorFiles: splitDescriptorFiles(*descriptors),
 		// Options.Services remains available as an explicit override for users
 		// whose message constructors need custom behaviour.
 		RouteCacheFile:   *routeCache,
@@ -275,6 +277,16 @@ func main() {
 		log.Printf("shutdown: %v", err)
 	}
 	log.Printf("stopped: %d route(s) served through the %s registry", len(gw.Routes()), reg.Name())
+}
+
+func splitDescriptorFiles(value string) []string {
+	var files []string
+	for _, path := range strings.Split(value, ",") {
+		if path = strings.TrimSpace(path); path != "" {
+			files = append(files, path)
+		}
+	}
+	return files
 }
 
 // cacheHint points an operator at the switch that decides whether "no table yet"

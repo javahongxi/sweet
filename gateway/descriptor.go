@@ -18,12 +18,16 @@ import (
 func compiledMethod(service, method string) (MessageTypes, bool, error) {
 	descriptor, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(service))
 	if err != nil {
-		return MessageTypes{}, false, fmt.Errorf("gRPC service %q is not present in Options.Services or compiled protobuf descriptors", service)
+		return MessageTypes{}, false, fmt.Errorf("gRPC service %q is not present in Options.Services or compiled protobuf descriptors: %w", service, err)
 	}
 	serviceDescriptor, ok := descriptor.(protoreflect.ServiceDescriptor)
 	if !ok {
 		return MessageTypes{}, false, fmt.Errorf("compiled descriptor %q is not a gRPC service", service)
 	}
+	return methodTypes(serviceDescriptor, service, method, true)
+}
+
+func methodTypes(serviceDescriptor protoreflect.ServiceDescriptor, service, method string, preferGenerated bool) (MessageTypes, bool, error) {
 	methodDescriptor := serviceDescriptor.Methods().ByName(protoreflect.Name(method))
 	if methodDescriptor == nil {
 		methods := serviceDescriptor.Methods()
@@ -39,9 +43,13 @@ func compiledMethod(service, method string) (MessageTypes, bool, error) {
 		return MessageTypes{}, false, fmt.Errorf("method %q of service %q uses client streaming; the HTTP gateway supports unary and server streaming only",
 			method, service)
 	}
+	constructor := dynamicMessageConstructor
+	if preferGenerated {
+		constructor = messageConstructor
+	}
 	return MessageTypes{
-		Request: messageConstructor(methodDescriptor.Input()),
-		Reply:   messageConstructor(methodDescriptor.Output()),
+		Request: constructor(methodDescriptor.Input()),
+		Reply:   constructor(methodDescriptor.Output()),
 	}, methodDescriptor.IsStreamingServer(), nil
 }
 
@@ -49,8 +57,12 @@ func messageConstructor(descriptor protoreflect.MessageDescriptor) func() proto.
 	if messageType, err := protoregistry.GlobalTypes.FindMessageByName(descriptor.FullName()); err == nil {
 		return func() proto.Message { return messageType.New().Interface() }
 	}
-	// A descriptor can be linked without its generated Go message type. dynamicpb
-	// has exactly the same protobuf wire contract, so the standard gRPC codec can
-	// still invoke a generated backend without any service-specific gateway code.
+	return dynamicMessageConstructor(descriptor)
+}
+
+func dynamicMessageConstructor(descriptor protoreflect.MessageDescriptor) func() proto.Message {
+	// The protobuf wire contract is independent of generated Go code. File-based
+	// routes always take this path so their messages cannot disagree with the
+	// descriptor snapshot used to validate their HTTP bindings.
 	return func() proto.Message { return dynamicpb.NewMessage(descriptor) }
 }

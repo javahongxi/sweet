@@ -19,8 +19,8 @@
 //     constructors (Handle), or ApplyRoutes resolves its method from an explicit
 //     Options.Services override or the process's compiled protobuf descriptors.
 //     Generated Go message types are preferred, with dynamic protobuf messages
-//     as a fallback. A route table can therefore be data published from a config
-//     centre without requiring provider-side reflection or descriptor files.
+//     as a fallback. ApplyRoutes can also build a private descriptor registry
+//     from FileDescriptorSet files. Neither path calls provider-side reflection.
 //   - No new dependency. JSON to protobuf goes through protojson, and
 //     google.golang.org/protobuf is already required by the generated stubs.
 //   - Routing is a table lookup, not http.ServeMux. ServeMux answers an
@@ -152,8 +152,20 @@ type Options struct {
 	// Services maps a gRPC service name — the part of RouteSpec.FullMethod
 	// before the method, e.g. "sweet.example.v1.Greeter" — to explicit message
 	// constructors. ApplyRoutes prefers this override when present; otherwise it
-	// resolves the method from compiled descriptors. Handle does not consult it.
+	// resolves the method from file-based or compiled descriptors. Handle does not
+	// consult it.
 	Services map[string]ServiceTypes
+
+	// DescriptorFiles are binary FileDescriptorSet files loaded afresh by every
+	// ApplyRoutes. File-defined services take precedence over compiled descriptors
+	// and use dynamicpb messages, so a new Proto contract can be deployed without
+	// rebuilding the gateway. Files are parsed into a private registry and become
+	// visible only through an accepted route table. Empty means no file I/O.
+	//
+	// There is deliberately no filesystem watcher: updating a file takes effect
+	// on the next ApplyRoutes, including a Nacos route publish or RestoreRoutes.
+	// Sets should be generated with protoc --include_imports.
+	DescriptorFiles []string
 
 	// RouteCacheFile, when set, keeps every table accepted by ApplyRoutes on disk
 	// so RestoreRoutes can serve something when the config centre is unreachable
