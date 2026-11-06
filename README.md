@@ -1,10 +1,6 @@
 # sweet
 
-基于 gRPC 的 Go RPC 框架，用 Nacos 做注册中心，手写服务注册与发现，不依赖 nacos-sdk-go。
-
-传输与线格式一律用 `grpc-go`：sweet 不重新发明 RPC 线格式，需要跨语言互通时直接用 gRPC。
-
-sweet 内置 HTTP-to-gRPC 网关，支持从 Nacos 动态加载路由配置并自动发现后端服务实例。
+基于 gRPC 的 Go RPC 框架，手写 Nacos 服务注册与发现，不依赖 nacos-sdk-go；传输与线格式使用 `grpc-go`，支持跨语言互通；内置 HTTP-to-gRPC 网关，可从 Nacos 动态加载路由并自动发现后端实例。
 
 ## 特性
 
