@@ -25,7 +25,7 @@
 ### 安装
 
 ```bash
-go get github.com/javahongxi/sweet   # 尚无 tag，安装 pseudo-version
+go get github.com/javahongxi/sweet@v1.0.0
 go mod tidy
 ```
 
@@ -108,7 +108,7 @@ go test ./...
 
 ## 版本
 
-目前没有语义化 tag，`go get` 得到 pseudo-version；长期使用时建议钉到 `@<commit>`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
+当前最新稳定版本为 `v1.0.0`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
 
 ## 深入了解更多
 
