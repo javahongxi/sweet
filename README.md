@@ -1,4 +1,4 @@
-# sweet
+# sweet 🍭
 
 基于 gRPC 的 Go RPC 框架，手写 Nacos 服务注册与发现，不依赖 nacos-sdk-go；传输与线格式使用 `grpc-go`，支持跨语言互通；内置 HTTP-to-gRPC 网关，可从 Nacos 动态加载路由并自动发现后端实例。
 
