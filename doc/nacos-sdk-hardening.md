@@ -599,3 +599,58 @@ nothing happening"。
 重启后另跑了一遍 `-run Live` 六条确认服务端健康（`nacos` ok 4.590s、`registry/nacos` ok 2.746s），
 drill 起过的 provider 进程与端口都无残留。derby 里的配置这次没数（上次核过 2248 条无损），
 如果要精确核对得走 v3 管理口读一遍——本轮没做，标在这里。
+
+## 连接管理特性总览
+
+README 里那句「Naming 与 Config 共用保活探针、死流检测和断线重连，重连后重放注册、订阅与配置监听」
+对应的代码位置与实现要点，分三层：
+
+### 底层连接 — `nacos/conn.go`
+
+| 特性 | 位置 | 要点 |
+|---|---|---|
+| 共用保活探针 | `sdkConn.keepAlive()` (L375-408) | Naming 与 Config 共用同一个 `sdkConn` 类型；`keepAlive` 在 `Setup` 成功后以 goroutine 启动，每隔 `KeepAlive`（默认 5s）检查空闲时间，超过阈值才发 `HealthCheckRequest`（应用层 unary RPC） |
+| 探针参数注入 | `naming_client.go` L172、`config_client.go` L177 | 两处都设 `conn.ProbeFatal = true`，探针无响应时触发 `failStream()` |
+| 死流检测 | `sdkConn.failStream()` (L337-358) | 三条路径触发：`readLoop` 接收失败、`send` 发送失败、`keepAlive` 探针超时无响应；幂等（`sendMu` 保护），多路径同时检测到只触发一次恢复 |
+| panic 转流死亡 | `sdkConn.guard()` (L289) | `readLoop` 与 `keepAlive` 头顶 `defer c.guard(...)`，panic 被转为流死亡信号而非静默杀死 goroutine |
+
+### 中间调度 — `nacos/lifecycle.go`
+
+| 特性 | 位置 | 要点 |
+|---|---|---|
+| 断线重连 | `supervise()` (L260-295) | 永久运行的 goroutine，通过 `lost` channel 监听流丢失；`streamLost()` 设 `conn=nil` 并唤醒它 |
+| 退避策略 | `nextBackoff()` (L301) | 指数退避，上限 30s，带 1/4 随机抖动防止集群同步重连 |
+| 重连尝试 | `reconnectOnce()` (L126) | 先原地重连同节点（L137），失败后从 `serverList` 选下一个节点 |
+| 发布连接 | `publish()` (L169) | 关闭旧连接、启动新连接的 push 消费者，然后执行 `replay` |
+| supervisor 永不放弃 | `registry/nacos/nacos.go` L131-134 注释 | 即使 31 次失败仍继续重试；退避封顶 30s 后足够安静，而一次半小时的 Nacos 故障就把注册中心永久打死比继续敲门更糟 |
+
+### 上层重放
+
+| 特性 | 位置 | 要点 |
+|---|---|---|
+| 注册重放 | `NamingClient.replay()` (`naming_client.go` L442-490) | 遍历 `registrations` map 中 `live=true` 的记录，按 service 名 + instance key 确定性排序后逐个 `registerInstance` |
+| 订阅重放 | 同上 `replay()` | 遍历 `subscriptions` map 中 `live=true` 的服务，按服务名排序后逐个 `callSubscribe`；完成后调 `OnReplay` 回调通知 `registry/nacos` 层 nudge watchers 刷新 |
+| 注销优先 | `NamingClient.Deregister()` (L233) | 先将 intent 标记 `live=false` 再发注销请求，确保重连不会复活已注销的实例 |
+| 配置监听重放 | `ConfigClient` replay hook (`config_client.go` L158) | 构造时设定 `replay: func() error { return c.listen(c.watchedKeys()) }`；`watchedKeys()` 快照所有 watcher 的 key 并排序，`listen()` 构造 `ConfigBatchListenRequest` 携带每个 key 当前的 md5，服务端返回 `ChangedConfigs` 后对变更 key 启动 `refresh()` 拉取最新内容 |
+| Watch 容错 | `ConfigClient.Watch()` (L267) | 即使初始 pull 失败也保留 watcher 注册，replay 用空 md5 重新监听，服务端返回「过期」后触发 pull 获取内容 |
+
+### 架构关系
+
+```
+sdkConn (conn.go)
+  ├── keepAlive()         — 共用保活探针
+  ├── failStream()        — 死流检测（接收/发送/探针三路径）
+  └── onStreamLost → lifecycle.streamLost()
+                                │
+lifecycle (lifecycle.go) ───────┘
+  ├── supervise()         — 断线重连监控（永不放弃）
+  ├── reconnectOnce()     — 先原地重试，再换节点
+  └── publish() → replay()
+                    │
+        ┌───────────────┼───────────────┐
+        │               │               │
+  NamingClient     ConfigClient
+    .replay()        .replay() (via listen)
+    ├── 注册重放     └── 配置监听重放
+    └── 订阅重放
+```
