@@ -44,7 +44,9 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
 
 ## 标准桩与跨语言互通
 
-`interoptest/` 验证 stock grpc-go 客户端与服务端在两个方向上的互通，包括一元、生成式流方法、反射、健康检查和原生重试配置。具体测试与实测读数见[测试与能力验证](testing.md)。
+`interoptest/` 把 sweet 与 stock grpc-go 配在一起跑一元、生成式流方法、反射与健康检查。但要说清一件事：sweet 不实现线格式，RPC 面两端都是 grpc-go，所以这几条测的是**接线**——健康状态只在 `Serve` 绑好端口并 `Expose` 成功之后才翻成 SERVING、反射列得出实例真正在服的服务——而不是协议互通。真正的外部对照只有一条：`TestSweetClientDiscoversNativeServer`，发现面走的是 sweet 自己手写的 Nacos 协议，一个 stock 服务端经它被发现、再用 stock 桩调通，这才是关于 sweet 自己写的东西的证据。
+
+原生重试配置不在 `interoptest/`，在 `sweettest/retry_test.go`：那是 stock 的 service config，sweet 没加自己的重试旋钮。具体测试与实测读数见[测试与能力验证](testing.md)。
 
 跨语言示例：
 

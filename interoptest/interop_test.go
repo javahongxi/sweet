@@ -1,6 +1,22 @@
-// Package interoptest measures sweet against a stack we do not control: the
-// stock grpc-go health service and its generated stubs. A test that only ever
-// pairs sweet with sweet proves internal consistency, nothing more.
+// Package interoptest pairs sweet with a stack it does not control: the stock
+// grpc-go health service, its generated stubs, and a live Nacos server.
+//
+// The pairing is worth much less on one plane than on the other. sweet
+// implements no wire format — Register hands the descriptor straight to
+// grpc.Server.RegisterService and client.Dial is only a resolver — so on the
+// RPC plane both ends are grpc-go, and a stock client reaching a sweet server
+// cannot fail for a protocol reason. What those legs assert is wiring: that the
+// health status flips only once Serve has bound and exposed, and that
+// reflection enumerates what the instance really serves. That the built-in
+// services do not leak into ServiceName inference is pinned offline in
+// sweettest/register_test.go, which is the cheaper place for it.
+//
+// The genuinely external counterpart is TestSweetClientDiscoversNativeServer:
+// discovery runs over sweet's own hand-written Nacos protocol, so a stock
+// server found through it and called with a stock stub is evidence about
+// something sweet wrote. The cross-language leg — sweet against the Java jaws
+// implementation — is not automated; it is measured by hand in
+// example/jaws-wire and recorded in doc/grpc-interop.md.
 package interoptest
 
 import (
@@ -77,13 +93,6 @@ func TestNativeClientCallsSweetServer(t *testing.T) {
 			t.Fatalf("service %q status = %v, want SERVING", name, resp.GetStatus())
 		}
 		t.Logf("stock grpc-go client reached sweet's server: %q → %v", name, resp.GetStatus())
-	}
-
-	// Guard for how health and reflection are wired: they are registered straight
-	// on the grpc.Server, so they must not be mistaken for the instance's service
-	// name when Options.ServiceName is left to Register's descriptor.
-	if got := srv.ServiceName(); got != ping.ServiceName {
-		t.Fatalf("ServiceName() = %q, want %q — a built-in service leaked into the inference", got, ping.ServiceName)
 	}
 }
 
@@ -167,9 +176,13 @@ func TestReflectionListsRegisteredService(t *testing.T) {
 	}
 }
 
-// TestNativeServerAcceptsGeneratedStreamViaSweet: streaming must survive the
-// same way, since Health.Watch is the generated server-streaming method. The
-// health service watched here is the one sweet registers itself.
+// TestNativeServerAcceptsGeneratedStreamViaSweet drives a *generated*
+// server-streaming stub through sweet's resolver. Resolve-and-call is already
+// covered offline by sweettest's TestServeDialOverDirectRegistry with the
+// hand-written ping service; what this leg adds is the other descriptor
+// provenance — protoc-generated code, and a stream rather than a unary call —
+// reaching the same grpc.Server. The health service watched here is the one
+// sweet registers itself.
 func TestNativeServerAcceptsGeneratedStreamViaSweet(t *testing.T) {
 	srv, err := server.New(server.Options{
 		Address:     "127.0.0.1:0",
