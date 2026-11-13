@@ -6,7 +6,7 @@
 
 - **标准 gRPC** — 直接使用生成桩，支持一元及三种流式调用，内置反射与健康服务，兼容 grpcurl
 - **两种注册模式** — `nacos` 提供服务发现，`direct` 用于直通、测试与无注册中心场景
-- **手写 Nacos 协议** — Naming 支持注册、查询、订阅与实例推送；Config 支持只读查询、监听与变更回拉
+- **手写 Nacos 协议** — Naming 支持注册、查询、订阅与推送；Config 支持查询、监听、发布与删除（含 CAS）
 - **Nacos 连接管理** — Naming 与 Config 共用保活探针、死流检测和断线重连，重连后重放注册、订阅与配置监听
 - **可选快照回落** — Nacos 冷启动不可达时可使用本地实例快照，默认关闭，恢复后自动回到服务端视图
 - **优雅上下线** — 先注销，再等待在途请求，最后停止服务；健康状态随生命周期变化
@@ -25,7 +25,7 @@
 ### 安装
 
 ```bash
-go get github.com/javahongxi/sweet@v1.0.0
+go get github.com/javahongxi/sweet@v1.0.1
 go mod tidy
 ```
 
@@ -108,7 +108,7 @@ go test ./...
 
 ## 版本
 
-当前最新稳定版本为 `v1.0.0`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
+当前最新稳定版本为 `v1.0.1`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
 
 ## 深入了解更多
 
@@ -119,7 +119,7 @@ go test ./...
 | [gRPC 兼容与标准工具](doc/grpc-interop.md) | grpcurl、反射、健康状态与跨语言互通 |
 | [Nacos 协议加固](doc/nacos-sdk-hardening.md) | 手写协议的生命周期、鉴权、重连与推送语义 |
 | [服务发布顺序](doc/service-publish-order.md) | 为什么注册发生在 accept 之前 |
-| [Nacos 网关路由](doc/nacos-config-routes.md) | 配置域客户端、动态路由格式与验证结果 |
+| [Nacos 网关路由](doc/nacos-config-routes.md) | 配置域客户端的读写两侧、动态路由格式与验证结果 |
 | [grpc-gateway 适配](doc/grpc-gateway-adaptation.md) | 转码协议选择、功能调研与后续路线 |
 | [helloworld](example/helloworld/README.md) | 手写 `grpc.ServiceDesc`，跑通四种调用形态 |
 | [greeter](example/greeter/README.md) | proto 生成码的 Go 调 Go 完整示例 |

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -249,6 +250,125 @@ func (c *ConfigClient) Query(ctx context.Context, key ConfigKey) (Config, error)
 		ContentType:  resp.ContentType,
 		LastModified: resp.LastModified,
 	}, nil
+}
+
+// PublishInput is one config write.
+type PublishInput struct {
+	// Content is the new value. It must not be blank: the server checks that
+	// before it looks at anything else (ParamUtils.java:98-101 rejects a blank
+	// content with errorCode 400), so "take this config away" is a Remove, never a
+	// Publish of "". Checked here too, so the caller learns it without a round trip.
+	Content string
+
+	// Type is Nacos' own config type — json, yaml, properties, xml, text, html.
+	// It travels in additionMap["type"] (ConfigPublishRequestHandler.java:86) and
+	// only affects the console's rendering and validation; an unrecognised value is
+	// quietly replaced by the server default (:109-111), so it is not verified here.
+	Type string
+
+	// AppName lands in additionMap["appName"]; like the server's own srcUser it is
+	// bookkeeping for the config's history row. Optional.
+	AppName string
+
+	// ExpectMD5 turns the write into a compare-and-swap: pass the MD5 that came
+	// back from Query and the server only applies the change while that is still
+	// its current value, otherwise Publish returns an ErrConflict-wrapped error.
+	// Empty means write-unconditional, which is the official client's default too
+	// (ClientWorker.java:1438 passes whatever the caller had, usually null).
+	//
+	// One detail worth knowing: CAS does not require the config to exist. When it
+	// does not, the server creates it and ignores ExpectMD5
+	// (ConfigOperationService.java:1436-1439 → insertOrUpdateCas →
+	// EmbeddedConfigInfoPersistServiceImpl.java:316-322), so a first publish cannot
+	// fail with a conflict.
+	ExpectMD5 string
+}
+
+// Publish writes one config.
+//
+// The write shares this client's connection — same module=config handshake, same
+// per-request credential injection — and a publish for a key this client is
+// watching arrives back as an ordinary server notify, so the Watch callback sees
+// it like any other writer's change. Nothing is applied locally on the way out.
+//
+// Returning nil means the value is durable, not that Query can read it back yet.
+// A publish commits to the database and then raises a ConfigDataChangeEvent that a
+// separate task manager dumps into the in-memory cache
+// (ConfigOperationService.java:172 → DumpService.java:133-156), while the read side
+// answers from that cache and nowhere else — a cache miss is a not-found, with no
+// database fallback (ConfigChainEntryHandler.java:52-76). Measured against a 3.2.3
+// standalone on 9848: a new dataId took 58-118 ms to become readable, a delete took
+// 85-110 ms to stop serving the old value, and a winning CAS still returned the old
+// content and old md5 one millisecond after Publish said success.
+//
+// That is the server's contract, not a defect to hide here, and it rules out one
+// tempting pattern: do not Query to confirm a Publish. Write conditionally with
+// ExpectMD5, or Watch the key to learn when it moved.
+func (c *ConfigClient) Publish(ctx context.Context, key ConfigKey, in PublishInput) error {
+	if key.Tenant == "" {
+		key.Tenant = c.tenant
+	}
+	if strings.TrimSpace(in.Content) == "" {
+		return fmt.Errorf("nacos: publish %s/%s: content is required; Nacos rejects a blank one, use Remove to take a config away", key.Group, key.DataID)
+	}
+	conn, err := c.liveConn()
+	if err != nil {
+		return err
+	}
+	req := ConfigPublishRequest{
+		DataID:  key.DataID,
+		Group:   key.Group,
+		Tenant:  key.Tenant,
+		Content: in.Content,
+		CasMD5:  in.ExpectMD5,
+	}
+	// Only send the keys that are set: the server reads them with
+	// getAdditionParam, which treats a missing entry and an empty one the same
+	// (ConfigPublishRequest.java:50-52), but an absent map is what the official
+	// client sends when it has nothing to add.
+	for k, v := range map[string]string{"type": in.Type, "appName": in.AppName} {
+		if v != "" {
+			if req.Addition == nil {
+				req.Addition = map[string]string{}
+			}
+			req.Addition[k] = v
+		}
+	}
+	var resp ConfigPublishResponse
+	if err := conn.Call(ctx, req, &resp); err != nil {
+		return err
+	}
+	return resp.checkWrite("publish", key)
+}
+
+// Remove deletes one config. It is idempotent in the server's own words: deleting
+// a key that is not there is not an error, because the persist layer looks the row
+// up first and does nothing when it is absent
+// (EmbeddedConfigInfoPersistServiceImpl.java:494-519), and deleteConfig still
+// reports success afterwards (ConfigOperationService.java:333). It does still fire
+// a change notify, so watchers of a never-existing key get one pull that comes
+// back not-found.
+//
+// The same visibility window as Publish applies in reverse: 85-110 ms measured here
+// before a deleted dataId stopped answering, because the cache entry is dropped by
+// the dump task rather than by the delete itself.
+//
+// ConfigRemoveRequest's tag field is deliberately not exposed — see the note on
+// the wire type about it being passed as grayName.
+func (c *ConfigClient) Remove(ctx context.Context, key ConfigKey) error {
+	if key.Tenant == "" {
+		key.Tenant = c.tenant
+	}
+	conn, err := c.liveConn()
+	if err != nil {
+		return err
+	}
+	req := ConfigRemoveRequest{DataID: key.DataID, Group: key.Group, Tenant: key.Tenant}
+	var resp ConfigRemoveResponse
+	if err := conn.Call(ctx, req, &resp); err != nil {
+		return err
+	}
+	return resp.check("remove", key)
 }
 
 // Watch registers interest in one config. It first pulls the current value and

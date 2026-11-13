@@ -31,6 +31,13 @@ var (
 	// non-success with an errorCode that is not 403/404. The server's message is
 	// preserved in the error text.
 	ErrRefused = errors.New("nacos: request refused")
+
+	// ErrConflict is a compare-and-swap publish that lost: the md5 sent with the
+	// request is no longer what the server holds, so somebody wrote in between the
+	// query and the publish. It is a normal outcome, not a failure — the retry loop
+	// is query again, then publish with the new md5. See checkWrite for why this one
+	// has to be recognised from the message rather than an errorCode.
+	ErrConflict = errors.New("nacos: md5 conflict")
 )
 
 // Response is the shared base of every Nacos response, config and naming alike:

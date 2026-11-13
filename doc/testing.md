@@ -6,7 +6,7 @@
 
 - Nacos 3.x，**只在 3.2.3 上验过**（钉的是本地 checkout 的 tag 与 commit，写在 `nacos/doc.go` 顶部）。ephemeral 实例的注册、查询、订阅、推送**全程走 gRPC**。
 - 连接地址是 SDK gRPC 口：`9848 = mainPort(8848) + 1000`，不是 HTTP 的 8848。Nacos 连接目前走明文 gRPC，暂不提供 TLS 配置面。
-- RPC 传输由 grpc-go 负责，不另做 HTTP RPC 传输；Nacos 配置只提供读侧，发布与删除走 Nacos admin HTTP 接口。
+- RPC 传输由 grpc-go 负责，不另做 HTTP RPC 传输；Nacos 配置的读侧与写侧都走 gRPC（`Query` / `Watch` / `Publish` / `Remove`），不经 admin HTTP 口。
 - 服务端**开鉴权也能连**。凭据走 `Options.Access`（`AccessGetter`），注入在**每个请求**的 `Metadata.headers` 上——建连时服务端对 `ServerCheckRequest` 直接 return、不进 handler 也不进 filter 链（`GrpcRequestAcceptor.java:106-115`），校验点在每次派发上（`RequestHandler.handleRequest:45-56`）。
 - 包内自带 `PasswordAccess`（HTTP 登录，默认路径 `/v3/auth/user/login`，token 缓存 + TTL 窗口内刷新 + 被 403 作废后重取一次）和 `StaticAccess`（直接给 header）。两半都在真 3.2.3 上读过：不带 `Access` 时握手仍成功、config 查询落 `ErrDenied`；带 `PasswordAccess` 时路由热更新全程不重启，读数见 [Nacos 协议加固](nacos-sdk-hardening.md) 的判据 10。
 - 连真实例的那轮自证测试不配凭据，只读 `NACOS_GRPC_ADDR`，所以运行时服务端要设 `nacos.core.auth.enabled=false`；开鉴权的那轮是在隔离实例上手工验证的。
@@ -31,7 +31,8 @@
 | 重试走 gRPC 原生 service config，sweet 不自带重试旋钮 | `TestNativeRetryAppliesThroughSweetDial` + 负对照 `TestWithoutRetryConfigTheInjectionSticks` | 配 retryPolicy 时服务端看到 3 次尝试、调用成功；不配时只看到 1 次并直接把 UNAVAILABLE 抛给调用方（grpc-go 对 UNAVAILABLE 不做透明重试） |
 | 手写 `ServiceDesc` 与生成码一样会走服务端一元拦截器 | `TestUnaryHandlerInvokesTheInterceptor` | grpc-go 把拦截器链交给 desc 的 handler 去调用；手写 desc 若丢弃第 4 个参数，服务端一元拦截器会全部静默失效 |
 | Nacos 不可达时的快照回落，**默认关** | `TestWatchFallsBackToSnapshot` + 负对照 `TestWatchWithoutSnapshotDirStillFails` | 设了 `SnapshotDir` 才在冷拨号或订阅失败时投递带 age 的旧列表并回调通知；不设时同一场景仍然报错。另有真停掉本机 Nacos 的冷启动端到端，见 [Nacos 快照回落](nacos-snapshot.md) |
-| 配置的**读侧**：notify 只带 key，客户端回拉内容并用新 md5 重新 listen；重连后 re-listen | `TestConfigWatchPullsAfterNotify`、`TestListenResponseStaleSubsetIsPulled`、`TestConfigReplayAfterReconnect`（`nacos/config_client_test.go`） | 真机（本地 3.2.3、`9848`，一次运行、全程未重启）发布 2 条路由表后 2s 报 `applied 2 route(s)`；同一天补跑验的是删除方向——表 A 换表 C 后旧路径 404、新路径 200，且"配置本来不存在 → 首次发布"也会被 notify→回拉→装上。读数在 [Nacos 网关路由](nacos-config-routes.md)。**写路径不经本库**：Nacos 3.x 已移除 v1 HTTP 口，发布/删除走 `/nacos/v3/admin/cs/config`（参数名 `groupName`） |
+| 配置的**读侧**：notify 只带 key，客户端回拉内容并用新 md5 重新 listen；重连后 re-listen | `TestConfigWatchPullsAfterNotify`、`TestListenResponseStaleSubsetIsPulled`、`TestConfigReplayAfterReconnect`（`nacos/config_client_test.go`） | 真机（本地 3.2.3、`9848`，一次运行、全程未重启）发布 2 条路由表后 2s 报 `applied 2 route(s)`；同一天补跑验的是删除方向——表 A 换表 C 后旧路径 404、新路径 200，且"配置本来不存在 → 首次发布"也会被 notify→回拉→装上。读数在 [Nacos 网关路由](nacos-config-routes.md) |
+| 配置的**写侧**：`ConfigPublishRequest` / `ConfigRemoveRequest` 走同一条 SDK 口，含 CAS（`casMd5`） | `TestConfigPublishWireShape`、`TestConfigPublishLeavesOutCasAndAddition`、`TestConfigRemoveSendsNoTag`、`TestConfigPublishCasConflictIsErrConflict`、`TestConfigPublishRefusalIsNotAConflict`（`nacos/config_write_test.go`）+ 四条真机 `TestLivePublish*`（`nacos/config_write_live_test.go`） | 2026-11-14 真机（3.2.3 standalone、`9848`）：发→读回逐字相同→删→not-found→再删仍幂等；错 md5 的 CAS 报 `errorCode=500` + `Cas publish fail, server md5 may have changed.`（专属错误码不上线，只能靠 message 分类）；对 md5 的 CAS 成功且 md5 移动；CAS 对不存在的 key 仍创建成功。**写完不立即可读**：新 dataId 58–118ms、删除后 85–110ms、覆盖写 83ms，因为读侧只查内存 cache 而 dump 是异步的。读数在 [Nacos 网关路由](nacos-config-routes.md) 的「写侧补全」 |
 
 ## 离线测试
 
@@ -65,7 +66,12 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos ./interoptest -c
 NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos ./registry/nacos -count=1 -run Live
 ```
 
-选中的是 `TestLiveSetupHandshakeIsAcknowledged`（握手能力表）、`TestLiveUnaryServerCheck`、`TestLiveSetupIsNotTornDownByCallerTimeout`、`TestLiveProbeChannelFacts`（探针通道事实）、`TestLiveRegisterQueryDeregister`、`TestLiveWatchSeedsAndPushes`。这份清单可用下面的命令核对，不需要连接服务端：
+选中的是 `TestLivePublishQueryRemoveRoundTrip`、`TestLivePublishCas`、
+`TestLivePublishCasCreatesAbsent`、`TestLivePublishBlankContentIsRejected`（config 写侧，会在
+真服务端上建一批一次性 dataId 并删干净）、`TestLiveSetupHandshakeIsAcknowledged`（握手能力表）、
+`TestLiveUnaryServerCheck`、`TestLiveSetupIsNotTornDownByCallerTimeout`、
+`TestLiveProbeChannelFacts`（探针通道事实）、`TestLiveRegisterQueryDeregister`、
+`TestLiveWatchSeedsAndPushes`、`TestLiveWatchSharedSnapshotAndCancellation`。这份清单可用下面的命令核对，不需要连接服务端：
 
 ```bash
 go test -list 'Live' ./nacos ./registry/nacos
@@ -89,7 +95,7 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test -short ./nacos ./registry/nacos ./interop
 
 ## 版本与依赖验证
 
-当前最新稳定版本为 `v1.0.0`，`go get github.com/javahongxi/sweet@v1.0.0` 即可；`@latest` 也会解析到该 tag。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面的离线、Live 与快速验证命令都跑一遍，别只跑离线测试。
+当前最新稳定版本为 `v1.0.1`，`go get github.com/javahongxi/sweet@v1.0.1` 即可；`@latest` 也会解析到该 tag。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面的离线、Live 与快速验证命令都跑一遍，别只跑离线测试。
 
 不拆 module 不等于别人要为整个 sweet 买单：`go get` 下的是整仓，编译进去的只有 import 的那条链。只用 nacos 时参与编译的是 `nacos` 与 `gen` 两个包，`registry`/`gateway`/`server` 一行都不进二进制，第三方依赖也只有 `grpc` 自己那一组（`x/net`、`x/sys`、`x/text`、`genproto`、`protobuf` 都是它的依赖）。在自己的模块里可以这样验证：
 

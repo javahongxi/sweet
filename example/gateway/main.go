@@ -35,6 +35,14 @@
 //	go run ./example/gateway -routes=nacos
 //
 // and publishing a second table while it runs swaps the routes in place.
+//
+// The curl above is the shortest path to a published table because it compiles
+// nothing. The library can publish the same config itself: ConfigClient.Publish
+// goes over a config-domain gRPC connection (9848) with the same handshake this
+// gateway uses to read the table — on one client it is literally the same
+// connection — and PublishInput.ExpectMD5 turns the write into a conditional one.
+// See the "写侧补全" section of doc/nacos-config-routes.md for the contract and
+// the measurements.
 package main
 
 import (

@@ -1,5 +1,7 @@
 package nacos
 
+import "fmt"
+
 // Config-domain wire shapes, verified against nacos @3.2.3 (tag c843da5be):
 //
 //   - api/.../config/remote/request/AbstractConfigRequest.java:30-34 — every
@@ -125,3 +127,88 @@ func (ConfigChangeNotifyRequest) typeName() string { return TypeConfigChangeNoti
 
 // configKey is the internal map key; ConfigKey is exported for callers.
 type configKey = ConfigKey
+
+// The two write requests. They are not an extension: the handlers are @Since
+// ("2.0.0") and live in the same package as the read ones this file already
+// covers (ConfigPublishRequestHandler.java, ConfigRemoveRequestHandler.java),
+// reached through the same RequestHandler registry that GrpcRequestAcceptor
+// dispatches on, and guarded by the same @Secured(action=WRITE, signType=CONFIG).
+// The official Java client writes through this port too — it builds a
+// ConfigPublishRequest at ClientWorker.java:1436-1444 and a ConfigRemoveRequest
+// at :1470 — so a client that only reads has implemented half the domain.
+
+// ConfigPublishRequest writes one config's content.
+// api/.../config/remote/request/ConfigPublishRequest.java:30-36 — content, casMd5
+// and a free-form additionMap. The keys the server actually reads are tag,
+// appName, type, src_user, encryptedDataKey, config_tags, desc, use, effect,
+// schema and betaIps (ConfigPublishRequestHandler.java:84-117).
+type ConfigPublishRequest struct {
+	RequestID string            `json:"requestId,omitempty"`
+	DataID    string            `json:"dataId"`
+	Group     string            `json:"group"`
+	Tenant    string            `json:"tenant,omitempty"`
+	Content   string            `json:"content"`
+	CasMD5    string            `json:"casMd5,omitempty"`
+	Addition  map[string]string `json:"additionMap,omitempty"`
+}
+
+func (ConfigPublishRequest) typeName() string { return "ConfigPublishRequest" }
+
+// ConfigPublishResponse adds nothing to Response — api/.../ConfigPublishResponse.java
+// declares only the two build helpers. Note what the success builder does NOT
+// set: buildSuccessResponse() returns a bare object, so resultCode stays at its
+// field default of 200 (Response.java:29) and success serialises as true.
+type ConfigPublishResponse struct {
+	ConfigResponse
+}
+
+func (ConfigPublishResponse) typeName() string { return "ConfigPublishResponse" }
+
+// ConfigRemoveRequest deletes one config.
+// api/.../config/remote/request/ConfigRemoveRequest.java:27 — the only field
+// beyond the key is tag, and it is a trap: ConfigRemoveRequestHandler.java:84
+// passes it to deleteConfig as the *grayName* argument, so a non-empty tag
+// deletes a gray rule rather than clearing the tag of the formal config
+// (ConfigOperationService.java:313-326). Send it empty.
+type ConfigRemoveRequest struct {
+	RequestID string `json:"requestId,omitempty"`
+	DataID    string `json:"dataId"`
+	Group     string `json:"group"`
+	Tenant    string `json:"tenant,omitempty"`
+	Tag       string `json:"tag,omitempty"`
+}
+
+func (ConfigRemoveRequest) typeName() string { return "ConfigRemoveRequest" }
+
+// ConfigRemoveResponse adds nothing to Response either, but note its failure
+// builder takes only a message (ConfigRemoveResponse.buildFailResponse(String)):
+// a remove refusal arrives with errorCode 0, so it can only be reported through
+// the message text. That is why Remove's error goes through check, not checkWrite.
+type ConfigRemoveResponse struct {
+	ConfigResponse
+}
+
+func (ConfigRemoveResponse) typeName() string { return "ConfigRemoveResponse" }
+
+// casConflictMessage is the exact text the server produces when the md5 sent
+// with a publish no longer matches what it holds
+// (ConfigOperationService.java:145-147).
+const casConflictMessage = "Cas publish fail, server md5 may have changed."
+
+// checkWrite classifies a publish answer. It is check plus one case: the CAS
+// rejection is not given its own errorCode. ConfigPublishRequestHandler.java:134-137
+// routes both NacosApiException and ConfigAlreadyExistsException through
+// buildFailResponse(ResponseCode.FAIL.getCode(), …), which sets resultCode=500
+// AND errorCode=500 (ConfigPublishResponse.java:45-51) — RESOURCE_CONFLICT never
+// reaches the wire, only its message does. So the message is the signal, matched
+// exactly rather than by substring guessing, and anything unrecognised still
+// falls back to the sentinels check returns.
+func (r ConfigResponse) checkWrite(what string, key configKey) error {
+	if r.Message == casConflictMessage {
+		// errorCode is kept in the text on purpose: the server puts
+		// ResponseCode.FAIL (500) there for this outcome, which is the evidence that
+		// no dedicated code reaches the wire.
+		return fmt.Errorf("%w: %s %s (errorCode=%d): %s", ErrConflict, what, key.Group+"/"+key.DataID, r.ErrorCode, r.Message)
+	}
+	return r.check(what, key)
+}

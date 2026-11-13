@@ -59,6 +59,10 @@ curl -s -X POST 'http://127.0.0.1:8848/nacos/v3/admin/cs/config' \
 go run ./example/gateway -routes=nacos -listen 127.0.0.1:20112
 ```
 
+上面用 curl 是因为它不用编译任何东西。库自己也能发同一条配置：`nacos.ConfigClient.Publish`
+走的是 config 域的 gRPC 连接（9848），与网关读表同一套握手，同一个 client 上就是同一条连接；
+带上 `ExpectMD5` 就是条件写。契约与实测读数见 `doc/nacos-config-routes.md` 的「写侧补全」。
+
 路由还支持 path/query/body 绑定。例如下面这条 GET 路由从路径取 `name`，从 query 取其余未绑定
 字段，并只返回响应的 `message` 字段：
 

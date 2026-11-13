@@ -24,10 +24,21 @@ type configStub struct {
 	connSeq   int
 	queries   []*gen.Payload
 	listens   []*gen.Payload
+	publishes []*gen.Payload
+	removes   []*gen.Payload
 	clientFra []*gen.Payload // everything the client wrote on the bidi stream
 
 	content string
 	md5     string
+
+	// publishRefusal and removeRefusal script a server that says no. They are a
+	// message plus an errorCode because that is the pair the real server sends and
+	// the pair the classification hangs off: a CAS loss measures as errorCode 500
+	// with "Cas publish fail, server md5 may have changed." (read back from a live
+	// 3.2.3), even though the server built it from RESOURCE_CONFLICT, while a
+	// rejected parameter measures as 400.
+	publishRefusal *refusal
+	removeRefusal  *refusal
 
 	// staleOnListen decides whether a listen reports the key as changed: the
 	// real server does that when the client's md5 is not current.
@@ -87,6 +98,20 @@ func (s *configStub) setContent(content, md5 string) {
 	s.content, s.md5 = content, md5
 }
 
+// denyPublish and denyRemove script the refusal the write handlers should answer
+// with. They take the lock so a test can change its mind while the client is live.
+func (s *configStub) denyPublish(r *refusal) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publishRefusal = r
+}
+
+func (s *configStub) denyRemove(r *refusal) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeRefusal = r
+}
+
 func (s *configStub) snapshot() (queries, listens, clientFrames []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,9 +140,22 @@ func (s *configStub) rawBodies(wantType string) []string {
 	}
 	collect(s.queries)
 	collect(s.listens)
+	collect(s.publishes)
+	collect(s.removes)
 	collect(s.clientFra)
 	return out
 }
+
+// refusal is a scripted server-side "no": the message and errorCode of the
+// response, leaving resultCode at 500 and success at false the way
+// Response.setErrorInfo does (Response.java:118-122).
+type refusal struct {
+	message   string
+	errorCode int
+}
+
+// failWith builds a refusal carrying a specific errorCode.
+func failWith(code int, message string) *refusal { return &refusal{message: message, errorCode: code} }
 
 func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 	t, _ := unmarshal(in, nil)
@@ -160,6 +198,33 @@ func (s *configStub) unary(in *gen.Payload) *gen.Payload {
 			})
 		}
 		return frame("InstanceResponse", map[string]any{"resultCode": 200, "success": true})
+	case "ConfigPublishRequest":
+		s.publishes = append(s.publishes, in)
+		s.noteHeaders(t, in)
+		deny := s.publishRefusal
+		s.mu.Unlock()
+		if deny != nil {
+			return frame("ConfigPublishResponse", map[string]any{
+				"resultCode": 500, "success": false,
+				"errorCode": deny.errorCode, "message": deny.message,
+			})
+		}
+		return frame("ConfigPublishResponse", map[string]any{"resultCode": 200, "success": true})
+	case "ConfigRemoveRequest":
+		s.removes = append(s.removes, in)
+		s.noteHeaders(t, in)
+		deny := s.removeRefusal
+		s.mu.Unlock()
+		if deny != nil {
+			return frame("ConfigRemoveResponse", map[string]any{
+				"resultCode": 500, "success": false,
+				"errorCode": deny.errorCode, "message": deny.message,
+			})
+		}
+		// Deleting a config that is already gone answers success: the server looks
+		// the row up and does nothing when it is absent, which is why a Remove can
+		// be retried safely (EmbeddedConfigInfoPersistServiceImpl.java:494-519).
+		return frame("ConfigRemoveResponse", map[string]any{"resultCode": 200, "success": true})
 	case "ConfigBatchListenRequest":
 		s.listens = append(s.listens, in)
 		var req ConfigBatchListenRequest

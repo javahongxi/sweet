@@ -44,7 +44,9 @@ sweet 的 HTTP→gRPC 网关最初每条路由都在 Go 里声明（`gateway/gat
 1. 不引 `nacos-sdk-go`；不引 YAML/TOML——配置格式用 JSON + `encoding/json`。
 2. 原阶段不做 reflection / descriptor 动态消息；后续已实现**进程内已编译 descriptor**和二进制
    `FileDescriptorSet` 文件，仍未实现服务端 reflection。
-3. 不实现写回：`ConfigPublishRequest` / `ConfigRemoveRequest` 不做，只读。
+3. ~~不实现写回：`ConfigPublishRequest` / `ConfigRemoveRequest` 不做，只读。~~
+   **本条已于 2026-11-14 撤销**，见下节「写侧补全」。撤销不是因为发现了 bug，而是因为
+   当初把「Nacos 3.x 移除了 v1 HTTP 口」这个事实误记成了「写路径不经本库」。
 4. 不做 fuzzy watch、灰度(beta) 配置、`encryptedDataKey` 解密、多 dataId 聚合。
 5. 原阶段不改路由匹配语义；后续仅增加 `{field}` / `{a.b}` 单段路径变量，仍不做 `*`、`**`
    通配或前缀匹配。
@@ -208,8 +210,99 @@ $ curl -s localhost:20116/v1/greeter/greet -d '{"name":"still-cold"}'
 （`TestAckClassIsARegisteredPayload`），并把 `ConnectResetRequest → EmptyResponse` 这种
 字符串规则推不出来的情形写进注释。
 
+## 写侧补全（2026-11-14）
+
+补上 `ConfigPublishRequest` / `ConfigRemoveRequest` 之后，config 域的协议面才是完整的，
+sweet 也才谈得上是一个可用的 Nacos SDK。这两个 handler 在 9848 上一直是一等公民：
+`@Since("2.0.0")`、四个类都在 Payload SPI 表里（`api/src/main/resources/META-INF/services/com.alibaba.nacos.api.remote.Payload`
+第 37/39/43/45 行），官方 Java 客户端 `ClientWorker.java:1431-1474` 的 publishConfig /
+removeConfig 走的就是这条 SDK 口。
+
+### 契约锚点（nacos @3.2.3 源码 + 本机真机实测）
+
+- `ConfigPublishRequest{dataId, group, tenant, content, casMd5, additionMap}`；additionMap
+  的 key 服务端逐个用 `getAdditionParam` 读（`ConfigPublishRequestHandler.java:84-117`）：
+  `tag`/`appName`/`type`/`src_user`/`encryptedDataKey`/`config_tags`/`desc`/`use`/
+  `effect`/`schema`/`betaIps`。sweet 只填 `type` 与 `appName`，且不填就连 map 都不发。
+- 写比读多一道鉴权动作：handler 上是 `@NamespaceValidation` +
+  `@TpsControl(pointName="ConfigPublish")` + `@Secured(action=WRITE, signType=CONFIG)`，
+  凭据仍走 `Metadata.headers`，与读侧同一套注入（`conn.go` 的 `marshalSigned`）。
+- `ConfigRemoveRequest{dataId, group, tenant, tag}`，但 **tag 是个坑**：
+  `ConfigRemoveRequestHandler.java:78-84` 把它当 grayName 传给 `deleteConfig`，
+  带了 tag 删掉的是灰度版本而不是配置本体。所以这个字段不上 wire，也不暴露给调用方。
+- CAS 语义有两条反直觉：`ConfigRequestInfo.updateForExist` 默认 TRUE，所以不带 casMd5
+  也能覆盖写；`insertOrUpdateCas` 在行不存在时落到 `addConfigInfo`，**CAS 会创建**
+  （`ConfigOperationService.java:136-150`）。
+- 空 content 服务端直接 400：`ParamUtils.java:98-101` 抛 PARAMETER_VALIDATE_ERROR
+  `content is blank`，紧接着是 `content.length() > maxContent`，默认 10 MiB
+  （`PropertyUtil.java:52`）。容量记账的 `defaultMaxSize` 是 102400，而
+  `isCapacityLimitCheck` 默认 false（`:73`、`:93`），即默认只记账不拒。
+- 删除不存在的配置幂等成功（`EmbeddedConfigInfoPersistServiceImpl.java:494-519`），
+  所以 `Remove` 可以安全重放。
+
+### 关键语义决定
+
+- **不做「读己之写」补偿**。实测发现 Publish 返回 nil 之后 Query 仍可能读不到，根因在读侧：
+  gRPC 查询走 `ConfigQueryChainService`，链头 `ConfigChainEntryHandler.java:52-76` 只看
+  `ConfigCacheService` 的内存 cache，miss 就是 `CONFIG_NOT_FOUND`，**没有 DB 兜底**；
+  而写完的可见性由另一条线程 dump（`ConfigOperationService.java:172` 发事件 →
+  `DumpService.java:133-156` 订阅并 dump）。这是服务端的契约，不是 sweet 能补的——
+  补上也只在单实例成立。所以 `Publish` 的文档只说明这个窗口，不给「写完等可读」的旋钮，
+  调用方要的是条件写（`ExpectMD5`）或 `Watch`。
+- 不暴露 `betaIps`（灰度）、`encryptedDataKey`、`tag`；不做批量发布、历史版本查询、
+  监听者查询。写侧只补「发一条、删一条」这两条主线，其余仍是原阶段第 4 条的边界。
+- Publish / Remove 不做本地应用：写出去的值靠服务端 notify → 回拉回来，与别的写者
+  走完全相同的路径，所以同一个 client 既 Watch 又 Publish 时，自己的写入也会触发自己的回调。
+
+### 验收判据与实测读数
+
+第 0 步是真机一枪——判据是实测数字，不是从字节码推断：
+
+```bash
+NACOS_GRPC_ADDR=127.0.0.1:9848 go test ./nacos -run LivePublish -count=1 -v
+```
+
+本机 Nacos 3.2.3 standalone（`-Dnacos.standalone=true`）、`127.0.0.1:9848`，2026-11-14：
+
+| 判据 | 实测 |
+| --- | --- |
+| 发 → 读回内容逐字相同 → 删 → 读回 not-found → 再删仍幂等 | 新 dataId 可读延迟 58–118ms（三轮）；删除后不可读延迟 85–110ms |
+| 错 md5 的 CAS 失败，且值没被动过 | `nacos: md5 conflict: publish DEFAULT_GROUP/sweet-cas-live-….json (errorCode=500): Cas publish fail, server md5 may have changed.` |
+| 对 md5 的 CAS 成功，且 md5 移动 | 覆盖写可见延迟 83ms；md5 `8b04d5e3775d298e78455efc5ca404d5` → `7b63d1cafe15e5edab88a8e81de794b5` |
+| 对不存在的 key 用 CAS 写，仍创建成功 | 可读延迟 53–84ms，内容 `created-by-cas` |
+| 空 content 在本地就被挡下，不花一次往返 | 桩端 `ConfigPublishRequest` 帧计数为 0 |
+
+CAS 失败那条读数值得单独记：服务端是用 `ErrorCode.RESOURCE_CONFLICT` 造的错
+（`ConfigOperationService.java:145-147`），但线上到达的是 `resultCode=500` 且
+**`errorCode` 也是 500**——专属码没有上线。所以 `ErrConflict` 只能靠 `checkWrite`
+逐字比对那一句 message，这是实测出来的分类方式，不是推断出来的。
+
+### 验收过程中修掉的两处
+
+1. **判据 0 第一次跑不绿**：三个测试都是「Publish 返回 nil，紧接着 Query 报
+   `config data not exist`」。第一怀疑是 `NewConfigClient` 把空 Tenant 规范成 `"public"`
+   造成幻影命名空间；查下来不成立——`NamespaceUtil.namespaceDefaultId` 就是
+   `Constants.DEFAULT_NAMESPACE_ID = "public"`，`processNamespaceParameter` 只把 blank
+   换成它、字面量 `"public"` 原样保留（`NamespaceUtil.java:36-49`），读写两侧调的是同一个
+   函数，服务端 `plugin-control.log` 里 `Intercepting publishConfig … namespaceId: public`
+   也证明请求确实进了 handler。真正的差异在读侧的 cache-only 查询，见上。
+2. **修掉时序后仍有一条失败**：覆盖写之后立刻 Query，拿到的是旧内容、旧 md5
+   （`readable after 0ms`）。原因是等待条件写成了「存在即可读」，而覆盖写不会先让 key
+   消失。等待条件必须比对**内容**而不是存在性——这正是「不要用 Query 确认 Publish」
+   的具体形态。
+
+离线部分在 `nacos/config_write_test.go`，钉 wire 字段名（`casMd5`、`additionMap`、
+没有 `tag`、body 里没有 `headers`）与错误分类（冲突 → `ErrConflict`、参数拒绝 →
+`ErrRefused`、403 → `ErrDenied`，且只有那一句 message 会被判成冲突）。桩在
+`config_client_test.go` 里扩了 `ConfigPublishRequest` / `ConfigRemoveRequest` 两个 case
+与 `denyPublish` / `denyRemove` 两个开关。
+
 ## 原阶段冻结结论
 
 上述配置域阶段达成后冻结的是：不加 fuzzy watch、不加写回、不把 config 与 naming 合并成一条连接。
-后续 descriptor 与 HTTP 绑定升级没有改变这些边界；配置写路径仍由 Nacos admin API 或控制台负责。
+后续 descriptor 与 HTTP 绑定升级没有改变这些边界。
+
+其中「不加写回」已于 2026-11-14 撤销，理由与实测读数见「写侧补全」；撤销后仍然冻结的是
+fuzzy watch、灰度(beta) 配置、批量发布、历史版本与监听者查询、`encryptedDataKey` 解密，
+以及 config 与 naming 各自一条连接的既有设计。
 
