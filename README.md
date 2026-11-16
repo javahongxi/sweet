@@ -121,6 +121,8 @@ go test ./...
 | [服务发布顺序](doc/service-publish-order.md) | 为什么注册发生在 accept 之前 |
 | [Nacos 网关路由](doc/nacos-config-routes.md) | 配置域客户端的读写两侧、动态路由格式与验证结果 |
 | [grpc-gateway 适配](doc/grpc-gateway-adaptation.md) | 转码协议选择、功能调研与后续路线 |
+| [Go 运行时优化](doc/go-runtime-optimization.md) | GC、GMP 调度与内存管理在本仓的实践 |
+| [gin 与 grpc-go 并发模型](doc/gin-grpc-goroutine-model.md) | goroutine 粒度与归属、并发上限、性能表现、panic 半径 |
 | [helloworld](example/helloworld/README.md) | 手写 `grpc.ServiceDesc`，跑通四种调用形态 |
 | [greeter](example/greeter/README.md) | proto 生成码的 Go 调 Go 完整示例 |
 | [jaws-wire](example/jaws-wire/README.md) | Go 客户端调用 Java jaws 服务端 |
