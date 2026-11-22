@@ -108,16 +108,56 @@ path is `sweet.example.v1.Greeter`, which is exactly the Java interface
   `jaws/sweet-greeter-app` (or the bare name with `-namespace=`), metadata
   carrying `revision` — no per-interface entries at all.
 - Config, group `JAWS_CONFIG`: `mapping:sweet.example.v1.Greeter` →
-  `sweet-greeter-app`. The mapping survives unexport on purpose, the same
-  boundary jaws keeps.
+  `sweet-greeter-app`. The mapping survives unexpose on purpose, the same
+  boundary jaws keeps; this sample removes it on shutdown — see the mapping
+  cleanup section below.
 - Re-export with a different `-weight`: the revision changes, the instance is
   upserted in place (Nacos keys by ip:port), and consumers pull the new metadata
   without a second registration.
+
+## Mapping cleanup: `Provider.RemoveMapping`
+
+The mapping is a persistent config entry: the unexpose closure never removes it
+(the jaws/Dubbo boundary). But "mapping present → application-level" is an
+implicit switch on both sides — a stale mapping silently reroutes every later
+interface-level lookup of that service name to the dead application, sweet's
+own consumers and jaws references alike, since both read the same key in
+`JAWS_CONFIG`. Callers that own the lifecycle should therefore clean up on
+graceful shutdown:
+
+```go
+// After srv.Stop() (deregister + drain), before the deferred cc.Close():
+// the config client must still be alive — the same ordering jaws keeps with
+// its shutdown-hook priority 12 (after unexport at 10, before registry close
+// at 20).
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := provider.RemoveMapping(ctx, serviceName); err != nil {
+    log.Printf("remove mapping for %s: %v", serviceName, err)
+}
+```
+
+`RemoveMapping` delegates to `ConfigClient.Remove`, the third slice of the
+interface, implemented by `*nacos.ConfigClient`. This example's provider has
+the cleanup built in: after SIGTERM the log ends with `mapping for
+sweet.example.v1.Greeter removed`, and the admin API answers "Config not exist"
+for the dataId. `SIGKILL` runs no cleanup; remove the entry by hand instead:
+
+```
+DELETE /nacos/v3/admin/cs/config?dataId=mapping:{interface}&groupName=JAWS_CONFIG&namespaceId=public
+```
+
+The jaws side keeps the same contract: `ServiceNameMapping.removeMapping` plus
+a priority-12 shutdown hook in each of its three app-level samples, smoke
+verified on all three registry legs — see `doc/app-level-discovery.md` in the
+jaws repository.
 
 ## Offline evidence
 
 The wire contract is pinned without Nacos in
 [`applevel/applevel_test.go`](../../applevel/applevel_test.go): the revision
 golden vector, URL encoding round-trips, provider aggregation and revision
-history, and a real loopback gRPC metadata pull end to end — including tampered
-metadata being voided and healed by the retry task.
+history, a real loopback gRPC metadata pull end to end — including tampered
+metadata being voided and healed by the retry task — and the mapping cleanup
+boundary (`TestRemoveMappingAndUnexposeBoundary`: unexpose keeps the entry,
+`RemoveMapping` deletes it).
