@@ -26,7 +26,7 @@
 ### 安装
 
 ```bash
-go get github.com/javahongxi/sweet@v1.0.1
+go get github.com/javahongxi/sweet@v1.0.2
 go mod tidy
 ```
 
@@ -109,7 +109,7 @@ go test ./...
 
 ## 版本
 
-当前最新稳定版本为 `v1.0.1`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
+当前最新稳定版本为 `v1.0.2`。编译只包含实际 import 的包，但 `go.mod` 的依赖图由全仓共享，详细说明与验证命令见[测试与能力验证](doc/testing.md#版本与依赖验证)。
 
 ## 深入了解更多
 

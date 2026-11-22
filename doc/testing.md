@@ -95,7 +95,7 @@ NACOS_GRPC_ADDR=127.0.0.1:9848 go test -short ./nacos ./registry/nacos ./interop
 
 ## 版本与依赖验证
 
-当前最新稳定版本为 `v1.0.1`，`go get github.com/javahongxi/sweet@v1.0.1` 即可；`@latest` 也会解析到该 tag。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面的离线、Live 与快速验证命令都跑一遍，别只跑离线测试。
+当前最新稳定版本为 `v1.0.2`，`go get github.com/javahongxi/sweet@v1.0.2` 即可；`@latest` 也会解析到该 tag。升级 `grpc-go` 或者换 Nacos 服务端版本之后，把上面的离线、Live 与快速验证命令都跑一遍，别只跑离线测试。
 
 不拆 module 不等于别人要为整个 sweet 买单：`go get` 下的是整仓，编译进去的只有 import 的那条链。只用 nacos 时参与编译的是 `nacos` 与 `gen` 两个包，`registry`/`gateway`/`server` 一行都不进二进制，第三方依赖也只有 `grpc` 自己那一组（`x/net`、`x/sys`、`x/text`、`genproto`、`protobuf` 都是它的依赖）。在自己的模块里可以这样验证：
 
