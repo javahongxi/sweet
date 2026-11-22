@@ -7,7 +7,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.36.1
-// source: greeter.proto
+// source: jaws-wire-greeter.proto
 
 package greeterpb
 
@@ -239,5 +239,5 @@ var Greeter_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 	},
-	Metadata: "greeter.proto",
+	Metadata: "jaws-wire-greeter.proto",
 }

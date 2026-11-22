@@ -1,7 +1,7 @@
 # 跨语言：sweet 调 jaws 的 wire provider
 
 对端是 **jaws 的 Java gRPC 服务端**（Spring Boot 那个样例，`WireBootProvider`）：服务实现、
-接口和 proto 都是 jaws 自己的，sweet 这边一行都不必知道。调用侧是 `greeter.proto` 生成的标准
+接口和 proto 都是 jaws 自己的，sweet 这边一行都不必知道。调用侧是 `jaws-wire-greeter.proto` 生成的标准
 Go 桩，只是 `conn` 由 `client.Dial` 给出。所以这一跑证明的是两件不同的事：wire 上真互通，
 以及 sweet 的拨号链路不破坏 gRPC 语义。
 
@@ -87,10 +87,12 @@ jaws 侧修掉（出站帧同样算数据，`outboundFramesCountAsDataToo` 钉�
   服务端把 Java 接口名和 proto 全名都登记了一次。
 - **调用点不为一件事改过一行**：`greeterpb.NewGreeterClient(conn)` 是生成码原样，换寻址方式只
   影响 `conn` 从哪来。
-- **proto 副本只加了 `go_package`**：`greeter.proto` 是从 jaws 的
-  `jaws-sample-wire-api/src/main/proto/greeter.proto` 复制的，package/service/method
+- **proto 副本只加了 `go_package`，文件名改为 `jaws-wire-greeter.proto`**：内容从 jaws 的
+  `jaws-sample-wire-api/src/main/proto/greeter.proto` 复制，package/service/method
   字段一字未改，`java_*` 选项也留着（对 Go 生成无影响）。加 `go_package` 只影响生成代码的
-  导入路径，不碰线上格式。
+  导入路径，不碰线上格式。改文件名是因为 protobuf 运行时按文件名全局注册：
+  `example/greeter` 的 proto 也叫 `greeter.proto`，两个包同链一个二进制（如
+  `example/applevel` 的双 target 消费端）会在 init 期 panic。文件名不进线上格式。
 
 重新生成桩不需要手敲 protoc —— 配方写成了 `go:generate`，就地可跑（完整命令见
 `greeterpb/doc.go`）：

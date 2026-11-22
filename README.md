@@ -11,6 +11,7 @@
 - **可选快照回落** — Nacos 冷启动不可达时可使用本地实例快照，默认关闭，恢复后自动回到服务端视图
 - **优雅上下线** — 先注销，再等待在途请求，最后停止服务；健康状态随生命周期变化
 - **跨语言互通** — 已与 Java jaws 双向调通，Go 调 Java 见本仓 jaws-wire，Java 调 Go 见 jaws 仓示例
+- **应用级服务发现** — 每进程一条实例，接口→应用映射进配置中心，元数据留内存按需拉取，与 jaws 双向互通
 - **动态 HTTP 网关** — HTTP-to-gRPC 转码，从 Nacos 加载路由并自动发现后端实例
 
 ## 快速开始
@@ -126,6 +127,7 @@ go test ./...
 | [helloworld](example/helloworld/README.md) | 手写 `grpc.ServiceDesc`，跑通四种调用形态 |
 | [greeter](example/greeter/README.md) | proto 生成码的 Go 调 Go 完整示例 |
 | [jaws-wire](example/jaws-wire/README.md) | Go 客户端调用 Java jaws 服务端 |
+| [applevel](example/applevel/README.md) | 应用级服务发现，与 jaws `registerMode=instance` 双向互通 |
 | [gateway](example/gateway/README.md) | HTTP-to-gRPC 网关运行示例 |
 
 &copy; [hongxi.org](http://hongxi.org)
