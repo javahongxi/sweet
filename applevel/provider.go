@@ -195,6 +195,18 @@ func (p *Provider) remove(ctx context.Context, key string, in registry.Instance)
 	p.logf("application %s re-exposed revision=%s services=%d", p.appName, info.Revision, len(p.services))
 }
 
+// RemoveMapping deletes the interface → application mapping from the config
+// center, restoring peers' interface-level fallback. The unexpose closure
+// never calls this — the mapping outlives unexpose on purpose (the jaws/Dubbo
+// boundary); callers that own the lifecycle (sample providers on shutdown)
+// remove it explicitly, while the config client is still alive. A stale
+// mapping silently reroutes every later interface-level lookup of this
+// service name to the dead application, on both sides of the interop: sweet's
+// own consumers and jaws references read the same key.
+func (p *Provider) RemoveMapping(ctx context.Context, serviceName string) error {
+	return p.cfg.Remove(ctx, mappingKey(serviceName))
+}
+
 // rebuild snapshots the service table into a fresh revision and archives the
 // previous one, so a consumer holding an older revision pointer can still pull
 // it during a rolling update. Caller holds p.mu.

@@ -106,6 +106,13 @@ func (f *fakeConfig) Publish(_ context.Context, key nacos.ConfigKey, in nacos.Pu
 	return nil
 }
 
+func (f *fakeConfig) Remove(_ context.Context, key nacos.ConfigKey) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.m, key)
+	return nil
+}
+
 func awaitInstances(t *testing.T, ch <-chan []registry.Instance) []registry.Instance {
 	t.Helper()
 	select {
@@ -521,5 +528,34 @@ func TestProviderRejectsMissingOptions(t *testing.T) {
 	}
 	if !errors.Is(fmt.Errorf("%w: x", nacos.ErrNotFound), nacos.ErrNotFound) {
 		t.Fatal("sanity: ErrNotFound wrapping")
+	}
+}
+
+func TestRemoveMappingAndUnexposeBoundary(t *testing.T) {
+	reg, cfg := newFakeRegistry(), newFakeConfig()
+	p, err := NewProvider(reg, cfg, ProviderOptions{Application: "sweet-app"})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	ctx := context.Background()
+	inst := registry.Instance{Host: "127.0.0.1", Port: 20010}
+	const svc = "sweet.example.v1.Greeter"
+
+	unreg, err := p.Expose(ctx, svc, inst)
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	// The unexpose closure keeps the jaws/Dubbo boundary: the mapping stays.
+	unreg()
+	if _, ok := cfg.m[mappingKey(svc)]; !ok {
+		t.Fatal("unexpose must leave the mapping behind")
+	}
+	// Explicit removal restores the interface-level fallback for later Watch
+	// calls — on both sides of the interop, sweet and jaws read this same key.
+	if err := p.RemoveMapping(ctx, svc); err != nil {
+		t.Fatalf("RemoveMapping: %v", err)
+	}
+	if _, ok := cfg.m[mappingKey(svc)]; ok {
+		t.Fatal("RemoveMapping must delete the mapping entry")
 	}
 }

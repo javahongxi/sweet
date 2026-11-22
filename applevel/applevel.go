@@ -83,10 +83,12 @@ const (
 )
 
 // ConfigClient is the slice of *nacos.ConfigClient this package needs: read a
-// mapping, publish a mapping. An interface so offline tests supply a map.
+// mapping, publish a mapping, remove a mapping. An interface so offline tests
+// supply a map.
 type ConfigClient interface {
 	Query(ctx context.Context, key nacos.ConfigKey) (nacos.Config, error)
 	Publish(ctx context.Context, key nacos.ConfigKey, in nacos.PublishInput) error
+	Remove(ctx context.Context, key nacos.ConfigKey) error
 }
 
 // MetadataInfo mirrors jaws' org.hongxi.jaws.metadata.MetadataInfo JSON shape:

@@ -201,4 +201,16 @@ func main() {
 	log.Printf("signal received, draining (grace period %s)", srv.DrainDelay())
 	srv.Stop()
 	log.Printf("stopped: application instance deregistered then drained")
+
+	// The mapping is a persistent config entry the unexpose closure leaves
+	// behind on purpose; this sample owns its lifecycle, so remove it here —
+	// before the deferred cc.Close() — otherwise a later interface-level run
+	// (sweet or jaws) would be silently routed to this dead application.
+	rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := provider.RemoveMapping(rctx, serviceName); err != nil {
+		log.Printf("remove mapping for %s: %v", serviceName, err)
+	} else {
+		log.Printf("mapping for %s removed", serviceName)
+	}
 }
