@@ -5,6 +5,14 @@
 // a consumer of the same registry abstraction the clients use, not a new mode
 // the server has to know about.
 //
+// Application-level providers (example/applevel, jaws' registerMode=instance)
+// work through the same door: the nacos registry is wrapped in an
+// applevel.Consumer, which reads the interface → application mapping and
+// expands the application instance back into interface-level addresses. No
+// mapping means plain interface-level discovery, so one gateway serves both
+// kinds; -group picks the naming group (default_rpc, the app-level convention)
+// and -app-namespace the application-name prefix.
+//
 // Unary and server-streaming methods are both exposed. Client streaming and
 // bidi are not: they need a duplex transport (WebSocket, or SSE plus a second
 // POST), and a half-built duplex endpoint is worse than an absent one.
@@ -18,7 +26,12 @@
 // Run it after starting the provider, e.g.
 //
 //	go run ./example/greeter/cmd/server -registry=nacos -server 127.0.0.1:9848 -listen 127.0.0.1:20001
-//	go run ./example/gateway
+//	go run ./example/gateway -group=DEFAULT_GROUP
+//
+// or against an application-level provider (listens on 20010, so the edge moves):
+//
+//	go run ./example/applevel/cmd/provider
+//	go run ./example/gateway -listen 127.0.0.1:20011
 //
 // then:
 //
@@ -60,6 +73,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/javahongxi/sweet/applevel"
 	pb "github.com/javahongxi/sweet/example/greeter/greeterpb"
 	"github.com/javahongxi/sweet/gateway"
 	"github.com/javahongxi/sweet/nacos"
@@ -72,6 +86,10 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:20010", "address to listen on")
 	registryKind := flag.String("registry", "nacos", "nacos | direct")
 	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
+	group := flag.String("group", "default_rpc", "Nacos naming group the providers registered under")
+	appNamespace := flag.String("app-namespace", "jaws",
+		"application-name prefix for application-level discovery: jaws matches providers registered "+
+			"with -namespace=jaws, empty watches the bare application name")
 	endpoints := flag.String("endpoints", "127.0.0.1:20001", "provider addresses, used only with -registry=direct")
 	service := flag.String("service", pb.Greeter_ServiceDesc.ServiceName,
 		"name to look up in the registry — a lookup key, independent of the gRPC method below")
@@ -103,11 +121,24 @@ func main() {
 	var reg registry.Registry
 	switch *registryKind {
 	case "nacos":
-		nr, err := nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr})
+		nr, err := nacosregistry.New(nacosregistry.Options{ServerAddr: *serverAddr, GroupName: *group})
 		if err != nil {
 			log.Fatalf("registry: %v", err)
 		}
-		reg = nr
+		// The mapping reads need a config-domain connection of their own; the
+		// routes table below may open a second one, which is fine — they watch
+		// different keys. No mapping for a service means the decorator passes
+		// through to interface-level discovery, so this wrap costs nothing for
+		// classic providers.
+		cc, err := nacos.NewConfigClient(nacos.ConfigOptions{Addr: *serverAddr, Tenant: *namespace})
+		if err != nil {
+			log.Fatalf("config client: %v", err)
+		}
+		defer func() { _ = cc.Close() }()
+		reg = applevel.NewConsumer(nr, cc, applevel.ConsumerOptions{
+			Namespace: *appNamespace,
+			Logger:    log.Default(),
+		})
 	case "direct":
 		dr, err := direct.New(*endpoints)
 		if err != nil {

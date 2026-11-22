@@ -16,7 +16,7 @@ Nacos 命名协议把自己登记成 `sweet.example.v1.Greeter`。这一发证�
 go run ./example/greeter/cmd/server -registry=nacos -server 127.0.0.1:9848 -listen 127.0.0.1:20001
 
 # 终端 2：gateway
-go run ./example/gateway -registry=nacos -listen 127.0.0.1:20010 -timeout 1s
+go run ./example/gateway -registry=nacos -group=DEFAULT_GROUP -listen 127.0.0.1:20010 -timeout 1s
 
 # 终端 3：打
 curl -s localhost:20010/v1/greeter/greet -d '{"name":"web"}'
@@ -26,6 +26,8 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 `-N` 是 `--no-buffer`：不加它 curl 也会把整条流读完才显示，看上去就像一次性返回。
 
 入参：`-listen`、`-registry`（`nacos` | `direct`）、`-server`（Nacos gRPC 口）、
+`-group`（naming group，默认 `default_rpc` 即应用级约定；经典 greeter 注册在
+`DEFAULT_GROUP`，所以上面显式带上）、`-app-namespace`（应用级发现的应用名前缀，默认 `jaws`）、
 `-endpoints`（只在 `direct` 时用）、`-service`（注册中心里的查找名）、`-timeout`（调用方没给
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
 `-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
@@ -39,6 +41,33 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 ```
 go run ./example/gateway -registry=direct -endpoints 127.0.0.1:20001
 ```
+
+## 应用级 provider（`applevel.Consumer` 装饰器）
+
+`-registry=nacos` 时注册中心被 `applevel.Consumer` 包了一层：路由表里的服务名先查
+配置中心的 `mapping:{接口名}`，有映射就订阅应用实例、按 revision 拉元数据、展开回
+接口级地址；没有映射直通接口级发现。所以同一个网关能同时代理两种 provider，
+网关本体一行未改——它只认 `registry.Registry` 接口，装饰器从 `Options.Registry` 进来。
+
+```
+# 终端 1：应用级 provider（默认 jaws/sweet-greeter-app，group default_rpc，监听 20010）
+go run ./example/applevel/cmd/provider
+
+# 终端 2：gateway（provider 占了 20010，边缘挪到 20011；group 默认值已对齐）
+go run ./example/gateway -listen 127.0.0.1:20011
+
+# 终端 3：打
+curl -s localhost:20011/v1/greeter/greet -d '{"name":"web"}'
+curl -sN localhost:20011/v1/greeter/greet-stream -d '{"name":"web","times":3}'
+```
+
+sweet↔sweet 裸名约定则是两端都 `-app-namespace=`、provider 与网关都
+`-group=DEFAULT_GROUP`。对端是 jaws 的应用级 provider（如
+`jaws-sample-wire-boot-provider`）时，把 `-service` 指到 Java 接口全名即可，
+映射与元数据拉取走的是同一条契约。
+
+一个与 jaws 同语义的边界：mapping 每次 Watch 读一次，而网关按服务缓存长连接——
+服务在网关已建连后才从接口级迁到应用级，不会自动改路由，需重启或路由重载。
 
 ## 路由表来自配置中心（`-routes=nacos`）
 
