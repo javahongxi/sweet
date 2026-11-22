@@ -144,7 +144,7 @@ sweet.example.v1.Greeter removed`, and the admin API answers "Config not exist"
 for the dataId. `SIGKILL` runs no cleanup; remove the entry by hand instead:
 
 ```
-DELETE /nacos/v3/admin/cs/config?dataId=mapping:{interface}&groupName=JAWS_CONFIG&namespaceId=public
+curl -s -X DELETE 'http://127.0.0.1:8848/nacos/v3/admin/cs/config?dataId=mapping:sweet.example.v1.Greeter&groupName=JAWS_CONFIG&namespaceId=public'
 ```
 
 The jaws side keeps the same contract: `ServiceNameMapping.removeMapping` plus
