@@ -52,3 +52,28 @@ $ grpcurl -plaintext -d '{"name":"grpcurl","times":2}' localhost:20001 sweet.exa
 
 - [jaws-wire](../example/jaws-wire/README.md)：sweet 的 Go 客户端经 direct 或 Nacos 调用 jaws 的 Java gRPC 服务端。
 - jaws 仓库的 `jaws-samples/jaws-sample-wire-sweet`：jaws 的 wire 客户端经 Nacos 发现并调用 sweet 启动的 grpc-go 服务。
+
+## 与 jaws 的命名与 group 约定
+
+两个框架共用一套 group 默认值，框架身份靠服务名前缀表达，不靠 group：
+
+| 维度                           | sweet                              | jaws          | 说明                                                                                          |
+|--------------------------------|------------------------------------|---------------|-----------------------------------------------------------------------------------------------|
+| naming group                   | `default_rpc`                      | `default_rpc` | 共用默认值；`registry/nacos` 与 `applevel` provider 的默认值即此                              |
+| 服务名                         | 裸名（`sweet.example.v1.Greeter`） | `jaws/{name}` | Nacos 身份是 (tenant, group, name) 三元组，同组内前缀不同即不同服务，接口全名相同也不会混实例 |
+| 应用级 mapping 的 config group | `JAWS_CONFIG`                      | `JAWS_CONFIG` | 配置域固定值（`applevel.ConfigGroup`），与 naming group 是两个独立维度，不随其变化            |
+
+设计取舍：group 的本职是业务域/环境隔离。若让它兼任框架判别器（sweet 曾用
+`DEFAULT_GROUP`、jaws 用 `default_rpc`），就与前缀的判别职责冗余，每条互通链路都要
+一个 group 对齐开关——消费端按模式切 group、网关与示例显式传 `-group`。对齐之后这些
+开关全部消失：jaws 消费 sweet 只需置空 `registryNamespace` 一处适配，`-applevel` 两种
+模式同 group；sweet↔sweet 裸名约定只需 `-namespace=`。
+
+边界两条：底层 `nacos/naming_client.go` 保持协议层的 `DEFAULT_GROUP` 默认（那是 Nacos
+官方客户端的惯例，框架层显式传值覆盖）；网关路由表仍在配置域 `DEFAULT_GROUP`，与
+naming 无关。另注意 jaws 若显式 `registryNamespace=` 注册裸名，会与同名 sweet 服务在
+同组相撞——前缀兜底只在默认配置下成立。
+
+应用级契约的完整表格（revision 算法、StringValue 信封、元数据拉取路径）见
+[applevel 示例](../example/applevel/README.md)；接口级互通的实测见
+[jaws-wire 示例](../example/jaws-wire/README.md)与 jaws 仓库的 `jaws-sample-wire-sweet`。
