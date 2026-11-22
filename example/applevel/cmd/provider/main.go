@@ -12,10 +12,10 @@
 // second registry entry.
 //
 // The defaults aim at the jaws interop leg: -namespace=jaws registers
-// "jaws/<app>" the way a jaws consumer's default registryNamespace subscribes,
-// and -group=default_rpc is jaws' URL group. Run with -namespace= -group=DEFAULT_GROUP
-// for sweet's own bare-name convention; the consumer side picks the matching
-// flags (see ../consumer and README.md).
+// "jaws/<app>" the way a jaws consumer's default registryNamespace subscribes.
+// The group default_rpc is shared by both frameworks; run with -namespace=
+// for sweet's own bare-name convention, the consumer side picks the matching
+// flag (see ../consumer and README.md).
 //
 // Nacos must be listening on 127.0.0.1:8848 (SDK gRPC port 9848).
 package main
@@ -135,7 +135,7 @@ func main() {
 		"prefix of the registered application name: jaws matches a jaws consumer's default "+
 			"registryNamespace, empty registers the bare name sweet's own consumers watch")
 	group := flag.String("group", "default_rpc",
-		"Nacos group AND the URL group parameter; jaws' default is default_rpc, sweet's DEFAULT_GROUP")
+		"Nacos group AND the URL group parameter; default_rpc is shared by sweet and jaws")
 	weight := flag.Int("weight", 100, "instance weight advertised through the service URL")
 	flag.Parse()
 

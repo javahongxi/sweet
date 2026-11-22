@@ -25,7 +25,7 @@
 //
 // No mapping present? Consumer passes through to interface-level discovery, so
 // this binary also calls example/greeter's classic server with -target=sweet
-// -namespace= -group=DEFAULT_GROUP — the mode decision lives in the config
+// -namespace= — the mode decision lives in the config
 // center, not in a flag, exactly as jaws' ConsumerCoordinator decides.
 package main
 

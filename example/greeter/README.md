@@ -140,8 +140,8 @@ GreetAll    == 1 frame from 3 requests
 Nacos 自己的管理面（HTTP 8848，与客户端走的 gRPC 9848 是两条面）：
 
 ```
-curl -s "http://127.0.0.1:8848/nacos/v3/admin/ns/instance/list?serviceName=sweet.example.v1.Greeter&groupName=DEFAULT_GROUP&namespaceId=public"
-{"code":0,"message":"success","data":[{"instanceId":"127.0.0.1#20002#DEFAULT#DEFAULT_GROUP@@sweet.example.v1.Greeter","ip":"127.0.0.1","port":20002,"weight":100.0,"healthy":true,"enabled":true,"ephemeral":true,"clusterName":"DEFAULT","serviceName":"DEFAULT_GROUP@@sweet.example.v1.Greeter","metadata":{},"instanceHeartBeatInterval":5000,"instanceHeartBeatTimeOut":15000,"ipDeleteTimeout":30000,"instanceIdGenerator":"simple"}]}
+curl -s "http://127.0.0.1:8848/nacos/v3/admin/ns/instance/list?serviceName=sweet.example.v1.Greeter&groupName=default_rpc&namespaceId=public"
+{"code":0,"message":"success","data":[{"instanceId":"127.0.0.1#20002#DEFAULT#default_rpc@@sweet.example.v1.Greeter","ip":"127.0.0.1","port":20002,"weight":100.0,"healthy":true,"enabled":true,"ephemeral":true,"clusterName":"DEFAULT","serviceName":"default_rpc@@sweet.example.v1.Greeter","metadata":{},"instanceHeartBeatInterval":5000,"instanceHeartBeatTimeOut":15000,"ipDeleteTimeout":30000,"instanceIdGenerator":"simple"}]}
 ```
 
 `SIGTERM` 掉服务端，先注销再停止 accept：

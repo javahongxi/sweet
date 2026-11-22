@@ -47,7 +47,8 @@ type Options struct {
 	Servers []string
 	// Namespace is the tenant. Empty means "public".
 	Namespace string
-	// GroupName defaults to DEFAULT_GROUP.
+	// GroupName defaults to default_rpc, the naming group shared with jaws;
+	// frameworks stay apart by name prefix (jaws/{name} vs bare), not by group.
 	GroupName string
 	// HealthyOnly filters queried instances.
 	HealthyOnly bool
@@ -140,7 +141,7 @@ func New(opts Options) (*Registry, error) {
 	// "public" the way the official client does, and this used to be the adapter
 	// quietly doing the library's job.
 	if opts.GroupName == "" {
-		opts.GroupName = "DEFAULT_GROUP"
+		opts.GroupName = "default_rpc"
 	}
 	if opts.ReconnectDelay <= 0 {
 		opts.ReconnectDelay = time.Second

@@ -26,7 +26,7 @@
 // Run it after starting the provider, e.g.
 //
 //	go run ./example/greeter/cmd/server -registry=nacos -server 127.0.0.1:9848 -listen 127.0.0.1:20001
-//	go run ./example/gateway -group=DEFAULT_GROUP
+//	go run ./example/gateway
 //
 // or against an application-level provider (listens on 20010, so the edge moves):
 //
@@ -86,7 +86,8 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:20010", "address to listen on")
 	registryKind := flag.String("registry", "nacos", "nacos | direct")
 	serverAddr := flag.String("server", "127.0.0.1:9848", "Nacos SDK gRPC address (mainPort+1000)")
-	group := flag.String("group", "default_rpc", "Nacos naming group the providers registered under")
+	group := flag.String("group", "default_rpc", "Nacos naming group, shared by sweet and jaws; "+
+		"the frameworks stay apart by name prefix (jaws/{name} vs bare), not by group")
 	appNamespace := flag.String("app-namespace", "jaws",
 		"application-name prefix for application-level discovery: jaws matches providers registered "+
 			"with -namespace=jaws, empty watches the bare application name")

@@ -326,7 +326,7 @@ func TestConsumerAppLevelEndToEnd(t *testing.T) {
 	if len(got) != 1 || got[0].Port != port {
 		t.Fatalf("expanded instance wrong: %+v", got)
 	}
-	if got[0].Metadata["group"] != "DEFAULT_GROUP" || got[0].Metadata["application"] != "sweet-app" {
+	if got[0].Metadata["group"] != "default_rpc" || got[0].Metadata["application"] != "sweet-app" {
 		t.Fatalf("URL parameters must travel as instance metadata: %+v", got[0].Metadata)
 	}
 

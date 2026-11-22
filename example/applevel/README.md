@@ -56,14 +56,14 @@ Prerequisite: Nacos 3.x on `127.0.0.1:8848` (SDK gRPC port `9848`), auth off.
 
 ```
 # terminal 1: application-level provider
-go run ./example/applevel/cmd/provider -namespace= -group=DEFAULT_GROUP
+go run ./example/applevel/cmd/provider -namespace=
 
 # terminal 2: application-level consumer
-go run ./example/applevel/cmd/consumer -target=sweet -namespace= -group=DEFAULT_GROUP
+go run ./example/applevel/cmd/consumer -target=sweet -namespace=
 ```
 
 `-namespace=` drops the `jaws/` prefix on both sides (sweet's bare-name
-convention). The consumer prints the expanded instance list before calling all
+convention); the naming group `default_rpc` is shared by both frameworks. The consumer prints the expanded instance list before calling all
 four method shapes. Kill the provider mid-run and the list empties; restart it
 and the revision pull brings it back.
 

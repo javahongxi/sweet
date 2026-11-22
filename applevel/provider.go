@@ -31,7 +31,8 @@ type ProviderOptions struct {
 	Namespace string
 	// Group is the URL group parameter written into every service URL and the
 	// application instance; a jaws consumer reference must set the same group.
-	// Defaults to DEFAULT_GROUP, sweet's naming convention.
+	// Defaults to default_rpc, shared with jaws — the frameworks stay apart by
+	// name prefix (jaws/{name} vs bare), not by group.
 	Group string
 	// Version is the URL version parameter; defaults to jaws' "1.0".
 	Version string
@@ -79,7 +80,7 @@ func NewProvider(inner registry.Registry, cfg ConfigClient, opts ProviderOptions
 		return nil, errors.New("applevel: ProviderOptions.Application required")
 	}
 	if opts.Group == "" {
-		opts.Group = "DEFAULT_GROUP"
+		opts.Group = "default_rpc"
 	}
 	if opts.Version == "" {
 		opts.Version = DefaultURLVersion

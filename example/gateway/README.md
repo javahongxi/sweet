@@ -16,7 +16,7 @@ Nacos 命名协议把自己登记成 `sweet.example.v1.Greeter`。这一发证�
 go run ./example/greeter/cmd/server -registry=nacos -server 127.0.0.1:9848 -listen 127.0.0.1:20001
 
 # 终端 2：gateway
-go run ./example/gateway -registry=nacos -group=DEFAULT_GROUP -listen 127.0.0.1:20010 -timeout 1s
+go run ./example/gateway -registry=nacos -listen 127.0.0.1:20010 -timeout 1s
 
 # 终端 3：打
 curl -s localhost:20010/v1/greeter/greet -d '{"name":"web"}'
@@ -26,8 +26,8 @@ curl -sN localhost:20010/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 `-N` 是 `--no-buffer`：不加它 curl 也会把整条流读完才显示，看上去就像一次性返回。
 
 入参：`-listen`、`-registry`（`nacos` | `direct`）、`-server`（Nacos gRPC 口）、
-`-group`（naming group，默认 `default_rpc` 即应用级约定；经典 greeter 注册在
-`DEFAULT_GROUP`，所以上面显式带上）、`-app-namespace`（应用级发现的应用名前缀，默认 `jaws`）、
+`-group`（naming group，默认 `default_rpc`，sweet 与 jaws 共用；框架靠前缀区分——
+jaws 注册 `jaws/{name}`，sweet 裸名——不靠 group）、`-app-namespace`（应用级发现的应用名前缀，默认 `jaws`）、
 `-endpoints`（只在 `direct` 时用）、`-service`（注册中心里的查找名）、`-timeout`（调用方没给
 期限时兜底）、`-verbose-errors`（把 provider 的状态文本带到边缘）、
 `-print-status-table`（打印 gRPC→HTTP 映射表后退出）、`-routes`（`embedded` | `nacos`）、
@@ -61,8 +61,7 @@ curl -s localhost:20011/v1/greeter/greet -d '{"name":"web"}'
 curl -sN localhost:20011/v1/greeter/greet-stream -d '{"name":"web","times":3}'
 ```
 
-sweet↔sweet 裸名约定则是两端都 `-app-namespace=`、provider 与网关都
-`-group=DEFAULT_GROUP`。对端是 jaws 的应用级 provider（如
+sweet↔sweet 裸名约定则是两端都 `-app-namespace=`（group 默认已对齐，无需再传）。对端是 jaws 的应用级 provider（如
 `jaws-sample-wire-boot-provider`）时，把 `-service` 指到 Java 接口全名即可，
 映射与元数据拉取走的是同一条契约。
 

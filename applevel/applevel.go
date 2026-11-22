@@ -29,11 +29,12 @@
 //     point-to-point pull, and expands the metadata back into interface-level
 //     instances.
 //
-// Naming follows the existing interop convention (example/jaws-wire): jaws
-// registers under "jaws/{name}" in group default_rpc, sweet under the bare name
-// in DEFAULT_GROUP. ConsumerOptions.Namespace and ProviderOptions.Namespace
-// pick the side of that convention; the URL "group" parameter is separate from
-// the Nacos naming group and must match what a jaws consumer reference sets.
+// Naming follows the interop convention (example/jaws-wire): both frameworks
+// share the naming group default_rpc; jaws registers under "jaws/{name}",
+// sweet under the bare name, so the prefix alone tells the frameworks apart.
+// ConsumerOptions.Namespace and ProviderOptions.Namespace pick the side of
+// that convention; the URL "group" parameter is separate from the Nacos
+// naming group and must match what a jaws consumer reference sets.
 package applevel
 
 import (
